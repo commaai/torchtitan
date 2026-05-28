@@ -34,7 +34,8 @@ Or via CLI override:
 ### Requirements
 
 - **Optimizer**: Must be `Adam` or `AdamW`.
-- **Implementation**: Must be `fused_opt_states_bf16`. The fused CUDA kernel (`FusedAdamMathFunctorMP`) handles mixed-precision updates (fp32 parameters + bf16 states).
+- **Implementation**: Must be `fused_opt_states_bf16`. The fused CUDA kernel handles mixed-precision updates (fp32 parameters + bf16 states).
+- **PyTorch**: Requires a PyTorch build with mixed fp32 parameter + bf16 optimizer-state support in fused Adam/AdamW.
 
 These constraints are validated at config time.
 

@@ -16,6 +16,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.components.validate import Validator
 from torchtitan.config import ConfigManager
@@ -68,11 +69,13 @@ class Trainer(ForgeEngine):
         )
 
         # metrics logging
+        model_has_quantization = has_quantization(model_args)
         self.metrics_processor = config.metrics.build(
             parallel_dims=self.parallel_dims,
             dump_folder=config.dump_folder,
             pp_schedule=config.parallelism.pipeline_parallel_schedule,
             config_dict=config.to_dict(),
+            has_quantization=model_has_quantization,
         )
         color = self.metrics_processor.color
 
@@ -85,8 +88,26 @@ class Trainer(ForgeEngine):
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
-        gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
-        logger.info(f"Peak FLOPS used for computing MFU: {gpu_peak_flops:.3e}")
+        peak_flops_mul_dtype = (
+            "float8"
+            if model_has_quantization
+            else (
+                config.training.mixed_precision_param
+                if self.parallel_dims.fsdp_enabled
+                else config.training.dtype
+            )
+        )
+        self.metrics_processor.gpu_peak_flops = utils.get_peak_flops(
+            device_memory_monitor.device_name,
+            mul_dtype=peak_flops_mul_dtype,
+            acc_dtype=config.training.mixed_precision_reduce,
+        )
+        logger.info(
+            "Peak FLOPS used for computing MFU "
+            f"(multiply={peak_flops_mul_dtype}, "
+            f"accumulate={config.training.mixed_precision_reduce}): "
+            f"{self.metrics_processor.gpu_peak_flops:.3e}"
+        )
         device_mem_stats = device_memory_monitor.get_peak_stats()
         logger.info(
             f"{utils.device_type.upper()} memory usage for model: "
@@ -144,7 +165,6 @@ class Trainer(ForgeEngine):
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]:
         """Returns an iterator that processes batches from the data iterator."""
-        device_type = utils.device_type
         data_iterator = iter(data_iterable)
 
         while True:

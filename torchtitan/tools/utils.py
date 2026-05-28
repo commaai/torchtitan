@@ -19,6 +19,9 @@ from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger
 
 
+_DTypeLike = str | torch.dtype
+
+
 def has_cuda_capability(major: int, minor: int) -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
         major,
@@ -82,9 +85,82 @@ class GarbageCollection:
         logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
 
 
-# hardcoded BF16 type peak flops for NVIDIA A100, H20, H100, H200, B200 GPU,
-# AMD MI250, MI300X, MI325X, MI355X, Intel PVC, and AWS Trainium/Inferentia
-def get_peak_flops(device_name: str) -> float:
+_PEAK_FLOPS = {
+    "A100": {
+        ("float32", "float32"): 19.5e12,
+        ("bfloat16", "float32"): 312e12,
+    },
+    "A6000": {
+        ("float32", "float32"): 38.7e12,
+    },
+    "H100 NVL": {
+        ("float32", "float32"): 67e12,
+        ("bfloat16", "float32"): 835e12,
+    },
+    "H100 PCIe": {
+        ("float32", "float32"): 51e12,
+        ("bfloat16", "float32"): 756e12,
+    },
+    "H100": {
+        ("float32", "float32"): 67e12,
+        ("bfloat16", "float32"): 989e12,
+    },
+    "H200": {
+        ("float32", "float32"): 67e12,
+        ("bfloat16", "float32"): 989e12,
+    },
+    "H20": {
+        ("bfloat16", "float32"): 148e12,
+    },
+    "GB200": {
+        ("bfloat16", "float32"): 2.5e15,
+    },
+    "GB300": {
+        ("bfloat16", "float32"): 2.5e15,
+    },
+    "B300": {
+        ("bfloat16", "float32"): 2.25e15,
+    },
+    "B200": {
+        ("bfloat16", "float32"): 2.25e15,
+    },
+    "RTX 5090": {
+        ("float32", "float32"): 104.8e12,
+        ("bfloat16", "float32"): 209.5e12,
+        ("bfloat16", "bfloat16"): 419e12,
+        ("float8", "bfloat16"): 838e12,
+    },
+    "MI355X": {
+        ("bfloat16", "float32"): 2500e12,
+    },
+    "MI300X": {
+        ("bfloat16", "float32"): 1300e12,
+    },
+    "MI325X": {
+        ("bfloat16", "float32"): 1300e12,
+    },
+    "MI250X": {
+        ("bfloat16", "float32"): 191.5e12,
+    },
+    "l40s": {
+        ("float32", "float32"): 91.6e12,
+        ("bfloat16", "float32"): 362e12,
+    },
+}
+
+
+def _normalize_peak_flops_dtype(dtype: _DTypeLike) -> str:
+    return str(dtype).lower().removeprefix("torch.")
+
+
+def get_peak_flops(
+    device_name: str,
+    mul_dtype: _DTypeLike = torch.bfloat16,
+    acc_dtype: _DTypeLike = torch.float32,
+) -> float:
+    mul_dtype = _normalize_peak_flops_dtype(mul_dtype)
+    acc_dtype = _normalize_peak_flops_dtype(acc_dtype)
+
     try:
         # Run the lspci command and capture the output
         result = subprocess.run(["lspci"], stdout=subprocess.PIPE, text=True)
@@ -98,90 +174,56 @@ def get_peak_flops(device_name: str) -> float:
         device_name = " ".join(filtered_lines) or device_name
     except FileNotFoundError as e:
         logger.warning(f"Error running lspci: {e}, fallback to use device_name")
-    if "A100" in device_name:
-        # data from https://www.nvidia.com/en-us/data-center/a100/
-        return 312e12
-    elif "A6000" in device_name:
-        # data from https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/
-        # quadro-product-literature/proviz-print-nvidia-rtx-a6000-datasheet-us-nvidia-1454980-r9-web%20(1).pdf
-        # NOTE: 309.7 TFLOPS is with sparsity; dense value is half.
-        return 154.85e12
-    elif "H100" in device_name:
-        # data from https://www.nvidia.com/en-us/data-center/h100/
-        # NOTE: Specifications are one-half lower without sparsity.
-        if "NVL" in device_name:
-            return 835e12
-        elif "PCIe" in device_name:
-            return 756e12
-        else:  # for H100 SXM and other variants
-            return 989e12
-    elif "H200" in device_name:
-        # data from https://www.nvidia.com/en-us/data-center/h200/
-        return 989e12
-    elif "H20" in device_name:
-        # NVIDIA H20 is a region-specific GPU variant.
-        # Since first-hand specifications do not seem to be readily available on
-        # NVIDIA's official global website, we refer to technical reports from
-        # Tom's Hardware. The peak BF16/FP16 Tensor performance is reported as
-        # 148 TFLOPS.
-        # Ref: https://www.tomshardware.com/news/
-        # nvidias-latest-regulation-compliant-gpu-for-china-has-been-delayed-to-early-next-year
-        return 148e12
-    elif "GB200" in device_name or "GB300" in device_name:
-        # Grace Blackwell Superchips (Grace CPU + Blackwell GPU)
-        # BF16 dense per GPU: 2,500 TFLOPS (half of 5,000 TFLOPS with sparsity)
-        # GB200 data from https://www.nvidia.com/en-us/data-center/dgx-gb200
-        # GB300 data from https://www.nvidia.com/en-us/data-center/dgx-gb300
-        return 2.5e15
-    elif "B300" in device_name or "B200" in device_name:
-        # data from https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
-        # Checked after GB300 to avoid false match on "GB300"
-        return 2.25e15
-    elif "MI355X" in device_name:
-        # MI355X data from https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html
-        return 2500e12
-    elif "MI300X" in device_name or "MI325X" in device_name:
-        # MI300X data from https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html
-        # MI325X data from https://www.amd.com/en/products/accelerators/instinct/mi300/mi325x.html
-        return 1300e12
-    elif "MI250X" in device_name:
-        # data from https://www.amd.com/en/products/accelerators/instinct/mi200/mi250x.html (per GCD)
-        return 191.5e12
-    elif "Data Center GPU Max 1550" in device_name:
-        # Also known as Ponte Vecchio (PVC).
-        # data from https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-0/intel-xe-gpu-architecture.html
-        # Dot Product Accumulate Systolic (DPAS):
-        # - Freq: 1300MHz
-        # - #ops: 512
-        # Full EU mode (i.e. 512 max compute units): 340.8 TFLOPS (BF16)
-        # Standard EU mode (i.e. 448 max compute units): 298.2 TFLOPS (BF16)
+    if "Data Center GPU Max 1550" in device_name:
         max_comp_units = torch.xpu.get_device_properties("xpu").max_compute_units
-        return 512 * max_comp_units * 1300 * 10**6
-    elif "l40s" in device_name:
-        # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
-        return 362e12
+        device_flops = {("bfloat16", "float32"): 512 * max_comp_units * 1300 * 10**6}
     elif "neuron" in device_name:
-        # AWS Trainium/Inferentia: query chip type via torch.neuron
-        # TensorEngine BF16 TFLOPS per NeuronCore × default Logical NeuronCore (LNC) count per device
         neuron_device_name = device_module.get_device_properties().name
         if neuron_device_name in ("trn1", "trn1n", "inf2"):
-            # NeuronCore-v2 TensorEngine: 90 BF16 TFLOPS/core, LNC=1
-            # https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/neuron-core-v2.html
-            return 90e12 * 1
+            device_flops = {("bfloat16", "float32"): 90e12}
         elif neuron_device_name in ("trn2", "trn2n", "trn2u", "trn3", "trn3u"):
-            # NeuronCore-v3/NeuronCore-v4 TensorEngine: 79 BF16 TFLOPS/core, LNC=2
-            # https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/neuron-core-v3.html
-            # https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/neuron-core-v4.html
-            return 79e12 * 2
+            device_flops = {("bfloat16", "float32"): 79e12 * 2}
         else:
             logger.warning(
                 f"Unknown neuron device: {neuron_device_name}, fallback to trn2/trn3"
             )
-            return 79e12 * 2
+            device_flops = {("bfloat16", "float32"): 79e12 * 2}
+    else:
+        device_flops = next(
+            (
+                flops
+                for name, flops in _PEAK_FLOPS.items()
+                if name.lower() in device_name.lower()
+            ),
+            None,
+        )
 
-    else:  # for other GPU types, assume A100
+    if device_flops is None:
         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
-        return 312e12
+        device_flops = _PEAK_FLOPS["A100"]
+
+    key = (mul_dtype, acc_dtype)
+    for fallback_key in (
+        key,
+        (mul_dtype, "float32"),
+        (mul_dtype, "bfloat16"),
+        ("bfloat16", acc_dtype),
+        ("bfloat16", "float32"),
+        ("float32", "float32"),
+    ):
+        if fallback_key in device_flops:
+            if fallback_key != key:
+                logger.warning(
+                    f"Peak flops undefined for {device_name} with multiply={mul_dtype}, "
+                    f"accumulate={acc_dtype}; using multiply={fallback_key[0]}, "
+                    f"accumulate={fallback_key[1]} peak."
+                )
+            return device_flops[fallback_key]
+
+    logger.warning(
+        f"Peak flops undefined for: {device_name}, fallback to A100 BF16/FP32"
+    )
+    return _PEAK_FLOPS["A100"][("bfloat16", "float32")]
 
 
 @dataclass(frozen=True)

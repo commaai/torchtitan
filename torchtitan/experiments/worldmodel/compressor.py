@@ -1,0 +1,53 @@
+import io
+
+import einops
+import torch
+import torch.nn.functional as F
+
+
+COMPRESSOR_IN_CHANNELS = 6
+MAX_UINT8 = 255.0
+
+
+class _DebugCompressor(torch.nn.Module):
+    def forward(self, x):
+        latents = F.adaptive_avg_pool2d(x, (16, 32))
+        repeat_channels = (32 + latents.shape[1] - 1) // latents.shape[1]
+        return latents.repeat(1, repeat_channels, 1, 1)[:, :32]
+
+
+def load_compressor_encoder(*, compressor_model: str, encoder_path: str, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
+    if encoder_path:
+        compressor = torch.jit.load(encoder_path, map_location="cpu")
+    elif compressor_model == "dummy-compressor":
+        compressor = torch.jit.trace(_DebugCompressor(), torch.zeros(1, 6, 32, 64))
+    else:
+        from xx.training.lib.checkpoint import Checkpoint
+
+        compressor = torch.jit.load(io.BytesIO(Checkpoint(compressor_model)["encoder.jit"]), map_location="cpu")
+    return compressor.to(device=device, dtype=dtype).eval()
+
+
+@torch.no_grad()
+def images_to_latents(compressor: torch.nn.Module, imgs: torch.Tensor, big_imgs: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    batch, timesteps = imgs.shape[:2]
+    compressor_inputs = einops.rearrange(
+        [imgs, big_imgs],
+        "nc b t h w c -> (b t) (nc c) h w",
+        nc=2,
+        b=batch,
+        t=timesteps,
+    )
+    compressor_inputs = compressor_inputs.to(device=device, dtype=dtype)
+    compressor_inputs = compressor_inputs.div(MAX_UINT8).mul(2).sub(1).clamp(-1, 1)
+
+    latents = compressor(compressor_inputs)
+    if isinstance(latents, tuple):
+        latents = latents[0]
+    return einops.rearrange(
+        latents,
+        "(b t) (nc c) h w -> b t (nc c) h w",
+        nc=2,
+        b=batch,
+        t=timesteps,
+    )

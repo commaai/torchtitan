@@ -85,6 +85,12 @@ class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
         Default is 2 when num_workers > 0, otherwise None.
         """
 
+        multiprocessing_context: str | None = None
+        """Multiprocessing start method for worker processes, e.g. fork or spawn."""
+
+        in_order: bool = True
+        """Return worker batches in submission order. Set false to avoid head-of-line blocking."""
+
     dp_rank: int
     dp_world_size: int
 
@@ -136,6 +142,7 @@ class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
         if kwargs.get("num_workers", 0) == 0:
             kwargs.pop("persistent_workers", None)
             kwargs.pop("prefetch_factor", None)
+            kwargs.pop("multiprocessing_context", None)
 
     def state_dict(self) -> dict[str, Any]:
         # Store state only for dp rank to avoid replicating the same state across other dimensions.

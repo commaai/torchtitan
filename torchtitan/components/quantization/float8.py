@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from importlib.util import find_spec
 from typing import Literal
@@ -55,7 +55,7 @@ class Float8LinearConverter(QuantizationConverter):
 
     @dataclass(kw_only=True, slots=True)
     class Config(QuantizationConverter.Config):
-        recipe_name: Literal["rowwise", "rowwise_with_gw_hp"] = "rowwise"
+        recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] = "tensorwise"
         """Float8 recipe name."""
 
         filter_fqns: list[str] = field(default_factory=list)
@@ -70,6 +70,9 @@ class Float8LinearConverter(QuantizationConverter):
         If True, emulation is used instead of hardware accelerated gemm.
         This is for test purpose only. Not compatible with torch.compile.
         """
+
+        enable_fsdp_float8_all_gather: bool = True
+        """Enable torchao's FSDP float8 all-gather path when supported."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -110,7 +113,17 @@ class Float8LinearConverter(QuantizationConverter):
         )
         if cfg.emulate:
             self.torchao_config = TorchAOFloat8LinearConfig(emulate=True)
-        logger.info(f"Float8 training active with recipe {cfg.recipe_name}")
+        if hasattr(self.torchao_config, "enable_fsdp_float8_all_gather"):
+            self.torchao_config = replace(
+                self.torchao_config,
+                enable_fsdp_float8_all_gather=cfg.enable_fsdp_float8_all_gather,
+            )
+        logger.info(
+            "Float8 training active with "
+            f"recipe {cfg.recipe_name}, "
+            f"scaling {self.torchao_config.cast_config_input.scaling_granularity.value}, "
+            f"fsdp_float8_all_gather={cfg.enable_fsdp_float8_all_gather}"
+        )
 
         # short-term solution for https://github.com/pytorch/pytorch/issues/150859
         if cfg.recipe_name == "rowwise":

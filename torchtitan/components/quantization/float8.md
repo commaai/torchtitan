@@ -11,7 +11,7 @@ USE_CPP=0 python -m pip install git+https://github.com/pytorch/ao.git
 
 Quantization is applied at config time in your `model_registry()` function via the `quantization` parameter. Each converter walks the model config tree and swaps config types so that quantized modules are built directly.
 
-For float8 with rowwise scaling, configure it in your config_registry function:
+For float8 with tensorwise scaling, configure it in your config_registry function:
 ```python
 from torchtitan.components.quantization import Float8LinearConverter
 
@@ -20,14 +20,14 @@ model_spec = model_registry(
     "405B",
     quantization=[
         Float8LinearConverter.Config(
-            recipe_name="rowwise",
+            recipe_name="tensorwise",
             filter_fqns=["output"],
             model_compile_enabled=True,
         ),
     ],
 )
 ```
-* `recipe_name`: Float8 recipe name. Options: `"rowwise"` (default), `"rowwise_with_gw_hp"`.
+* `recipe_name`: TorchAO Float8 recipe name. Options: `"tensorwise"` (default), `"rowwise"`, `"rowwise_with_gw_hp"`.
 * `filter_fqns` (optional): a list of fully qualified names of modules not to convert to float8 training. Example: `filter_fqns=["attention.wk", "attention.wv"]`. You can determine which layers to convert by looking at the microbenchmarks in the [performance section](https://github.com/pytorch/ao/tree/main/torchao/float8#performance) of the torchao documentation for the float8 recipe you're using.
     * **Auto-filter**: add `"auto_filter_small_kn"` as one of the `filter_fqns` to enable automatic module filtering, which will automatically not convert linear layers that are not large enough to benefit from float8 training, since the GEMM has to be big enough that the speedup from using FP8 tensorcores is greater than the overhead of creating dynamically quantized inputs. The thresholds for conversion are based on microbenchmarks measured on NVIDIA H100 GPUs, where (K,N) represents the linear layer weight shape. For best performance, you should still manually filter out layers that are too small to benefit from float8 training.
 * `model_compile_enabled`: set to `True` when `torch.compile` is enabled for the model (required for competitive performance). `torch.compile` fuses the float8 scaling/casting kernels.
@@ -50,6 +50,6 @@ model_spec = model_registry(
 )
 ```
 
-For parallelisms, for float8 with rowwise scaling, all distributed communication is done in high precision.
+For parallelisms, float8 distributed communication uses high precision unless FSDP float8 all-gather is enabled.
 
-For scaling strategy, we support rowwise dynamic scaling (alpha).
+For scaling strategy, the default is tensorwise dynamic scaling.

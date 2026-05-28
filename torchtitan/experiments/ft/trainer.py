@@ -17,6 +17,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.experiments.ft.config.job_config import FaultTolerance
@@ -118,6 +119,7 @@ class FaultTolerantTrainer(Trainer):
         model.verify_module_protocol()
 
         # metrics logging (FT addition: ft_enable, ft_replica_id)
+        model_has_quantization = has_quantization(model_config)
         self.metrics_processor = config.metrics.build(
             parallel_dims=parallel_dims,
             dump_folder=config.dump_folder,
@@ -125,6 +127,7 @@ class FaultTolerantTrainer(Trainer):
             ft_enable=config.fault_tolerance.enable,
             ft_replica_id=config.fault_tolerance.replica_id,
             config_dict=config.to_dict(),
+            has_quantization=model_has_quantization,
         )
         color = self.metrics_processor.color
 
@@ -245,8 +248,26 @@ class FaultTolerantTrainer(Trainer):
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
-        gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
-        logger.info(f"Peak FLOPS used for computing MFU: {gpu_peak_flops:.3e}")
+        peak_flops_mul_dtype = (
+            "float8"
+            if model_has_quantization
+            else (
+                config.training.mixed_precision_param
+                if self.parallel_dims.fsdp_enabled
+                else config.training.dtype
+            )
+        )
+        self.metrics_processor.gpu_peak_flops = utils.get_peak_flops(
+            device_memory_monitor.device_name,
+            mul_dtype=peak_flops_mul_dtype,
+            acc_dtype=config.training.mixed_precision_reduce,
+        )
+        logger.info(
+            "Peak FLOPS used for computing MFU "
+            f"(multiply={peak_flops_mul_dtype}, "
+            f"accumulate={config.training.mixed_precision_reduce}): "
+            f"{self.metrics_processor.gpu_peak_flops:.3e}"
+        )
         device_mem_stats = device_memory_monitor.get_peak_stats()
         logger.info(
             f"{device_type.upper()} memory usage for model: "

@@ -1,64 +1,90 @@
 #!/bin/bash
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-
+#
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# --- This script is optimized for AWS with EFA
-# --- adjust NCCL_BUFFSIZE if you encounter memory
-# --- constraint issues or to tune for improved performance.
-# ---
+set -euo pipefail
 
-#SBATCH --job-name=torchtitan_multi_node
+JOB_ENV_FILE="${1:?Usage: sbatch multinode_trainer.slurm JOB_ENV_FILE}"
+source "$JOB_ENV_FILE"
 
-#SBATCH --ntasks=4
-
-#SBATCH --nodes=4
-
-#SBATCH --gpus-per-task=8
-
-#SBATCH --cpus-per-task=96
-
-#SBATCH --partition=train
-
-
-nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
-nodes_array=($nodes)
-head_node=${nodes_array[0]}
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
-
-echo Node IP: $head_node_ip
-export LOGLEVEL=INFO
-# Enable for A100
-export FI_PROVIDER="efa"
-# Ensure that P2P is available
-# export NCCL_P2P_DISABLE=1
-# export NCCL_IB_DISABLE=1
-
-# debugging flags (optional)
-export NCCL_DEBUG=WARN
+export HOME="/home/$(whoami)"
+export PATH="$HOME/.local/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$HOME/.trainer_venv}"
+export LOG_RANK="${LOG_RANK:-0}"
+export TORCHFT_LIGHTHOUSE="${TORCHFT_LIGHTHOUSE:-http://localhost:29510}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export LOGLEVEL="${LOGLEVEL:-INFO}"
 export PYTHONFAULTHANDLER=1
-# optional debug settings
-# export NCCL_DEBUG=INFO
-# NCCL_DEBUG_SUBSYS=INIT,GRAPH,ENV
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0,en,eth,em,bond}"
+export NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_1}"
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+export NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-2097152}"
+export FI_EFA_SET_CUDA_SYNC_MEMOPS="${FI_EFA_SET_CUDA_SYNC_MEMOPS:-0}"
 
-export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=/usr/local/lib/:$LD_LIBRARY_PATH
-export CUDA_LAUNCH_BLOCKING=0
+if [[ -d /opt/amazon/efa/lib ]]; then
+  export FI_PROVIDER="${FI_PROVIDER:-efa}"
+  export LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH:-}"
+fi
+export LD_LIBRARY_PATH="/usr/local/lib/:${LD_LIBRARY_PATH:-}"
 
-# on your cluster you might need these:
-# set the network interface
-export NCCL_SOCKET_IFNAME="eth0,en,eth,em,bond"
-export NCCL_BUFFSIZE=2097152
-#export TORCH_DIST_INIT_BARRIER=1
-export FI_EFA_SET_CUDA_SYNC_MEMOPS=0
+output_file="/var/log/slurm/${SLURM_JOB_NAME}${SLURM_ARRAY_TASK_ID:+_$SLURM_ARRAY_TASK_ID}.out"
+error_file="/var/log/slurm/${SLURM_JOB_NAME}${SLURM_ARRAY_TASK_ID:+_$SLURM_ARRAY_TASK_ID}.err"
 
-MODULE=${MODULE:-"llama3"}
-CONFIG=${CONFIG:-"llama3_debugmodel"}
+run_logged() {
+  "$@" \
+    1> >(tee -a "$output_file") \
+    2> >(tee -a "$error_file" >&2)
+}
 
-dcgmi profile --pause
-# adjust sbatch --ntasks and sbatch --nodes above and --nnodes below
-# to your specific node count, and update target launch file.
-srun torchrun --nnodes 4 --nproc_per_node 8 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$head_node_ip:29500" -m torchtitan.train --module ${MODULE} --config ${CONFIG} "$@"
-dcgmi profile --resume
+if ! command -v uv >/dev/null 2>&1; then
+  echo "Error: uv is not installed on $(hostname). Install uv before running TorchTitan Slurm jobs." >&2
+  exit 1
+fi
+
+mapfile -t nodes < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+head_node="${nodes[0]}"
+rdzv_host="${MASTER:-$head_node}"
+rdzv_endpoint="${rdzv_host}:${MASTER_PORT:-12355}"
+
+echo "Head node: $head_node"
+echo "Rendezvous endpoint: $rdzv_endpoint"
+echo "Training command: $COMMAND_TO_LOG"
+
+cd "$PROJECT_CACHE"
+
+if command -v dcgmi >/dev/null 2>&1; then
+  dcgmi profile --pause || true
+fi
+
+if [[ -n "${COMM_MODE:-}" ]]; then
+  run_logged srun --export=ALL --nodes=1 --ntasks=1 --kill-on-bad-exit=1 \
+    uv run --project "$PROJECT_CACHE" --frozen \
+    python -m torchtitan.train \
+    --module "$MODULE" --config "$CONFIG" \
+    "${TORCHTITAN_ARGS[@]}" --comm.mode="$COMM_MODE" --training.steps 1
+else
+  run_logged srun --export=ALL --ntasks="$SLURM_NNODES" --kill-on-bad-exit=1 \
+    uv run --project "$PROJECT_CACHE" --frozen \
+    python -m torch.distributed.run \
+    --nnodes "$SLURM_NNODES" \
+    --nproc_per_node "$NGPU" \
+    --rdzv_id "$SLURM_JOB_ID" \
+    --rdzv_backend c10d \
+    --rdzv_endpoint "$rdzv_endpoint" \
+    --local-ranks-filter "$LOG_RANK" \
+    --role rank \
+    --tee 3 \
+    -m torchtitan.train \
+    --module "$MODULE" --config "$CONFIG" \
+    "${TORCHTITAN_ARGS[@]}"
+fi
+
+if command -v dcgmi >/dev/null 2>&1; then
+  dcgmi profile --resume || true
+fi

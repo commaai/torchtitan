@@ -6,8 +6,9 @@
 
 import os
 import time
+import uuid
 from collections import namedtuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -42,9 +43,7 @@ class DeviceMemoryMonitor:
         self.device = torch.device(device)  # device object
         self.device_name = device_module.get_device_name(self.device)
         self.device_index = device_module.current_device()
-        self.device_capacity = device_module.get_device_properties(
-            self.device
-        ).total_memory
+        self.device_capacity = device_module.get_device_properties(self.device).total_memory
         self.device_capacity_gib = self._to_gib(self.device_capacity)
 
         device_module.reset_peak_memory_stats()
@@ -74,9 +73,7 @@ class DeviceMemoryMonitor:
         num_ooms = device_info.get("num_ooms", -1)
 
         if num_retries > 0:
-            logger.warning(
-                f"{num_retries} {device_type.upper()} memory allocation retries."
-            )
+            logger.warning(f"{num_retries} {device_type.upper()} memory allocation retries.")
         if num_ooms > 0:
             logger.warning(f"{num_ooms} {device_type.upper()} OOM errors thrown.")
 
@@ -95,10 +92,7 @@ class DeviceMemoryMonitor:
 
 def build_device_memory_monitor():
     device_memory_monitor = DeviceMemoryMonitor(device_type)
-    logger.info(
-        f"{device_type.upper()} capacity: {device_memory_monitor.device_name} "
-        f"with {device_memory_monitor.device_capacity_gib:.2f}GiB memory"
-    )
+    logger.info(f"{device_type.upper()} capacity: {device_memory_monitor.device_name} with {device_memory_monitor.device_capacity_gib:.2f}GiB memory")
     return device_memory_monitor
 
 
@@ -164,15 +158,45 @@ class WandBLogger(BaseLogger):
         logger.info("WandB logging enabled")
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
-        wandb_metrics = {
-            (k if self.tag is None else f"{self.tag}/{k}"): v
-            for k, v in metrics.items()
-        }
+        wandb_metrics = {(k if self.tag is None else f"{self.tag}/{k}"): v for k, v in metrics.items()}
         self.wandb.log(wandb_metrics, step=step)
 
     def close(self) -> None:
         if self.wandb.run is not None:
             self.wandb.finish()
+
+
+class ReporterV2Logger(BaseLogger):
+    """Logger implementation for ReporterV2 metrics."""
+
+    def __init__(
+        self,
+        *,
+        training_id: str,
+        host: str,
+        config_dict: dict[str, Any] | None = None,
+        tag: str | None = None,
+    ):
+        os.environ["REPORTERV2_HOST"] = os.getenv("REPORTERV2_HOST", host)
+        from reporterv2 import ReporterV2
+
+        reporter_config = dict(config_dict or {})
+        model_spec = reporter_config.get("model_spec", {})
+        training_id = training_id or os.getenv("REPORTERV2_TRAINING_ID", "") or reporter_config.get("training_id", "") or str(uuid.uuid4())
+        reporter_config["training_id"] = training_id
+        reporter_config.setdefault("trainer", model_spec.get("name", "torchtitan"))
+        self.reporter = ReporterV2(reporter_config)
+        self.tag = tag
+        logger.info(f"ReporterV2 logging enabled with training_id={training_id}")
+
+    def log(self, metrics: dict[str, Any], step: int) -> None:
+        if self.tag is not None:
+            metrics = {f"{self.tag}/{key}": value for key, value in metrics.items()}
+        self.reporter.buffer_metrics(step=step, epoch=step, metrics=metrics)
+        self.reporter.save_metrics()
+
+    def close(self) -> None:
+        self.reporter.close()
 
 
 class LoggerContainer(BaseLogger):
@@ -197,9 +221,7 @@ class LoggerContainer(BaseLogger):
             logger_instance.close()
 
 
-def ensure_pp_loss_visible(
-    *, parallel_dims: ParallelDims, pp_schedule: str, color: Color | NoColor
-) -> None:
+def ensure_pp_loss_visible(*, parallel_dims: ParallelDims, pp_schedule: str, color: Color | NoColor) -> None:
     """
     Ensures that the loss is visible on the console for pipeline-parallel training.
 
@@ -223,11 +245,7 @@ def ensure_pp_loss_visible(
         env_logged_ranks = []
 
     if str(loss_visible_rank) not in env_logged_ranks:
-        logger.warning(
-            f"{color.red}Pipeline Parallel loss is not visible. "
-            f"Please add {color.yellow}rank {loss_visible_rank}{color.red} "
-            f"to LOG_RANK environment variable in run_train.sh.{color.reset}"
-        )
+        logger.warning(f"{color.red}Pipeline Parallel loss is not visible. Please add {color.yellow}rank {loss_visible_rank}{color.red} to LOG_RANK environment variable in run_train.sh.{color.reset}")
 
 
 def _get_metrics_rank(
@@ -299,6 +317,15 @@ class MetricsProcessor(Configurable):
 
         enable_wandb: bool = False
         """Whether to log metrics to Weights & Biases"""
+
+        enable_reporterv2: bool = False
+        """Whether to log metrics to ReporterV2."""
+
+        reporterv2_training_id: str = field(default_factory=lambda: os.getenv("REPORTERV2_TRAINING_ID", "") or str(uuid.uuid4()))
+        """ReporterV2 training id. Defaults to REPORTERV2_TRAINING_ID or a UUID."""
+
+        reporterv2_host: str = "http://data-gen.comma.life:3080/reporterv2"
+        """ReporterV2 storage endpoint or local path."""
 
     config: Config
     logger: BaseLogger
@@ -381,25 +408,18 @@ class MetricsProcessor(Configurable):
         Build an appropriate metric logger based on configuration.
         """
         # Log initial config state
-        logger.debug(
-            f"Building logger with config: wandb={config.enable_wandb}, "
-            f"tensorboard={config.enable_tensorboard}"
-        )
+        logger.debug(f"Building logger with config: wandb={config.enable_wandb}, tensorboard={config.enable_tensorboard}, reporterv2={config.enable_reporterv2}")
 
         # Check if any logging backend is enabled
-        has_logging_enabled = config.enable_tensorboard or config.enable_wandb
+        has_logging_enabled = config.enable_tensorboard or config.enable_wandb or config.enable_reporterv2
 
         # Determine if this rank should log
         should_log = has_logging_enabled
         if (not config.save_for_all_ranks) and should_log:
-            metrics_rank = _get_metrics_rank(
-                parallel_dims=parallel_dims, pp_schedule=pp_schedule
-            )
+            metrics_rank = _get_metrics_rank(parallel_dims=parallel_dims, pp_schedule=pp_schedule)
             should_log = torch.distributed.get_rank() == metrics_rank
 
-        logger.debug(
-            f"Logging decision: has_logging_enabled={has_logging_enabled}, should_log={should_log}"
-        )
+        logger.debug(f"Logging decision: has_logging_enabled={has_logging_enabled}, should_log={should_log}")
 
         if not should_log:
             logger.debug("Returning BaseLogger due to should_log=False")
@@ -419,9 +439,7 @@ class MetricsProcessor(Configurable):
             )
 
         if config.save_for_all_ranks:
-            base_log_dir = os.path.join(
-                base_log_dir, f"rank_{torch.distributed.get_rank()}"
-            )
+            base_log_dir = os.path.join(base_log_dir, f"rank_{torch.distributed.get_rank()}")
 
         # Create logger container
         logger_container = LoggerContainer()
@@ -430,17 +448,29 @@ class MetricsProcessor(Configurable):
         if config.enable_wandb:
             logger.debug("Attempting to create WandB logger")
             try:
-                wandb_logger = WandBLogger(
-                    base_log_dir, config_dict=config_dict, tag=tag
-                )
+                wandb_logger = WandBLogger(base_log_dir, config_dict=config_dict, tag=tag)
                 logger_container.add_logger(wandb_logger)
             except Exception as e:
                 if "No module named 'wandb'" in str(e):
-                    logger.error(
-                        "Failed to create WandB logger: No module named 'wandb'. Please install it using 'pip install wandb'."
-                    )
+                    logger.error("Failed to create WandB logger: No module named 'wandb'. Please install it using 'pip install wandb'.")
                 else:
                     logger.error(f"Failed to create WandB logger: {e}")
+
+        if config.enable_reporterv2:
+            logger.debug("Attempting to create ReporterV2 logger")
+            try:
+                reporter_logger = ReporterV2Logger(
+                    training_id=config.reporterv2_training_id,
+                    host=config.reporterv2_host,
+                    config_dict=config_dict,
+                    tag=tag,
+                )
+                logger_container.add_logger(reporter_logger)
+            except Exception as e:
+                if "No module named 'reporterv2'" in str(e):
+                    logger.error("Failed to create ReporterV2 logger: No module named 'reporterv2'. Please install reporterv2 or add it to PYTHONPATH.")
+                else:
+                    logger.error(f"Failed to create ReporterV2 logger: {e}")
 
         if config.enable_tensorboard:
             logger.debug("Creating TensorBoard logger")
@@ -477,19 +507,12 @@ class MetricsProcessor(Configurable):
         time_delta = time.perf_counter() - self.time_last_log
 
         # tokens per second per device, abbreviated as tps
-        tps = self.ntokens_since_last_log / (
-            time_delta * self.parallel_dims.non_data_parallel_size
-        )
+        tps = self.ntokens_since_last_log / (time_delta * self.parallel_dims.non_data_parallel_size)
         # model FLOPS utilization
         # For its definition and calculation, please refer to the PaLM paper:
         # https://arxiv.org/abs/2204.02311
-        # MFU is based on BF16 peak FLOPS which is misleading when quantization
-        # (FP8/MX) is active, so we skip it in that case.
         tflops = self.num_flops_per_token * tps / 1e12
-        if self.has_quantization:
-            mfu = None
-        else:
-            mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
+        mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
 
         time_end_to_end = time_delta / self.config.log_freq
         time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
@@ -498,23 +521,23 @@ class MetricsProcessor(Configurable):
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
         metrics = {
-            "loss_metrics/global_avg_loss": global_avg_loss,
-            "loss_metrics/global_max_loss": global_max_loss,
-            "grad_norm": grad_norm,
-            "throughput(tps)": tps,
-            "tflops": tflops,
-            "time_metrics/end_to_end(s)": time_end_to_end,
-            "time_metrics/data_loading(s)": time_data_loading,
-            "time_metrics/data_loading(%)": time_data_loading_pct,
-            "memory/max_active(GiB)": device_mem_stats.max_active_gib,
-            "memory/max_active(%)": device_mem_stats.max_active_pct,
-            "memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
-            "memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
-            "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
-            "memory/num_ooms": device_mem_stats.num_ooms,
+            "metrics/loss/train": global_avg_loss,
+            "metrics/max_loss/train": global_max_loss,
+            "metrics/grad_norm/": grad_norm,
+            "perf_metrics/throughput(tps)/train": tps,
+            "perf_metrics/tflops/train": tflops,
+            "perf_metrics/end_to_end(s)/": time_end_to_end,
+            "perf_metrics/data_loading(s)/": time_data_loading,
+            "perf_metrics/data_loading(%)/": time_data_loading_pct,
+            "memory/max_active(GiB)/train": device_mem_stats.max_active_gib,
+            "memory/max_active(%)/train": device_mem_stats.max_active_pct,
+            "memory/max_reserved(GiB)/train": device_mem_stats.max_reserved_gib,
+            "memory/max_reserved(%)/train": device_mem_stats.max_reserved_pct,
+            "memory/num_alloc_retries/": device_mem_stats.num_alloc_retries,
+            "memory/num_ooms/": device_mem_stats.num_ooms,
         }
         if mfu is not None:
-            metrics["mfu(%)"] = mfu
+            metrics["perf_metrics/mfu(%)/train"] = mfu
 
         if extra_metrics:
             metrics.update(extra_metrics)
@@ -539,25 +562,21 @@ class MetricsProcessor(Configurable):
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
 
-    def log_validation(
-        self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
-    ):
+    def log_validation(self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None):
         time_delta = time.perf_counter() - self.time_last_log
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
         # tokens per second per device, abbreviated as tps
-        tps = self.ntokens_since_last_log / (
-            time_delta * self.parallel_dims.non_data_parallel_size
-        )
+        tps = self.ntokens_since_last_log / (time_delta * self.parallel_dims.non_data_parallel_size)
 
         metrics = {
-            "validation_metrics/loss": loss,
-            "validation_metrics/throughput(tps)": tps,
-            "validation_metrics/memory/max_active(GiB)": device_mem_stats.max_active_gib,
-            "validation_metrics/memory/max_active(%)": device_mem_stats.max_active_pct,
-            "validation_metrics/memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
-            "validation_metrics/memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
+            "metrics/loss/val": loss,
+            "perf_metrics/throughput(tps)/val": tps,
+            "memory/max_active(GiB)/val": device_mem_stats.max_active_gib,
+            "memory/max_active(%)/val": device_mem_stats.max_active_pct,
+            "memory/max_reserved(GiB)/val": device_mem_stats.max_reserved_gib,
+            "memory/max_reserved(%)/val": device_mem_stats.max_reserved_pct,
         }
 
         if extra_metrics:
