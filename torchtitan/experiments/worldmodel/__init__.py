@@ -1,3 +1,4 @@
+from torchtitan.components.optimizer import register_float8_precompute_scale_hook
 from torchtitan.experiments.worldmodel.dataloader import WorldModelDataLoader
 from torchtitan.experiments.worldmodel.model import WorldModel
 from torchtitan.experiments.worldmodel.parallelize import parallelize_worldmodel
@@ -58,7 +59,7 @@ def model_registry(flavor: str, converters: list[ModelConfigConverter.Config] | 
         model=config,
         parallelize_fn=parallelize_worldmodel,
         pipelining_fn=None,
-        post_optimizer_build_fn=None,
+        post_optimizer_build_fn=register_float8_precompute_scale_hook,
         state_dict_adapter=None,
     )
 

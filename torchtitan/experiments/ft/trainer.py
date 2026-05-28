@@ -441,7 +441,6 @@ class FaultTolerantTrainer(Trainer):
         )
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
-        self.post_optimizer_step()
         self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.

@@ -28,10 +28,7 @@ from torchtitan.components.optimizer import (
     OptimizersContainer,
     OptimizersInBackwardContainer,
 )
-from torchtitan.components.quantization.utils import (
-    has_quantization,
-    should_precompute_float8_dynamic_scale_for_fsdp,
-)
+from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
@@ -422,10 +419,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     0
                 ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]
 
-        self.precompute_float8_dynamic_scale_for_fsdp = (
-            should_precompute_float8_dynamic_scale_for_fsdp(model_config)
-        )
-
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
         peak_flops_mul_dtype = (
@@ -732,15 +725,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
 
-    def post_optimizer_step(self) -> None:
-        if not self.precompute_float8_dynamic_scale_for_fsdp:
-            return
-
-        from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-        with sl.log_trace_span("float8_precompute_scales"):
-            for model_part in self.model_parts:
-                precompute_float8_dynamic_scale_for_fsdp(model_part)
-
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -798,7 +782,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
-            self.post_optimizer_step()
             self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.

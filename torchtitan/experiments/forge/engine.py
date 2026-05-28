@@ -16,9 +16,6 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import LossFunction
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.components.quantization.utils import (
-    should_precompute_float8_dynamic_scale_for_fsdp,
-)
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.configs import (
     ActivationCheckpointConfig,
@@ -29,7 +26,6 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
@@ -246,10 +242,6 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
             self.model_parts = [model]
 
-        self.precompute_float8_dynamic_scale_for_fsdp = (
-            should_precompute_float8_dynamic_scale_for_fsdp(model_config)
-        )
-
         # build optimizer after applying parallelisms to the model
         self.optimizers = config.optimizer.build(
             model_parts=self.model_parts,
@@ -281,16 +273,6 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
         )
         self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
-
-    def post_optimizer_step(self) -> None:
-        if not self.precompute_float8_dynamic_scale_for_fsdp:
-            return
-
-        from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-
-        with sl.log_trace_span("float8_precompute_scales"):
-            for model_part in self.model_parts:
-                precompute_float8_dynamic_scale_for_fsdp(model_part)
 
     def close(self) -> None:
         if self.checkpointer:

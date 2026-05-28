@@ -114,7 +114,6 @@ class WorldModelTrainer(Trainer):
             grad_norm = dist_utils.clip_grad_norm_([p for m in self.model_parts for p in m.parameters()], self.config.training.max_norm, foreach=True, pp_mesh=self.parallel_dims.get_optional_mesh("pp"), ep_enabled=self.parallel_dims.ep_enabled)
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
-            self.post_optimizer_step()
             self.lr_schedulers.step()
 
         if not self.metrics_processor.should_log(self.step):
