@@ -20,8 +20,6 @@ class WorldModelTrainer(Trainer):
     class Config(Trainer.Config):
         dataloader: WorldModelDataLoader.Config = field(default_factory=WorldModelDataLoader.Config)  # pyrefly: ignore [bad-override]
         pose_dropout: float = 0.1
-        no_noise_conditioning_frames_prob: float = 0.5
-        fake_timesteps_prob: float = 0.5
         plan_loss_weight: float = 0.1
         noise_scheduler_steps: int = 10
 
@@ -72,10 +70,6 @@ class WorldModelTrainer(Trainer):
                 discrete_timesteps=self.discrete_timesteps,
                 compressor_encoder=self.compressor_encoder,
                 pose_dropout=self.config.pose_dropout,
-                future_size_frames=self.config.dataloader.future_size_frames,
-                inference_conditioning_frames=self.config.dataloader.inference_conditioning_frames,
-                no_noise_conditioning_frames_prob=self.config.no_noise_conditioning_frames_prob,
-                fake_timesteps_prob=self.config.fake_timesteps_prob,
                 train=True,
                 dtype=self._dtype,
             )

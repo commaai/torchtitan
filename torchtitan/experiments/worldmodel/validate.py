@@ -24,8 +24,6 @@ class WorldModelValidator(Validator):
     class Config(Validator.Config):
         dataloader: BaseDataLoader.Config = field(default_factory=lambda: WorldModelDataLoader.Config(mock_data=True, infinite=False))
         pose_dropout: float = 0.0
-        no_noise_conditioning_frames_prob: float = 1.0
-        fake_timesteps_prob: float = 0.0
         plan_loss_weight: float = 0.1
         noise_scheduler_steps: int = 10
 
@@ -105,10 +103,6 @@ class WorldModelValidator(Validator):
                 discrete_timesteps=discrete_timesteps,
                 compressor_encoder=compressor_encoder,
                 pose_dropout=self.config.pose_dropout,
-                future_size_frames=self.dl_config.future_size_frames,
-                inference_conditioning_frames=self.dl_config.inference_conditioning_frames,
-                no_noise_conditioning_frames_prob=self.config.no_noise_conditioning_frames_prob,
-                fake_timesteps_prob=self.config.fake_timesteps_prob,
                 train=False,
             )
             with self.validation_context():

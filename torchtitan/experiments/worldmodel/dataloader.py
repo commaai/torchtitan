@@ -52,20 +52,30 @@ def _dump_info(info: dict[str, Any]) -> np.ndarray:
     from xx.common.helpers import dump_info
     return dump_info(info)
 
-def get_augments_pos_ref_augment_and_ref_augment_from_augments( states, calib_from_device, target_idx=1, ref_idx=0):
+def get_frame_to_frame_pos_euler(states, calib_from_device):
     from openpilot.common.transformations.orientation import euler_from_rot, rot_from_quat
     from xx.stages.lib.ekf_models.loc_kf import States
 
-    target_ecef_from_devices = rot_from_quat(states[target_idx, States.ECEF_ORIENTATION])
-    ref_ecef_from_devices = rot_from_quat(states[ref_idx, States.ECEF_ORIENTATION])
-    target_augment_from_ecef = calib_from_device.dot(target_ecef_from_devices.swapaxes(0, 1))
-    ref_augment_from_ecef = calib_from_device.dot(ref_ecef_from_devices.swapaxes(0, 1))
-    target_augment_pos_ecef = states[target_idx, States.ECEF_POS]
-    ref_augment_pos_ecef = states[ref_idx, States.ECEF_POS]
+    augments_pos_ref_augment = np.zeros((len(states), 3), dtype=np.float64)
+    ref_augment_from_augments_euler = np.zeros((len(states), 3), dtype=np.float64)
 
-    target_augment_pos_ref_augment = ref_augment_from_ecef.dot(target_augment_pos_ecef - ref_augment_pos_ecef)
-    ref_augment_from_target_augment = ref_augment_from_ecef.dot(target_augment_from_ecef.swapaxes(0, 1))
-    return target_augment_pos_ref_augment, euler_from_rot(ref_augment_from_target_augment)
+    if len(states) <= 1:
+      return augments_pos_ref_augment, ref_augment_from_augments_euler
+
+    ecef_from_devices = rot_from_quat(states[:, States.ECEF_ORIENTATION])
+    devices_from_ecef = ecef_from_devices.transpose(0, 2, 1)
+    augments_from_ecef = np.einsum("ad,fde->fae", calib_from_device, devices_from_ecef)
+
+    ref_augments_from_ecef = augments_from_ecef[:-1]
+    target_augments_from_ecef = augments_from_ecef[1:]
+    ecef_from_target_augments = target_augments_from_ecef.transpose(0, 2, 1)
+
+    target_pos_ecef = states[1:, States.ECEF_POS]
+    ref_pos_ecef = states[:-1, States.ECEF_POS]
+    augments_pos_ref_augment[1:] = np.einsum("fae,fe->fa", ref_augments_from_ecef, target_pos_ecef - ref_pos_ecef)
+    ref_augment_from_target_augment = np.einsum("fra,fat->frt", ref_augments_from_ecef, ecef_from_target_augments)
+    ref_augment_from_augments_euler[1:] = euler_from_rot(ref_augment_from_target_augment)
+    return augments_pos_ref_augment, ref_augment_from_augments_euler
 
 
 def get_data_from_seg(target: str, config, val: bool, local_rank: int):
@@ -122,17 +132,11 @@ def get_data_from_seg(target: str, config, val: bool, local_rank: int):
     batch, timesteps = states_sim_times.shape[:2]
     augments_pos_ref_augment = np.zeros((batch, timesteps, 3))
     ref_augment_from_augments_euler = np.zeros((batch, timesteps, 3))
+
     for idx in range(len(states_sim_times)):
-        ref_idx = config.context_size_frames - 2
-        target_idx = config.context_size_frames - 1
-        pose = get_augments_pos_ref_augment_and_ref_augment_from_augments(
-            states_sim_times[idx],
-            calib_from_device=calib_from_device,
-            ref_idx=ref_idx,
-            target_idx=target_idx,
-        )
-        augments_pos_ref_augment[idx][target_idx] = pose[0]
-        ref_augment_from_augments_euler[idx][target_idx] = pose[1]
+        pose = get_frame_to_frame_pos_euler(states_sim_times[idx], calib_from_device=calib_from_device)
+        augments_pos_ref_augment[idx] = pose[0]
+        ref_augment_from_augments_euler[idx] = pose[1]
 
     plan_sim_times = plan_sim_times[idxs - config.max_future_frames + config.context_size_frames]
     nan_filter = np.isnan(augments_pos_ref_augment).any(axis=(1, 2))
