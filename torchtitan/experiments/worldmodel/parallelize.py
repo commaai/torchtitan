@@ -8,7 +8,7 @@ from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully
 
 from torchtitan.config import ActivationCheckpointConfig, CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.fsdp import disable_fsdp_gradient_division, enable_fsdp_symm_mem
+from torchtitan.distributed.fsdp import enable_fsdp_symm_mem
 from torchtitan.tools.logging import logger
 
 
@@ -42,7 +42,6 @@ def parallelize_worldmodel(
         cpu_offload=training.enable_cpu_offload,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
-    logger.info("Applied fully_shard to the worldmodel")
     return model
 
 
@@ -59,7 +58,7 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    leaf_modules = [
+    embds = [
         model.x_embedder,
         model.position_scale,
         model.euler_scale,
@@ -69,7 +68,7 @@ def apply_fsdp(
         model.t_embedder,
         model.fidx_embedder,
     ]
-    for module in leaf_modules:
+    for module in embds:
         fully_shard(module, **fsdp_config)
 
     for idx, block in enumerate(model.blocks):
@@ -87,12 +86,14 @@ def apply_fsdp(
 
     if enable_symm_mem:
         enable_fsdp_symm_mem(model)
-    disable_fsdp_gradient_division(model)
 
+    logger.info("Applied fully_shard to the worldmodel")
 
 def apply_compile(model: nn.Module, compile_config: CompileConfig):
-    modules = [
+    embds = [
         model.x_embedder,
+        model.position_scale,
+        model.euler_scale,
         model.augments_pos_ref_augment_embedder,
         model.ref_augment_from_augments_euler_embedder,
         model.pose_mask_embedder,
@@ -100,15 +101,15 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
         model.fidx_embedder,
     ]
     if model.final_layer is not None:
-        modules.append(model.final_layer)
-
-    for module in modules:
+        embds.append(model.final_layer)
+    for module in embds:
         module.compile(backend=compile_config.backend, fullgraph=True)
     for block in model.blocks:
         block.compile(backend=compile_config.backend, fullgraph=True)
     if model.plan_head is not None:
         for block in model.plan_head.mlps:
             block.compile(backend=compile_config.backend, fullgraph=True)
+
     logger.info("Compiled worldmodel blocks with torch.compile")
 
 

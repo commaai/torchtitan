@@ -7,39 +7,6 @@ from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
 
-def _worldmodel_debug() -> WorldModel.Config:
-    return WorldModel.Config(
-        input_size=(15, 16, 32),
-        patch_size=(1, 2, 2),
-        in_channels=32,
-        out_channels=32,
-        transformer=TransformerConfig(
-            n_layer=2,
-            n_head=4,
-            n_embd=64,
-            act="GELU",
-            resid_pdrop=0.0,
-            attn_pdrop=0.0,
-            biased_linears=True,
-            qk_norm=True,
-            prenorm=False,
-            mlp_multiple_of=16,
-            attention_mask="BLOCKWISE_LOWER_TRIANGLE",
-            attention_impl="FLEX",
-        ),
-        plan_head=TransformerConfig(
-            n_layer=1,
-            n_head=4,
-            n_embd=64,
-            act="GELU",
-            biased_linears=True,
-            prenorm=True,
-            mlp_mult=2,
-            mlp_multiple_of=1,
-        ),
-    )
-
-
 def _worldmodel_base() -> WorldModel.Config:
     return WorldModel.Config(
         input_size=(15, 16, 32),
@@ -75,7 +42,6 @@ def _worldmodel_base() -> WorldModel.Config:
 
 
 worldmodel_configs = {
-    "debug": _worldmodel_debug,
     "base": _worldmodel_base,
 }
 

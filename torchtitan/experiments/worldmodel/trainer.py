@@ -2,9 +2,7 @@ import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import cast
-
 import torch
-
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
@@ -16,7 +14,6 @@ from torchtitan.experiments.worldmodel.schedulers import RFScheduler
 from torchtitan.experiments.worldmodel.step import compute_worldmodel_losses, prepare_worldmodel_batch
 from torchtitan.observability import structured_logger as sl
 from torchtitan.trainer import Trainer
-
 
 class WorldModelTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
@@ -35,7 +32,7 @@ class WorldModelTrainer(Trainer):
     def __init__(self, config: Config):
         self._last_loss_terms: dict[str, torch.Tensor] = {}
         super().__init__(config)
-
+        dist_utils.set_determinism(self.parallel_dims, self.device,config.debug, distinct_seed_mesh_dims=["fsdp", "dp_replicate"])
         self._dtype = TORCH_DTYPE_MAP[config.training.mixed_precision_param] if self.parallel_dims.dp_shard_enabled else TORCH_DTYPE_MAP[config.training.dtype]
         self.train_noise_scheduler = RFScheduler(steps=config.noise_scheduler_steps).to(device=self.device)
         self.discrete_timesteps = self.train_noise_scheduler.timesteps[:-1]
@@ -90,20 +87,9 @@ class WorldModelTrainer(Trainer):
             with sl.log_trace_span("worldmodel_forward"):
                 outputs = model(**model_inputs)
             with sl.log_trace_span("worldmodel_loss"):
-                per_sample_loss, terms = compute_worldmodel_losses(
-                    outputs,
-                    targets,
-                    batch_size=bsz,
-                    plan_loss_weight=self.config.plan_loss_weight,
-                )
+                per_sample_loss, terms = compute_worldmodel_losses( outputs, targets, batch_size=bsz, plan_loss_weight=self.config.plan_loss_weight)
 
-            if self.parallel_dims.dp_enabled:
-                local_items = torch.tensor(per_sample_loss.numel(), dtype=torch.float32, device=self.device)
-                global_items = dist_utils.dist_sum(local_items, self.parallel_dims.get_mesh("batch"))
-                loss = per_sample_loss.sum() / max(global_items, 1.0)
-            else:
-                loss = per_sample_loss.mean()
-
+            loss = per_sample_loss.mean()
             self._last_loss_terms = terms
             del outputs, per_sample_loss
             with sl.log_trace_span("worldmodel_backward"):
@@ -128,6 +114,7 @@ class WorldModelTrainer(Trainer):
             grad_norm = dist_utils.clip_grad_norm_([p for m in self.model_parts for p in m.parameters()], self.config.training.max_norm, foreach=True, pp_mesh=self.parallel_dims.get_optional_mesh("pp"), ep_enabled=self.parallel_dims.ep_enabled)
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
+            self.post_optimizer_step()
             self.lr_schedulers.step()
 
         if not self.metrics_processor.should_log(self.step):
@@ -136,7 +123,7 @@ class WorldModelTrainer(Trainer):
         local_loss = self._last_loss_terms["loss"].mean()
         if self.parallel_dims.dp_cp_enabled:
             loss_mesh = self.parallel_dims.get_optional_mesh("loss")
-            global_avg_loss = dist_utils.dist_sum(loss.detach(), loss_mesh)
+            global_avg_loss = dist_utils.dist_mean(local_loss, loss_mesh)
             global_max_loss = dist_utils.dist_max(local_loss, loss_mesh)
             global_ntokens_seen = dist_utils.dist_sum(torch.tensor(self.ntokens_seen, dtype=torch.int64, device=self.device), loss_mesh)
         else:
@@ -172,10 +159,4 @@ class WorldModelTrainer(Trainer):
             }
         )
 
-        self.metrics_processor.log(
-            self.step,
-            global_avg_loss,
-            global_max_loss,
-            float(grad_norm.item()),
-            extra_metrics=extra_metrics,
-        )
+        self.metrics_processor.log(self.step, global_avg_loss, global_max_loss, float(grad_norm.item()), extra_metrics=extra_metrics)

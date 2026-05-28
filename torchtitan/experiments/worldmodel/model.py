@@ -533,7 +533,13 @@ class WorldModel(BaseModel):
         if isinstance(target_device, str):
             target_device = torch.device(target_device)
         self.setup_attention_attrs(target_device)
-        self.reset_parameters()
+
+        def _reset(module):
+            module = getattr(module, "_checkpoint_wrapped_module", module)
+            if hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+
+        self.apply(_reset)
 
         def _init(module):
             module = getattr(module, "_checkpoint_wrapped_module", module)

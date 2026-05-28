@@ -27,37 +27,9 @@ def _floating_model_dtype(model: torch.nn.Module) -> torch.dtype:
     return torch.float32
 
 
-def get_pose_dropout_mask(*, batch_size: int, num_frames: int, inference_conditioning_frames: int, pose_dropout: float, device: torch.device, train: bool) -> torch.Tensor:
-    pose_mask = torch.ones((batch_size, num_frames), device=device, dtype=torch.bool)
+def get_pose_dropout_mask(*, batch_size: int, num_frames: int, pose_dropout: float, device: torch.device, train: bool) -> torch.Tensor:
     drop_prob = pose_dropout if train else 0.0
-    drop_pose = torch.rand((batch_size, 1), device=device) < drop_prob
-    pose_mask[:, inference_conditioning_frames:] = drop_pose
-    return pose_mask
-
-
-def augment_timesteps(
-    *,
-    timesteps: torch.Tensor,
-    mask: torch.Tensor,
-    scheduler: torch.nn.Module,
-    batch_size: int,
-    future_size_frames: int,
-    inference_conditioning_frames: int,
-    no_noise_conditioning_frames_prob: float,
-    fake_timesteps_prob: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    fake_timesteps = timesteps.clone()
-    if torch.rand((), device=timesteps.device) < no_noise_conditioning_frames_prob:
-        mask[:, :inference_conditioning_frames] = False
-        timesteps[:, :inference_conditioning_frames] = scheduler.no_noise_timestep
-        fake_timesteps[:, :inference_conditioning_frames] = scheduler.no_noise_timestep
-
-        fake_count = inference_conditioning_frames - future_size_frames
-        fake_sample = torch.rand((), device=timesteps.device)
-        if fake_count > 0 and fake_sample < fake_timesteps_prob:
-            fake_timesteps[:, future_size_frames:inference_conditioning_frames] = scheduler.sample_timestep((batch_size, fake_count))
-            mask[:, future_size_frames:] = True
-    return timesteps, fake_timesteps, mask
+    return torch.rand((batch_size, num_frames), device=device) < drop_prob
 
 
 def laplacian_density_loss(
@@ -89,24 +61,11 @@ def prepare_worldmodel_batch(
     discrete_timesteps: torch.Tensor,
     compressor_encoder: torch.nn.Module,
     pose_dropout: float,
-    future_size_frames: int,
-    inference_conditioning_frames: int,
-    no_noise_conditioning_frames_prob: float,
-    fake_timesteps_prob: float,
     train: bool,
     dtype: torch.dtype | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    model_dtype = dtype or _floating_model_dtype(model)
-    if "imgs" not in input_dict or "big_imgs" not in input_dict:
-        raise ValueError("worldmodel v1 requires imgs and big_imgs")
-
-    latents = images_to_latents(
-        compressor_encoder,
-        input_dict["imgs"],
-        input_dict["big_imgs"],
-        device=device,
-        dtype=model_dtype,
-    )
+    model_dtype = dtype or _floating_model_dtype(model) # TODO might not be needed
+    latents = images_to_latents(compressor_encoder, input_dict["imgs"], input_dict["big_imgs"], device=device, dtype=model_dtype)
     augments_pos_ref_augment = input_dict["augments_pos_ref_augment"].to(device=device, dtype=model_dtype)
     ref_augment_from_augments_euler = input_dict["ref_augment_from_augments_euler"].to(device=device, dtype=model_dtype)
     fidxs = input_dict["fidxs"].to(device=device, dtype=torch.int64)
@@ -117,56 +76,25 @@ def prepare_worldmodel_batch(
         latents = model.scale_latents(latents)
         noise = torch.randn_like(latents)
         if train:
-            timesteps_1d = scheduler.sample_timestep((batch_size,))
-            discrete = discrete_timesteps[(timesteps_1d.unsqueeze(-1) - discrete_timesteps.unsqueeze(0)).abs().argmin(dim=-1)]
+            timesteps = scheduler.sample_timestep((batch_size, num_frames))
         else:
             indexes = torch.randint(0, discrete_timesteps.numel(), (batch_size,), device=device)
-            timesteps_1d = discrete_timesteps[indexes]
-            discrete = timesteps_1d.clone()
+            timesteps = discrete_timesteps[indexes][:, None].expand(-1, num_frames).clone()
 
-        timesteps = timesteps_1d[:, None].expand(-1, num_frames).clone()
-        pose_mask = get_pose_dropout_mask(
-            batch_size=batch_size,
-            num_frames=num_frames,
-            inference_conditioning_frames=inference_conditioning_frames,
-            pose_dropout=pose_dropout,
-            device=device,
-            train=train,
-        )
-        augments_pos_ref_augment = augments_pos_ref_augment.clone()
-        ref_augment_from_augments_euler = ref_augment_from_augments_euler.clone()
+        pose_mask = get_pose_dropout_mask(batch_size=batch_size, num_frames=num_frames, pose_dropout=pose_dropout, device=device, train=train)
         augments_pos_ref_augment[pose_mask] = 0
         ref_augment_from_augments_euler[pose_mask] = 0
-
+        pose_mask = pose_mask.to(dtype=torch.int64)
         mask = torch.ones_like(latents, device=device, dtype=torch.bool)
-        timesteps, fake_timesteps, mask = augment_timesteps(
-            timesteps=timesteps,
-            mask=mask,
-            scheduler=scheduler,
-            batch_size=batch_size,
-            future_size_frames=future_size_frames,
-            inference_conditioning_frames=inference_conditioning_frames,
-            no_noise_conditioning_frames_prob=no_noise_conditioning_frames_prob,
-            fake_timesteps_prob=fake_timesteps_prob,
-        )
-        noisy_latents = scheduler.add_noise(latents, noise, fake_timesteps)
-        targets = {
-            **targets,
-            "v": latents - noise,
-            "mask": mask,
-            "debug": {
-                "fake_timesteps": fake_timesteps.detach(),
-                "timesteps": timesteps.detach(),
-                "discrete_timesteps": discrete.detach(),
-            },
-        }
+        noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+        targets = {**targets, "v": latents - noise, "mask": mask}
 
     return {
         "x": noisy_latents,
         "t": timesteps,
         "augments_pos_ref_augment": augments_pos_ref_augment,
         "ref_augment_from_augments_euler": ref_augment_from_augments_euler,
-        "pose_mask": pose_mask.to(dtype=torch.int64),
+        "pose_mask": pose_mask,
         "fidx": fidxs,
     }, targets
 

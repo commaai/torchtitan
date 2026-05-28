@@ -181,6 +181,8 @@ class ReporterV2Logger(BaseLogger):
         from reporterv2 import ReporterV2
 
         reporter_config = dict(config_dict or {})
+        metrics_config = reporter_config.get("metrics", {})
+        self.save_freq = int(metrics_config.get("save_freq", 1))
         model_spec = reporter_config.get("model_spec", {})
         training_id = training_id or os.getenv("REPORTERV2_TRAINING_ID", "") or reporter_config.get("training_id", "") or str(uuid.uuid4())
         reporter_config["training_id"] = training_id
@@ -193,7 +195,8 @@ class ReporterV2Logger(BaseLogger):
         if self.tag is not None:
             metrics = {f"{self.tag}/{key}": value for key, value in metrics.items()}
         self.reporter.buffer_metrics(step=step, epoch=step, metrics=metrics)
-        self.reporter.save_metrics()
+        if step == 1 or step % self.save_freq == 0:
+            self.reporter.save_metrics()
 
     def close(self) -> None:
         self.reporter.close()
@@ -297,6 +300,9 @@ class MetricsProcessor(Configurable):
     class Config(Configurable.Config):
         log_freq: int = 10
         """How often to log metrics to TensorBoard, in iterations"""
+
+        save_freq: int = 1
+        """How often to save buffered ReporterV2 metrics, in iterations."""
 
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""
