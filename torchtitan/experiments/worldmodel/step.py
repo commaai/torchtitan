@@ -123,7 +123,8 @@ def compute_worldmodel_losses(
         plan_target = targets["plan"].to(device=plan_pred.device, dtype=plan_pred.dtype)
         plan_values = plan_pred.shape[-1] // 2
         plan_loss = laplacian_density_loss(plan_target.float(), plan_pred.float()).flatten(1).mean(dim=1)
-        plan_mse = F.mse_loss(plan_pred[..., :plan_values].float(), plan_target[..., :plan_values].float(), reduction="none").flatten(1).mean(dim=1)
+        plan_squared_error = F.mse_loss(plan_pred[..., :plan_values].float(), plan_target[..., :plan_values].float(), reduction="none").flatten(1)
+        plan_mse = torch.nanmean(plan_squared_error, dim=1)
         loss = loss + (plan_loss_weight if "sample" in outputs else 1.0) * plan_loss
         terms["plan_loss"] = plan_loss.detach()
         terms["plan_mse"] = plan_mse.detach()
