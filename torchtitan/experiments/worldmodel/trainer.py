@@ -9,10 +9,13 @@ from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.worldmodel.compressor import load_compressor_encoder
 from torchtitan.experiments.worldmodel.config import validate_and_finalize_worldmodel_config
 from torchtitan.experiments.worldmodel.dataloader import WorldModelDataLoader
+from torchtitan.experiments.worldmodel.loss import WorldModelLoss
 from torchtitan.experiments.worldmodel.model import WorldModel
 from torchtitan.experiments.worldmodel.schedulers import RFScheduler
-from torchtitan.experiments.worldmodel.step import compute_worldmodel_losses, prepare_worldmodel_batch
+from torchtitan.experiments.worldmodel.step import prepare_worldmodel_batch
+from torchtitan.experiments.worldmodel.validate import WorldModelValidator
 from torchtitan.observability import structured_logger as sl
+from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 
 class WorldModelTrainer(Trainer):
@@ -20,7 +23,6 @@ class WorldModelTrainer(Trainer):
     class Config(Trainer.Config):
         dataloader: WorldModelDataLoader.Config = field(default_factory=WorldModelDataLoader.Config)  # pyrefly: ignore [bad-override]
         pose_dropout: float = 0.1
-        plan_loss_weight: float = 0.1
         noise_scheduler_steps: int = 10
 
         def __post_init__(self) -> None:
@@ -36,10 +38,14 @@ class WorldModelTrainer(Trainer):
         self.discrete_timesteps = self.train_noise_scheduler.timesteps[:-1]
         self.compressor_encoder = load_compressor_encoder(
             compressor_model=config.dataloader.compressor_model,
-            encoder_path=config.dataloader.compressor_encoder_path,
             device=self.device,
             dtype=self._dtype,
         )
+        if config.validator.enable:
+            validator = cast(WorldModelValidator, self.validator)
+            validator.compressor_encoder = self.compressor_encoder
+            validator._dtype = self._dtype
+            logger.info(f"Reusing trainer compressor encoder for worldmodel validation with dtype {self._dtype}")
 
     def batch_generator(self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]]) -> Iterator[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]]:
         data_iterator = iter(data_iterable)
@@ -81,7 +87,7 @@ class WorldModelTrainer(Trainer):
             with sl.log_trace_span("worldmodel_forward"):
                 outputs = model(**model_inputs)
             with sl.log_trace_span("worldmodel_loss"):
-                per_sample_loss, terms = compute_worldmodel_losses( outputs, targets, batch_size=bsz, plan_loss_weight=self.config.plan_loss_weight)
+                per_sample_loss, terms = cast(WorldModelLoss, self.loss_fn)(outputs, targets)
 
             loss = per_sample_loss.mean()
             self._last_loss_terms = terms
@@ -102,10 +108,16 @@ class WorldModelTrainer(Trainer):
         with sl.log_trace_span("worldmodel_fetch_batch"):
             input_dict, targets = next(data_iterator)
         with sl.log_trace_span("worldmodel_forward_backward"):
-            loss = self.forward_backward_step(input_dict=input_dict, targets=targets)
+            self.forward_backward_step(input_dict=input_dict, targets=targets)
 
         with sl.log_trace_span("worldmodel_optim"):
-            grad_norm = dist_utils.clip_grad_norm_([p for m in self.model_parts for p in m.parameters()], self.config.training.max_norm, foreach=True, pp_mesh=self.parallel_dims.get_optional_mesh("pp"), ep_enabled=self.parallel_dims.ep_enabled)
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.config.training.max_norm,
+                foreach=True,
+                pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=self.parallel_dims.ep_enabled,
+            )
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
             self.lr_schedulers.step()

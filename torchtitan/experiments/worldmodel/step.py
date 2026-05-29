@@ -1,10 +1,9 @@
 from typing import Any
 
-import math
 import torch
-import torch.nn.functional as F
 
 from torchtitan.experiments.worldmodel.compressor import images_to_latents
+from torchtitan.experiments.worldmodel.loss import compute_worldmodel_losses, laplacian_density_loss  # noqa: F401
 from torchtitan.experiments.worldmodel.model import WorldModel
 
 
@@ -30,25 +29,6 @@ def _floating_model_dtype(model: torch.nn.Module) -> torch.dtype:
 def get_pose_dropout_mask(*, batch_size: int, num_frames: int, pose_dropout: float, device: torch.device, train: bool) -> torch.Tensor:
     drop_prob = pose_dropout if train else 0.0
     return torch.rand((batch_size, num_frames), device=device) < drop_prob
-
-
-def laplacian_density_loss(
-    y_true: torch.Tensor,
-    y_pred: torch.Tensor,
-    *,
-    std_clamp: float = 1e-3,
-    loss_clamp: float = 1000.0,
-) -> torch.Tensor:
-    n_values = y_pred.shape[-1] // 2
-    mu_true = y_true[..., :n_values]
-    mu_pred = y_pred[..., :n_values]
-    mask = ~torch.isnan(mu_true)
-    mu_true = mu_true.masked_fill(~mask, 0).detach()
-    log_sigma_raw = y_pred[..., n_values:]
-    err = torch.abs(mu_true - mu_pred)
-    log_sigma_min = torch.clamp(log_sigma_raw, min=math.log(std_clamp))
-    log_sigma = torch.max(log_sigma_raw, torch.log(1e-6 + err / loss_clamp))
-    return mask * (err * torch.exp(-log_sigma) + log_sigma_min)
 
 
 def prepare_worldmodel_batch(
@@ -97,40 +77,3 @@ def prepare_worldmodel_batch(
         "pose_mask": pose_mask,
         "fidx": fidxs,
     }, targets
-
-
-def compute_worldmodel_losses(
-    outputs: dict[str, torch.Tensor],
-    targets: dict[str, torch.Tensor],
-    *,
-    batch_size: int,
-    plan_loss_weight: float,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    loss = torch.zeros((batch_size,), device=next(iter(outputs.values())).device)
-    terms: dict[str, torch.Tensor] = {}
-
-    if "sample" in outputs:
-        pred = outputs["sample"]
-        target = targets["v"].to(dtype=pred.dtype)
-        mse = F.mse_loss(pred.float(), target.float(), reduction="none").flatten(1)
-        flat_mask = targets["mask"].flatten(1).float()
-        diffusion_loss = (mse * flat_mask).sum(dim=1) / flat_mask.sum(dim=1).clamp_min(1.0)
-        loss = loss + diffusion_loss
-        terms["diffusion_loss"] = diffusion_loss.detach()
-
-    if "plan" in outputs and "plan" in targets:
-        plan_pred = outputs["plan"]
-        plan_target = targets["plan"].to(device=plan_pred.device, dtype=plan_pred.dtype)
-        plan_values = plan_pred.shape[-1] // 2
-        plan_loss = laplacian_density_loss(plan_target.float(), plan_pred.float()).flatten(1).mean(dim=1)
-        plan_squared_error = F.mse_loss(plan_pred[..., :plan_values].float(), plan_target[..., :plan_values].float(), reduction="none").flatten(1)
-        plan_mse = torch.nanmean(plan_squared_error, dim=1)
-        loss = loss + (plan_loss_weight if "sample" in outputs else 1.0) * plan_loss
-        terms["plan_loss"] = plan_loss.detach()
-        terms["plan_mse"] = plan_mse.detach()
-
-    if not terms:
-        raise RuntimeError("worldmodel produced no trainable loss outputs")
-
-    terms["loss"] = loss.detach()
-    return loss, terms

@@ -102,6 +102,9 @@ class BaseLogger:
     def log(self, metrics: dict[str, Any], step: int) -> None:
         pass
 
+    def write_report(self, html: str, step: int, name: str, output_type: str) -> None:
+        pass
+
     def close(self) -> None:
         pass
 
@@ -198,6 +201,9 @@ class ReporterV2Logger(BaseLogger):
         if step == 1 or step % self.save_freq == 0:
             self.reporter.save_metrics()
 
+    def write_report(self, html: str, step: int, name: str, output_type: str) -> None:
+        self.reporter.write_report(html, step=step, name=name, output_type=output_type)
+
     def close(self) -> None:
         self.reporter.close()
 
@@ -214,6 +220,10 @@ class LoggerContainer(BaseLogger):
     def log(self, metrics: dict[str, Any], step: int) -> None:
         for logger_instance in self._loggers:
             logger_instance.log(metrics, step)
+
+    def write_report(self, html: str, step: int, name: str, output_type: str) -> None:
+        for logger_instance in self._loggers:
+            logger_instance.write_report(html, step, name, output_type)
 
     @property
     def number_of_loggers(self) -> int:
@@ -602,6 +612,15 @@ class MetricsProcessor(Configurable):
         self.ntokens_since_last_log = 0
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
+
+    def write_report(
+        self,
+        html: str,
+        step: int,
+        name: str,
+        output_type: str,
+    ) -> None:
+        self.logger.write_report(html, step, name, output_type)
 
     def close(self):
         self.logger.close()

@@ -262,7 +262,6 @@ class WorldModelDataLoader(ParallelAwareDataloader):
 
         base_dir: str = "http://data-ssd.comma.life/runner/training_2025_07"
         compressor_model: str = "4672da0d-19f5-44f8-a5fb-2215981c9c0e"
-        compressor_encoder_path: str = ""
         in_channels: int = 32
         latent_size: tuple[int, int] = (16, 32)
         image_size: tuple[int, int] = (128, 256)

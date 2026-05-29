@@ -6,12 +6,9 @@ COMPRESSOR_IN_CHANNELS = 6
 MAX_UINT8 = 255.0
 
 
-def load_compressor_encoder(*, compressor_model: str, encoder_path: str, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
-    if encoder_path:
-        compressor = torch.jit.load(encoder_path, map_location="cpu")
-    else:
-        from xx.training.lib.checkpoint import Checkpoint
-        compressor = torch.jit.load(io.BytesIO(Checkpoint(compressor_model)["encoder.jit"]), map_location="cpu")
+def load_compressor_encoder(*, compressor_model: str, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
+    from xx.training.lib.checkpoint import Checkpoint
+    compressor = torch.jit.load(io.BytesIO(Checkpoint(compressor_model)["encoder.jit"]), map_location="cpu")
     return compressor.to(device=device, dtype=dtype).eval()
 
 

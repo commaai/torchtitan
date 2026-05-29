@@ -1,11 +1,11 @@
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import MSELoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.quantization import Float8LinearConverter
 from torchtitan.config import ActivationCheckpointConfig, CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.experiments.worldmodel.dataloader import WorldModelDataLoader
+from torchtitan.experiments.worldmodel.loss import WorldModelLoss
 from torchtitan.experiments.worldmodel.trainer import WorldModelTrainer
 from torchtitan.experiments.worldmodel.validate import WorldModelValidator
 
@@ -49,9 +49,8 @@ def _base_dataloader(*, infinite: bool = True) -> WorldModelDataLoader.Config:
         max_future_frames=50,
         inference_conditioning_frames=14,
         fps=5,
-        train_skip=40,
+        train_skip=100,
         val_skip=800,
-        compressor_model="4672da0d-19f5-44f8-a5fb-2215981c9c0e",
     )
 
 
@@ -59,7 +58,7 @@ def worldmodel() -> WorldModelTrainer.Config:
     dataloader = _base_dataloader()
     return WorldModelTrainer.Config(
         hf_assets_path="./tests/assets/tokenizer",
-        loss=MSELoss.Config(),
+        loss=WorldModelLoss.Config(plan_loss_weight=0.1),
         model_spec=model_registry("base", converters=[_blocks_only_float8(model_compile_enabled=True)]),
         optimizer=OptimizersContainer.Config(
             name="AdamW",
@@ -83,12 +82,13 @@ def worldmodel() -> WorldModelTrainer.Config:
         # TODO: 16/8 hard coded?
         parallelism=ParallelismConfig(data_parallel_replicate_degree=16, data_parallel_shard_degree=8),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        compile=CompileConfig(enable=True),
+        compile=CompileConfig(enable=True, components=["model", "loss"]),
         checkpoint=CheckpointManager.Config(enable=False, interval=1000, last_save_model_only=False),
         validator=WorldModelValidator.Config(
-            enable=False,
-            freq=1000,
-            steps=10,
+            enable=True,
+            freq=10,
+            steps=8,
+            cache_data=True,
             dataloader=_base_dataloader(infinite=False),
         ),
     )

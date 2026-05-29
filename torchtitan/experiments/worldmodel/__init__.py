@@ -1,5 +1,6 @@
 from torchtitan.components.optimizer import register_float8_precompute_scale_hook
 from torchtitan.experiments.worldmodel.dataloader import WorldModelDataLoader
+from torchtitan.experiments.worldmodel.loss import WorldModelLoss
 from torchtitan.experiments.worldmodel.model import WorldModel
 from torchtitan.experiments.worldmodel.parallelize import parallelize_worldmodel
 from torchtitan.experiments.worldmodel.transformer import TransformerConfig
@@ -68,6 +69,7 @@ __all__ = [
     "TransformerConfig",
     "WorldModel",
     "WorldModelDataLoader",
+    "WorldModelLoss",
     "model_registry",
     "parallelize_worldmodel",
     "worldmodel_configs",

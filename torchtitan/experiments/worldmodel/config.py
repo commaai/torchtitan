@@ -1,6 +1,7 @@
 from typing import Any
 
 from torchtitan.experiments.worldmodel.dataloader import WorldModelDataLoader
+from torchtitan.experiments.worldmodel.loss import WorldModelLoss
 from torchtitan.experiments.worldmodel.model import WorldModel
 
 
@@ -9,6 +10,8 @@ def validate_and_finalize_worldmodel_config(config: Any) -> None:
         raise TypeError("worldmodel requires WorldModelDataLoader.Config")
     if config.model_spec is None:
         raise ValueError("worldmodel requires a model_spec")
+    if not isinstance(config.loss, WorldModelLoss.Config):
+        raise TypeError("worldmodel requires WorldModelLoss.Config")
 
     model_config = config.model_spec.model
     if not isinstance(model_config, WorldModel.Config):
