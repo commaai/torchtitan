@@ -35,16 +35,4 @@ Note that if both W&B and Tensorboard are enabled then we will prioritize W&B.
 
 ## ReporterV2
 
-ReporterV2 can be enabled with `metrics.enable_reporterv2`. TorchTitan sends
-metrics only; checkpoint upload is intentionally left to TorchTitan's DCP
-checkpoint manager.
-
-```
-MODULE=worldmodel CONFIG=worldmodel_debugmodel ./run_train.sh \
-  --metrics.enable_reporterv2 \
-  --metrics.reporterv2_training_id my-run-id \
-  --metrics.reporterv2_host http://data-gen.comma.life:3080/reporterv2
-```
-
-If `metrics.reporterv2_training_id` is empty, TorchTitan uses
-`REPORTERV2_TRAINING_ID` or generates a UUID.
+ReporterV2 can be enabled with `metrics.enable_reporterv2`.
