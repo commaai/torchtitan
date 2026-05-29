@@ -16,7 +16,7 @@ def _worldmodel_base() -> WorldModel.Config:
         in_channels=32,
         out_channels=32,
         transformer=TransformerConfig(
-            n_layer=48,
+            n_layer=51,
             n_head=36,
             n_embd=2304,
             act="GELU",
@@ -26,7 +26,7 @@ def _worldmodel_base() -> WorldModel.Config:
             qk_norm=True,
             prenorm=False,
             mlp_multiple_of=256,
-            attention_mask="BLOCKWISE_LOWER_TRIANGLE",
+            attention_mask="NONE",
             attention_impl="FLEX",
         ),
         plan_head=TransformerConfig(

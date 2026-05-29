@@ -568,7 +568,7 @@ class WorldModel(BaseModel):
     def scale_latents(self, latents):
         return (latents - self.config.compressor_mean) / self.config.compressor_std
 
-    def forward(self, x, t, augments_pos_ref_augment, ref_augment_from_augments_euler, pose_mask, fidx):
+    def forward(self, x, t, augments_pos_ref_augment, ref_augment_from_augments_euler, pose_mask, fidx, return_plan: bool = True):
         x = self.x_embedder(x) + self.pos_embed
         augments_pos_ref_augment = self.position_scale(augments_pos_ref_augment)
         ref_augment_from_augments_euler = self.euler_scale(ref_augment_from_augments_euler)
@@ -585,7 +585,7 @@ class WorldModel(BaseModel):
             x = block(x, t6, self.mask)
 
         outputs = {}
-        if self.plan_head is not None:
+        if return_plan and self.plan_head is not None:
             outputs["plan"] = self.plan_head(x[:, -1, :])
         if self.final_layer is not None:
             outputs["sample"] = self.unpatchify(self.final_layer(x, t2))

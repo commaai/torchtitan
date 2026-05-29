@@ -38,13 +38,20 @@ def _blocks_only_float8(*, emulate: bool = False, model_compile_enabled: bool = 
     )
 
 
-def _base_dataloader(*, infinite: bool = True) -> WorldModelDataLoader.Config:
+def _base_dataloader(
+    *,
+    infinite: bool = True,
+    num_workers: int = 2,
+    persistent_workers: bool = True,
+    prefetch_factor: int | None = 16,
+    skip: int = 100,
+) -> WorldModelDataLoader.Config:
     return WorldModelDataLoader.Config(
         infinite=infinite,
         mock_data=False,
-        num_workers=2,
-        prefetch_factor=16,
-        persistent_workers=True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
         multiprocessing_context="spawn",
         in_order=False,
         in_channels=32,
@@ -54,8 +61,7 @@ def _base_dataloader(*, infinite: bool = True) -> WorldModelDataLoader.Config:
         max_future_frames=50,
         inference_conditioning_frames=14,
         fps=5,
-        train_skip=100,
-        val_skip=800,
+        skip=skip,
     )
 
 
@@ -67,30 +73,30 @@ def worldmodel() -> WorldModelTrainer.Config:
         model_spec=model_registry("base", converters=[_blocks_only_float8(model_compile_enabled=True)]),
         optimizer=OptimizersContainer.Config(
             name="AdamW",
-            lr=1e-4,
+            lr=1e-3,
             beta1=0.9,
             beta2=0.95,
             weight_decay=1e-2,
             implementation="fused_opt_states_bf16",
         ),
-        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=128, decay_ratio=0.1, decay_type="cosine"),
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=512, decay_ratio=0.1, decay_type="cosine"),
         training=TrainingConfig(
             local_batch_size=16,
-            steps=512 * 10,
+            steps=512 * 100,
             dtype="float32",
             mixed_precision_param="bfloat16",
             mixed_precision_reduce="bfloat16",
             max_norm=1.0,
         ),
         dataloader=dataloader,
-        metrics=MetricsProcessor.Config(log_freq=100),
+        metrics=MetricsProcessor.Config(enable_reporterv2=True, log_freq=1, save_freq=512),
         # TODO: 16/8 hard coded?
-        parallelism=ParallelismConfig(data_parallel_replicate_degree=16, data_parallel_shard_degree=8),
+        parallelism=ParallelismConfig(data_parallel_replicate_degree=32, data_parallel_shard_degree=8),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
         compile=CompileConfig(enable=True, components=["model", "loss"]),
         checkpoint=CheckpointManager.Config(
             enable=True,
-            interval=10,
+            interval=512 * 10,
             storage_backend="reporterv2",
             async_mode="async",
             exclude_from_saving=[
@@ -109,9 +115,13 @@ def worldmodel() -> WorldModelTrainer.Config:
         ),
         validator=WorldModelValidator.Config(
             enable=True,
-            freq=10,
+            freq=512,
             steps=8,
             cache_data=True,
-            dataloader=_base_dataloader(infinite=False),
+            dataloader=_base_dataloader(
+                infinite=False,
+                persistent_workers=False,
+                prefetch_factor=2,
+            ),
         ),
     )

@@ -42,17 +42,45 @@ def get_temporal_slices(data, idxs, temporal_len, skip):
     return np.lib.stride_tricks.as_strided(data[start_idx:], output_shape, _get_strides(data, skip))
 
 
-def _load_segments_from_file(path: str, *, val: bool) -> list[str]:
-    from xx.common.training_helpers import train_and_test_targets_from_file
-    train_targets, test_targets = train_and_test_targets_from_file(path)
-    return test_targets if val else train_targets
+def _iter_segment_lines(path: str) -> Iterator[str]:
+    from xx.common.basedir import XX_BASEDIR
+    from xx.common.file_helpers import is_url, read_file
+
+    if not is_url(path) and not os.path.isabs(path):
+        path = os.path.abspath(path) if os.path.exists(path) else os.path.join(XX_BASEDIR, path)
+
+    if is_url(path):
+        yield from read_file(path).decode().splitlines()
+        return
+
+    with open(path, encoding="utf-8") as f:
+        yield from f
+
+
+def _load_segments_from_file(path: str, *, val: bool, shard_rank: int = 0, shard_world_size: int = 1) -> list[str]:
+    from openpilot.tools.lib.route import SegmentName
+    from xx.common.training_helpers import in_val_set
+
+    segments = []
+    split_idx = 0
+    for line in _iter_segment_lines(path):
+        line = line.strip()
+        if not line:
+            continue
+        target = SegmentName(line.split()[0]).data_name
+        if in_val_set(target) != val:
+            continue
+        if split_idx % shard_world_size == shard_rank:
+            segments.append(target)
+        split_idx += 1
+    return segments
 
 
 def _dump_info(info: dict[str, Any]) -> np.ndarray:
     from xx.common.helpers import dump_info
     return dump_info(info)
 
-def get_frame_to_frame_pos_euler(states, calib_from_device):
+def get_frame_to_frame_pos_euler(states):
     from openpilot.common.transformations.orientation import euler_from_rot, rot_from_quat
     from xx.stages.lib.ekf_models.loc_kf import States
 
@@ -64,39 +92,36 @@ def get_frame_to_frame_pos_euler(states, calib_from_device):
 
     ecef_from_devices = rot_from_quat(states[:, States.ECEF_ORIENTATION])
     devices_from_ecef = ecef_from_devices.transpose(0, 2, 1)
-    augments_from_ecef = np.einsum("ad,fde->fae", calib_from_device, devices_from_ecef)
 
-    ref_augments_from_ecef = augments_from_ecef[:-1]
-    target_augments_from_ecef = augments_from_ecef[1:]
-    ecef_from_target_augments = target_augments_from_ecef.transpose(0, 2, 1)
+    ref_devices_from_ecef = devices_from_ecef[:-1]
+    target_devices_from_ecef = devices_from_ecef[1:]
+    ecef_from_target_devices = target_devices_from_ecef.transpose(0, 2, 1)
 
     target_pos_ecef = states[1:, States.ECEF_POS]
     ref_pos_ecef = states[:-1, States.ECEF_POS]
-    augments_pos_ref_augment[1:] = np.einsum("fae,fe->fa", ref_augments_from_ecef, target_pos_ecef - ref_pos_ecef)
-    ref_augment_from_target_augment = np.einsum("fra,fat->frt", ref_augments_from_ecef, ecef_from_target_augments)
-    ref_augment_from_augments_euler[1:] = euler_from_rot(ref_augment_from_target_augment)
+    augments_pos_ref_augment[1:] = np.einsum("fae,fe->fa", ref_devices_from_ecef, target_pos_ecef - ref_pos_ecef)
+    ref_device_from_target_device = np.einsum("fra,fat->frt", ref_devices_from_ecef, ecef_from_target_devices)
+    ref_augment_from_augments_euler[1:] = euler_from_rot(ref_device_from_target_device)
     return augments_pos_ref_augment, ref_augment_from_augments_euler
 
 
-def get_data_from_seg(target: str, config, val: bool, local_rank: int):
-    from openpilot.common.transformations.orientation import rot_from_euler
+def get_data_from_seg(target: str, config, local_rank: int):
     from openpilot.system.loggerd.config import CAMERA_FPS
     from xx.common.column_store import ColumnStoreReader
     from xx.common.frame_helpers import Perspective
     from xx.common.numpy_helpers import deep_interp_np
     from xx.common.nv_frame_helpers import NvSegmentFrameIterator
 
-    msh3d_path = os.path.join(config.base_dir, "Mesh3D", target)
+    msh3d_path = os.path.join(config.base_dir, "Localizer", target)
     pt_path = os.path.join(config.base_dir, "PlanTargets", target)
 
     frame_skip = CAMERA_FPS // config.fps
-    skip = config.val_skip if val else config.train_skip
-    skip = skip // frame_skip
+    skip = config.skip // frame_skip
     start_fidx = np.random.randint(0, frame_skip)
 
     inputs: dict[str, np.ndarray] = {}
     with ColumnStoreReader(msh3d_path) as mesh:
-        camera_frame_times = mesh["frame_times"]
+        camera_frame_times = mesh["frame_t"]
         num_frames = len(camera_frame_times)
         max_offset = num_frames // frame_skip - config.max_future_frames - 1
         offset = min(np.random.randint(0, skip), max_offset)
@@ -104,7 +129,6 @@ def get_data_from_seg(target: str, config, val: bool, local_rank: int):
         states_sim_times = np.ascontiguousarray(states[start_fidx::frame_skip][offset:])
 
     with ColumnStoreReader(pt_path) as pt:
-        calib_from_device = rot_from_euler(pt["calib"][-1]).T
         plan_sim_times = pt["plan"].astype(np.float32)[start_fidx::frame_skip][offset:]
 
     imgs, big_imgs = zip(
@@ -134,7 +158,7 @@ def get_data_from_seg(target: str, config, val: bool, local_rank: int):
     ref_augment_from_augments_euler = np.zeros((batch, timesteps, 3))
 
     for idx in range(len(states_sim_times)):
-        pose = get_frame_to_frame_pos_euler(states_sim_times[idx], calib_from_device=calib_from_device)
+        pose = get_frame_to_frame_pos_euler(states_sim_times[idx])
         augments_pos_ref_augment[idx] = pose[0]
         ref_augment_from_augments_euler[idx] = pose[1]
 
@@ -181,9 +205,12 @@ class WorldModelDataset(IterableDataset, Stateful):
         if config.mock_data:
             self.segments = [f"mock-{idx}" for idx in range(1024)]
         else:
-            self.segments = _load_segments_from_file(config.dataset, val=val)
-
-        self.segments = self.segments[dp_rank::dp_world_size]
+            self.segments = _load_segments_from_file(
+                config.dataset,
+                val=val,
+                shard_rank=dp_rank,
+                shard_world_size=dp_world_size,
+            )
 
     def __iter__(self) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
         worker_info = get_worker_info()
@@ -204,7 +231,7 @@ class WorldModelDataset(IterableDataset, Stateful):
                 batch = (
                     self._mock_batch() if self.config.mock_data
                     else
-                    (get_data_from_seg(self.segments[idx],config=self.config, val=self.val, local_rank=self.local_rank))
+                    (get_data_from_seg(self.segments[idx], config=self.config, local_rank=self.local_rank))
                 )
                 yield from self._flatten_batch(batch)
             except IGNORE_EXCEPTIONS:
@@ -255,12 +282,12 @@ class WorldModelDataset(IterableDataset, Stateful):
 class WorldModelDataLoader(ParallelAwareDataloader):
     @dataclass(kw_only=True, slots=True)
     class Config(ParallelAwareDataloader.Config):
-        dataset: str = "/home/batman/xx/datasets/lists/train_500k_20250717.txt"
+        dataset: str = "/home/batman/xx/datasets/lists/train_10m_20260218.txt"
         infinite: bool = True
         mock_data: bool = False
         mock_segment_batch_size: int = 8
 
-        base_dir: str = "http://data-ssd.comma.life/runner/training_2025_07"
+        base_dir: str = 'http://data-ssd.comma.life/runner/training_2026_02'
         compressor_model: str = "4672da0d-19f5-44f8-a5fb-2215981c9c0e"
         in_channels: int = 32
         latent_size: tuple[int, int] = (16, 32)
@@ -271,8 +298,7 @@ class WorldModelDataLoader(ParallelAwareDataloader):
         max_future_frames: int = 50
         inference_conditioning_frames: int = 14
         fps: int = 5
-        train_skip: int = 40
-        val_skip: int = 800
+        skip: int = 100
 
         def __post_init__(self):
             if self.context_size_frames + self.future_size_frames <= 0:

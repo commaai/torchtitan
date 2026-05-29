@@ -12,6 +12,12 @@ def load_compressor_encoder(*, compressor_model: str, device: torch.device, dtyp
     return compressor.to(device=device, dtype=dtype).eval()
 
 
+def load_compressor_decoder(*, compressor_model: str, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
+    from xx.training.lib.checkpoint import Checkpoint
+    compressor = torch.jit.load(io.BytesIO(Checkpoint(compressor_model)["decoder.jit"]), map_location="cpu")
+    return compressor.to(device=device, dtype=dtype).eval()
+
+
 @torch.no_grad()
 def images_to_latents(compressor: torch.nn.Module, imgs: torch.Tensor, big_imgs: torch.Tensor, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     batch, timesteps = imgs.shape[:2]
