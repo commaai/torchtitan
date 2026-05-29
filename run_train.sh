@@ -163,6 +163,25 @@ env_vars["PYTHONUNBUFFERED"]=1
 env_vars["LOGGABLE_PROGRESS"]=1
 env_vars["TRAINING_COMMAND"]="$COMMAND_TO_LOG"
 
+generate_uuid() {
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    tr -d '\n' < /proc/sys/kernel/random/uuid
+  elif command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import uuid; print(uuid.uuid4())'
+  else
+    date +'%s-%N'
+  fi
+}
+
+if [[ -z "${env_vars[REPORTERV2_HOST]+set}" ]]; then
+  env_vars["REPORTERV2_HOST"]="${REPORTERV2_HOST:-http://data-gen.comma.life:3080/reporterv2}"
+fi
+if [[ -z "${env_vars[REPORTERV2_TRAINING_ID]+set}" ]]; then
+  env_vars["REPORTERV2_TRAINING_ID"]="${REPORTERV2_TRAINING_ID:-$(generate_uuid)}"
+fi
+
 is_cluster_run=0
 if [[ -z "$N_VALUE" && -z "$PARTITION_VALUE" && -z "$NODELIST_VALUE" ]]; then
   echo "N nodes and partition not provided, running locally."

@@ -6,9 +6,8 @@
 
 import os
 import time
-import uuid
 from collections import namedtuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -16,6 +15,10 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.reporterv2_config import (
+    get_reporterv2_host,
+    get_reporterv2_training_id,
+)
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.tools import utils
@@ -175,20 +178,19 @@ class ReporterV2Logger(BaseLogger):
     def __init__(
         self,
         *,
-        training_id: str,
-        host: str,
         config_dict: dict[str, Any] | None = None,
         tag: str | None = None,
     ):
-        os.environ["REPORTERV2_HOST"] = os.getenv("REPORTERV2_HOST", host)
+        host = get_reporterv2_host()
+        training_id = get_reporterv2_training_id()
         from reporterv2 import ReporterV2
 
         reporter_config = dict(config_dict or {})
         metrics_config = reporter_config.get("metrics", {})
         self.save_freq = int(metrics_config.get("save_freq", 1))
         model_spec = reporter_config.get("model_spec", {})
-        training_id = training_id or os.getenv("REPORTERV2_TRAINING_ID", "") or reporter_config.get("training_id", "") or str(uuid.uuid4())
         reporter_config["training_id"] = training_id
+        reporter_config["reporterv2_host"] = host
         reporter_config.setdefault("trainer", model_spec.get("name", "torchtitan"))
         self.reporter = ReporterV2(reporter_config)
         self.tag = tag
@@ -337,12 +339,6 @@ class MetricsProcessor(Configurable):
         enable_reporterv2: bool = False
         """Whether to log metrics to ReporterV2."""
 
-        reporterv2_training_id: str = field(default_factory=lambda: os.getenv("REPORTERV2_TRAINING_ID", "") or str(uuid.uuid4()))
-        """ReporterV2 training id. Defaults to REPORTERV2_TRAINING_ID or a UUID."""
-
-        reporterv2_host: str = "http://data-gen.comma.life:3080/reporterv2"
-        """ReporterV2 storage endpoint or local path."""
-
     config: Config
     logger: BaseLogger
     parallel_dims: ParallelDims
@@ -476,8 +472,6 @@ class MetricsProcessor(Configurable):
             logger.debug("Attempting to create ReporterV2 logger")
             try:
                 reporter_logger = ReporterV2Logger(
-                    training_id=config.reporterv2_training_id,
-                    host=config.reporterv2_host,
                     config_dict=config_dict,
                     tag=tag,
                 )

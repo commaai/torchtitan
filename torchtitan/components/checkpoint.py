@@ -38,9 +38,21 @@ from torch.distributed.checkpoint.state_dict_saver import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 
+from torchtitan.components.checkpoint_storage import (
+    ReporterV2StorageReader,
+    ReporterV2StorageWriter,
+    reporterv2_checkpoint_exists,
+    reporterv2_delete_checkpoint,
+    reporterv2_folder_exists,
+    reporterv2_list_checkpoint_steps,
+)
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.reporterv2_config import (
+    get_reporterv2_host,
+    get_reporterv2_training_id,
+)
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
@@ -94,6 +106,12 @@ class SaveDone:
     pass
 
 
+@dataclass(frozen=True)
+class PurgeRequest:
+    path: str
+    storage_backend: Literal["filesystem", "reporterv2"]
+
+
 def purge_thread(purge_queue: queue.Queue):
     """Thread to purge the old checkpoints.
 
@@ -104,13 +122,22 @@ def purge_thread(purge_queue: queue.Queue):
     """
     try:
         while True:
-            path = purge_queue.get()
-            if isinstance(path, Terminate):
+            item = purge_queue.get()
+            if isinstance(item, Terminate):
                 return
-            assert isinstance(path, str)
+            if isinstance(item, PurgeRequest):
+                path = item.path
+                storage_backend = item.storage_backend
+            else:
+                assert isinstance(item, str)
+                path = item
+                storage_backend = "filesystem"
             logger.info("Checkpointer is deleting %s.", path)
             begin = time.monotonic()
-            shutil.rmtree(path, ignore_errors=True)
+            if storage_backend == "reporterv2":
+                reporterv2_delete_checkpoint(path)
+            else:
+                shutil.rmtree(path, ignore_errors=True)
             logger.info(
                 "Checkpointer deleted %s in %.2f seconds.",
                 path,
@@ -282,6 +309,13 @@ class CheckpointManager(Configurable):
         This will load the model only, excluding the specified keys.
         """
 
+        exclude_from_saving: list[str] = field(default_factory=list)
+        """
+        Exclude specific keys from being saved to the checkpoint.
+        Provide a comma-separated list of keys to exclude, e.g. 'optimizer,lr_scheduler,dataloader,train_state'.
+        Use the same keys with exclude_from_loading when loading these checkpoints.
+        """
+
         enable_first_step_checkpoint: bool = False
         """
         Enable the checkpoint save at first step. This will save a checkpoint immediately
@@ -303,6 +337,14 @@ class CheckpointManager(Configurable):
         purposes, without saving any new checkpoints. For example, you might use seed checkpoints
         to validate model correctness. Enabling this option allows checkpoints to be loaded
         without saving any during the training.
+        """
+
+        storage_backend: Literal["filesystem", "reporterv2"] = "filesystem"
+        """
+        Storage backend to use for standard DCP checkpoints.
+        "filesystem" keeps the default local DCP behavior.
+        "reporterv2" writes DCP checkpoint objects through reporterv2.storage,
+        which can target either a local path or mkv via REPORTERV2_HOST.
         """
 
     def __init__(
@@ -345,7 +387,23 @@ class CheckpointManager(Configurable):
         self.stager = None
         self.pg: dist.ProcessGroup | None = None
 
-        self.folder = os.path.join(base_folder, config.folder)
+        self.storage_backend = config.storage_backend.lower()
+        if self.storage_backend not in {"filesystem", "reporterv2"}:
+            raise ValueError(f"Unknown checkpoint storage_backend {config.storage_backend}")
+
+        if self.storage_backend == "reporterv2":
+            self.reporterv2_training_id = get_reporterv2_training_id()
+            if not self.reporterv2_training_id:
+                raise ValueError(
+                    "REPORTERV2_TRAINING_ID must be set when "
+                    "checkpoint.storage_backend='reporterv2'."
+                )
+            self.reporterv2_host = get_reporterv2_host()
+            self.folder = f"checkpoint/{self.reporterv2_training_id}"
+        else:
+            self.reporterv2_training_id = ""
+            self.reporterv2_host = ""
+            self.folder = os.path.join(base_folder, config.folder)
 
         # Checkpoint policy related fields.
         self.initial_load_model_only = config.initial_load_model_only
@@ -354,6 +412,11 @@ class CheckpointManager(Configurable):
         self.initial_load_in_hf_quantized = config.initial_load_in_hf_quantized
         self.last_save_model_only = config.last_save_model_only
         self.last_save_in_hf = config.last_save_in_hf
+        if self.storage_backend == "reporterv2" and self.last_save_in_hf:
+            raise ValueError(
+                "checkpoint.last_save_in_hf is not supported with "
+                "checkpoint.storage_backend='reporterv2'."
+            )
         if self.last_save_in_hf:
             assert (
                 sd_adapter is not None
@@ -361,6 +424,7 @@ class CheckpointManager(Configurable):
         self.sd_adapter = sd_adapter
         self.export_dtype = TORCH_DTYPE_MAP[config.export_dtype]
         self.exclude_from_loading = config.exclude_from_loading
+        self.exclude_from_saving = config.exclude_from_saving
         self.interval = config.interval
         self.enable_first_step_checkpoint = config.enable_first_step_checkpoint
 
@@ -445,10 +509,15 @@ class CheckpointManager(Configurable):
 
         ret: Future | AsyncSaveResponse | None = None
 
-        storage_writer: HuggingFaceStorageWriter | None = None
+        storage_writer: Any | None = None
         checkpoint_save_id: str | None = None
         fqn_to_index_mapping: dict[Any, int] | None = None
         if to_hf:
+            if self.storage_backend == "reporterv2":
+                raise ValueError(
+                    "Hugging Face checkpoint export is not supported with "
+                    "checkpoint.storage_backend='reporterv2'."
+                )
             assert (
                 self.sd_adapter is not None
             ), "trying to save checkpoint in HF safetensors format, but sd_adapter is not provided."
@@ -475,6 +544,11 @@ class CheckpointManager(Configurable):
 
         else:
             checkpoint_save_id = checkpoint_id
+            storage_writer = (
+                ReporterV2StorageWriter(checkpoint_id)
+                if self.storage_backend == "reporterv2"
+                else None
+            )
 
         if async_mode == AsyncMode.ASYNC:
             ret = dcp.async_save(
@@ -544,7 +618,16 @@ class CheckpointManager(Configurable):
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
             self.states[MODEL].load_state_dict(state_dict)
         else:
-            dcp.load(state_dict, checkpoint_id=checkpoint_id)
+            storage_reader = (
+                ReporterV2StorageReader(checkpoint_id)
+                if self.storage_backend == "reporterv2"
+                else None
+            )
+            dcp.load(
+                state_dict,
+                storage_reader=storage_reader,
+                checkpoint_id=checkpoint_id,
+            )
 
             # TODO: Since we flatten the model states in state_dict, we need to
             # manually call load_state_dict() for the model. Need to fix this.
@@ -584,7 +667,7 @@ class CheckpointManager(Configurable):
             self._save_last_step(curr_step)
             return True
 
-        states = self._flattened_model_states_sd()
+        states = self._states_to_save()
         if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
             GarbageCollection.collect("GC collection invoked by checkpointer.")
             if self.stager is None:
@@ -640,7 +723,7 @@ class CheckpointManager(Configurable):
         model_only = False
         from_hf = False
         from_quantized = False
-        if not os.path.exists(self.folder):
+        if not self._checkpoint_folder_exists():
             model_only = self.initial_load_model_only
             from_hf = self.initial_load_in_hf
             from_quantized = self.initial_load_in_hf_quantized
@@ -656,7 +739,7 @@ class CheckpointManager(Configurable):
 
             if self.initial_load_path:
                 checkpoint_id = self.initial_load_path
-                if not os.path.isdir(checkpoint_id):
+                if not self._checkpoint_exists(checkpoint_id, from_hf=from_hf):
                     raise ValueError(
                         "checkpoint.initial_load_path is specified but the path is not valid."
                     )
@@ -698,7 +781,7 @@ class CheckpointManager(Configurable):
             model_only = step == 0
             checkpoint_id = self._create_checkpoint_id(step)
 
-            if not os.path.isdir(checkpoint_id):
+            if not self._checkpoint_exists(checkpoint_id, from_hf=False):
                 raise FileNotFoundError(
                     f"--checkpoint.load_step={step} but checkpoint {checkpoint_id} is not found."
                 )
@@ -743,6 +826,12 @@ class CheckpointManager(Configurable):
         pattern = r"step-(\d+)"
         step_counts = []
 
+        if self.storage_backend == "reporterv2":
+            step_counts = reporterv2_list_checkpoint_steps(
+                folder, require_metadata=True
+            )
+            return max(step_counts) if step_counts else -1
+
         if not os.path.isdir(folder):
             return -1
 
@@ -763,6 +852,35 @@ class CheckpointManager(Configurable):
     def _create_checkpoint_id(self, step: int, folder: str = "") -> str:
         folder = folder if folder else self.folder
         return os.path.join(folder, f"step-{step}")
+
+    def _checkpoint_folder_exists(self, folder: str = "") -> bool:
+        folder = folder if folder else self.folder
+        if self.storage_backend == "reporterv2":
+            return reporterv2_folder_exists(folder)
+        return os.path.exists(folder)
+
+    def _checkpoint_exists(self, checkpoint_id: str, from_hf: bool) -> bool:
+        if self.storage_backend == "reporterv2" and not from_hf:
+            return reporterv2_checkpoint_exists(checkpoint_id)
+        return os.path.isdir(checkpoint_id)
+
+    def _discover_checkpoints(self, folder: str = "") -> list[tuple[int, str]]:
+        folder = folder if folder else self.folder
+        if self.storage_backend == "reporterv2":
+            return [
+                (step, self._create_checkpoint_id(step, folder=folder))
+                for step in reporterv2_list_checkpoint_steps(
+                    folder, require_metadata=False
+                )
+            ]
+
+        discovered_checkpoints = []
+        for filename in os.listdir(folder):
+            match = re.search(r"step-(\d+)", filename)
+            if match:
+                path = os.path.join(folder, filename)
+                discovered_checkpoints.append((int(match.group(1)), path))
+        return discovered_checkpoints
 
     def _flattened_model_states_sd(
         self, state_dict: dict[str, Any] | None = None
@@ -805,6 +923,18 @@ class CheckpointManager(Configurable):
 
         return states_to_load
 
+    def _states_to_save(self) -> dict[str, Any]:
+        """Determines which states to save for the current checkpoint."""
+        for exclude_key in self.exclude_from_saving:
+            if exclude_key not in self.states:
+                raise ValueError(f"{exclude_key} not found in state_dict.")
+
+        states_to_save = {
+            k: v for k, v in self.states.items() if k not in self.exclude_from_saving
+        }
+
+        return self._flattened_model_states_sd(states_to_save)
+
     def _save_last_step(self, curr_step: int) -> None:
         # We only consider saving model only at the end of the training. So this
         # won't affect preemption and training resume. We also only allow dtype
@@ -822,7 +952,7 @@ class CheckpointManager(Configurable):
             )
         else:
             logger.info(f"Saving a full checkpoint at last step, step {curr_step}.")
-            states = self._flattened_model_states_sd()
+            states = self._states_to_save()
 
         if self.last_save_in_hf:
             assert (
@@ -875,21 +1005,18 @@ class CheckpointManager(Configurable):
         return (
             self.keep_latest_k > 0
             and dist.get_rank() == 0
-            and os.path.isdir(self.folder)
+            and self._checkpoint_folder_exists()
         )
 
     def _purge_stale_checkpoints(self):
         if self._should_purge():
-            discovered_checkpoints = []
-            for filename in os.listdir(self.folder):
-                match = re.search(r"step-(\d+)", filename)
-                if match:
-                    path = os.path.join(self.folder, filename)
-                    discovered_checkpoints.append((int(match.group(1)), path))
-
+            discovered_checkpoints = self._discover_checkpoints()
             discovered_checkpoints.sort()
             to_delete = discovered_checkpoints[: -1 * self.keep_latest_k]
 
             for _, path in to_delete:
                 assert self.purge_thread is not None
-                self.purge_queue.put(path)
+                if self.storage_backend == "reporterv2":
+                    self.purge_queue.put(PurgeRequest(path, "reporterv2"))
+                else:
+                    self.purge_queue.put(path)

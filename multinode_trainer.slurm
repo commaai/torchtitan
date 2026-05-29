@@ -27,6 +27,25 @@ export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
 export NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-2097152}"
 export FI_EFA_SET_CUDA_SYNC_MEMOPS="${FI_EFA_SET_CUDA_SYNC_MEMOPS:-0}"
 
+set_default_gloo_socket_ifname() {
+  [[ -z "${GLOO_SOCKET_IFNAME:-}" ]] || return 0
+
+  local route_ifname=""
+  if command -v ip >/dev/null 2>&1; then
+    route_ifname="$(
+      ip route get 1.1.1.1 2>/dev/null \
+        | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}' \
+        || true
+    )"
+  fi
+
+  if [[ -n "$route_ifname" ]]; then
+    export GLOO_SOCKET_IFNAME="$route_ifname"
+  fi
+}
+
+set_default_gloo_socket_ifname
+
 if [[ -d /opt/amazon/efa/lib ]]; then
   export FI_PROVIDER="${FI_PROVIDER:-efa}"
   export LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH:-}"
@@ -54,6 +73,7 @@ rdzv_endpoint="${rdzv_host}:${MASTER_PORT:-12355}"
 
 echo "Head node: $head_node"
 echo "Rendezvous endpoint: $rdzv_endpoint"
+echo "GLOO_SOCKET_IFNAME: ${GLOO_SOCKET_IFNAME:-unset}"
 echo "Training command: $COMMAND_TO_LOG"
 
 cd "$PROJECT_CACHE"

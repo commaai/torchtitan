@@ -35,7 +35,9 @@ def validate_and_finalize_worldmodel_config(config: Any) -> None:
         or config.parallelism.context_parallel_degree > 1
         or config.parallelism.expert_parallel_degree > 1
     ):
-        raise NotImplementedError("worldmodel v1 supports FSDP/HSDP only; TP, PP, CP, and EP are not supported")
+        raise NotImplementedError(
+            "worldmodel v1 supports FSDP/HSDP only; TP, PP, CP, and EP are not supported"
+        )
 
     model_config._sync_derived_fields()
     config.training.seq_len = model_config.num_patches

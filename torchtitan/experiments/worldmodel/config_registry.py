@@ -3,7 +3,12 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.quantization import Float8LinearConverter
-from torchtitan.config import ActivationCheckpointConfig, CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    CompileConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.experiments.worldmodel.dataloader import WorldModelDataLoader
 from torchtitan.experiments.worldmodel.loss import WorldModelLoss
 from torchtitan.experiments.worldmodel.trainer import WorldModelTrainer
@@ -83,7 +88,25 @@ def worldmodel() -> WorldModelTrainer.Config:
         parallelism=ParallelismConfig(data_parallel_replicate_degree=16, data_parallel_shard_degree=8),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
         compile=CompileConfig(enable=True, components=["model", "loss"]),
-        checkpoint=CheckpointManager.Config(enable=False, interval=1000, last_save_model_only=False),
+        checkpoint=CheckpointManager.Config(
+            enable=True,
+            interval=10,
+            storage_backend="reporterv2",
+            async_mode="async",
+            exclude_from_saving=[
+                "optimizer",
+                "lr_scheduler",
+                "dataloader",
+                "train_state",
+            ],
+            exclude_from_loading=[
+                "optimizer",
+                "lr_scheduler",
+                "dataloader",
+                "train_state",
+            ],
+            enable_first_step_checkpoint=True,
+        ),
         validator=WorldModelValidator.Config(
             enable=True,
             freq=10,
