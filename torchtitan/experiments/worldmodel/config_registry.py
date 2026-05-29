@@ -73,7 +73,7 @@ def worldmodel() -> WorldModelTrainer.Config:
         model_spec=model_registry("base", converters=[_blocks_only_float8(model_compile_enabled=True)]),
         optimizer=OptimizersContainer.Config(
             name="AdamW",
-            lr=1e-3,
+            lr=5e-4,
             beta1=0.9,
             beta2=0.95,
             weight_decay=1e-2,
