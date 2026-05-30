@@ -73,13 +73,13 @@ def worldmodel() -> WorldModelTrainer.Config:
         model_spec=model_registry("base", converters=[_blocks_only_float8(model_compile_enabled=True)]),
         optimizer=OptimizersContainer.Config(
             name="AdamW",
-            lr=5e-4,
+            lr=4e-4,
             beta1=0.9,
             beta2=0.95,
             weight_decay=1e-2,
             implementation="fused_opt_states_bf16",
         ),
-        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=512, decay_ratio=0.1, decay_type="cosine"),
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2*512, decay_ratio=0.1, decay_type="cosine"),
         training=TrainingConfig(
             local_batch_size=16,
             steps=512 * 100,
