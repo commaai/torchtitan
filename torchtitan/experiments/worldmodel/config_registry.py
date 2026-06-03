@@ -96,7 +96,7 @@ def worldmodel() -> WorldModelTrainer.Config:
         compile=CompileConfig(enable=True, components=["model", "loss"]),
         checkpoint=CheckpointManager.Config(
             enable=True,
-            interval=512 * 10,
+            interval=512 * 5,
             storage_backend="reporterv2",
             async_mode="async",
             exclude_from_saving=[

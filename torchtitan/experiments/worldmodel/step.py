@@ -1,5 +1,5 @@
 from typing import Any
-
+import einops
 import torch
 
 from torchtitan.experiments.worldmodel.compressor import images_to_latents
@@ -56,7 +56,8 @@ def prepare_worldmodel_batch(
         latents = model.scale_latents(latents)
         noise = torch.randn_like(latents)
         if train:
-            timesteps = scheduler.sample_timestep((batch_size, num_frames))
+            timesteps = scheduler.sample_timestep((batch_size,))
+            timesteps = einops.repeat(timesteps, 'b -> b t', t=num_frames).clone()
         else:
             indexes = torch.randint(0, discrete_timesteps.numel(), (batch_size,), device=device)
             timesteps = discrete_timesteps[indexes][:, None].expand(-1, num_frames).clone()
