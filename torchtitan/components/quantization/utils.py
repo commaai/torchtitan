@@ -89,3 +89,13 @@ def has_quantization(model_config) -> bool:
         for _fqn, config, _parent, _attr in model_config.traverse(GroupedExperts.Config)
     )
     return has_quant_linear or has_quant_moe
+
+
+def should_precompute_float8_dynamic_scale_for_fsdp(model_config) -> bool:
+    from torchtitan.components.quantization.float8 import Float8Linear
+
+    return Float8Linear is not None and any(
+        isinstance(config, Float8Linear.Config)
+        and config.precompute_float8_dynamic_scale_for_fsdp
+        for _fqn, config, _parent, _attr in model_config.traverse(Linear.Config)
+    )

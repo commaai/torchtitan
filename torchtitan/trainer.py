@@ -267,12 +267,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         model.verify_module_protocol()
 
         # metrics logging
+        model_has_quantization = has_quantization(model_config)
         self.metrics_processor = config.metrics.build(
             parallel_dims=parallel_dims,
             dump_folder=config.dump_folder,
             pp_schedule=config.parallelism.pipeline_parallel_schedule,
             config_dict=config.to_dict(),
-            has_quantization=has_quantization(model_config),
+            has_quantization=model_has_quantization,
         )
         color = self.metrics_processor.color
 
@@ -420,8 +421,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
-        gpu_peak_flops = utils.get_peak_flops(device_memory_monitor.device_name)
-        logger.info(f"Peak FLOPS used for computing MFU: {gpu_peak_flops:.3e}")
+        peak_flops_mul_dtype = (
+            "float8"
+            if model_has_quantization
+            else (
+                config.training.mixed_precision_param
+                if self.parallel_dims.fsdp_enabled
+                else config.training.dtype
+            )
+        )
+        self.metrics_processor.gpu_peak_flops = utils.get_peak_flops(
+            device_memory_monitor.device_name,
+            mul_dtype=peak_flops_mul_dtype,
+            acc_dtype=config.training.mixed_precision_reduce,
+        )
+        logger.info(
+            "Peak FLOPS used for computing MFU "
+            f"(multiply={peak_flops_mul_dtype}, "
+            f"accumulate={config.training.mixed_precision_reduce}): "
+            f"{self.metrics_processor.gpu_peak_flops:.3e}"
+        )
         device_mem_stats = device_memory_monitor.get_peak_stats()
         logger.info(
             f"{device_type.upper()} memory usage for model: "

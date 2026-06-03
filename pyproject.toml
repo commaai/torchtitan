@@ -3,7 +3,7 @@
 name = "torchtitan"
 description = "A PyTorch native platform for training generative AI models"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.12.13"
 license = {file = "LICENSE"}
 authors = [
     { name = "PyTorch Team", email = "packages@pytorch.org" },
@@ -25,6 +25,8 @@ dependencies = [
     "wandb",
     "einops",
     "pillow",
+    "xx",
+    "reporterv2",
 ]
 dynamic = ["version"]
 
@@ -66,3 +68,32 @@ testpaths = ["tests"]
 project-excludes = ["torchtitan/experiments", "**/tests/**"]
 replace-imports-with-any = ["torchao.*", "torchft", "torchvision.*", "deep_ep.*", "jinja2.*"]  # optional dependencies
 search-path = ["../pytorch"]  # local built pytorch
+
+[tool.uv.sources]
+xx = { path = "..", editable = true }
+openpilot = { path = "../openpilot", editable = true }
+miniray = { path = "../miniray", editable = true }
+mkv = { path = "../mkv", editable = true }
+reporterv2 = { path = "../services/reporterv2", editable = true }
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+triton = { index = "pytorch" }
+carla = { git = "https://github.com/commaai/carla_stripped.git", rev = "release-carla", subdirectory = "carla" }
+threedgrut = { git = "https://github.com/commaai/3dgrut.git", rev = "ba286f78a9bb707be545aa574e71724974b72dac" }
+
+[tool.uv]
+exclude-newer = "1 week"
+dependency-metadata = [
+  { name = "threedgrut", version = "0.0.2", requires-dist = [], requires-python = ">=3.11" },
+]
+override-dependencies = [
+  "carla",
+  "onnxruntime ; sys_platform == 'never'",
+  "torch>=2.12.0",
+  "torchvision>=0.27.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu130/"
+explicit = true

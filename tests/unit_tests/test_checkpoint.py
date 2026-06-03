@@ -13,10 +13,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
 from torch.utils.data import DataLoader
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.checkpoint_storage import (
+    ReporterV2StorageReader,
+    ReporterV2StorageWriter,
+)
+from reporterv2.storage import store_list, store_put, store_size
 
 
 class FakeOptimizersContainer:
@@ -95,6 +101,7 @@ class DummyTrainerConfig:
             last_save_model_only=False,
             export_dtype="float32",
             exclude_from_loading=[],
+            exclude_from_saving=[],
             initial_load_path=None,
             initial_load_model_only=False,
         )
@@ -124,6 +131,7 @@ class TestCheckpointManager(unittest.TestCase):
             last_save_model_only=False,
             export_dtype="float32",
             exclude_from_loading=[],
+            exclude_from_saving=[],
             initial_load_path=None,
             initial_load_model_only=False,
         )
@@ -153,7 +161,7 @@ class TestCheckpointManager(unittest.TestCase):
                 sd_to_save[key] = val
         torch.save(sd_to_save, os.path.join(checkpoint_id, "state_dict.pt"))
 
-    def fake_load(self, states: dict, checkpoint_id=None):
+    def fake_load(self, states: dict, checkpoint_id=None, storage_reader=None):
         path = os.path.join(checkpoint_id, "state_dict.pt")
         loaded = torch.load(path, weights_only="False")
         for key, val in loaded.items():
@@ -161,6 +169,209 @@ class TestCheckpointManager(unittest.TestCase):
                 states[key].load_state_dict(val)
             elif key in states and isinstance(states[key], torch.Tensor):
                 states[key].copy_(val)
+
+    def test_reporterv2_storage_round_trip(self):
+        storage_root = os.path.join(self.test_folder, "reporterv2-store")
+        checkpoint_id = "checkpoint/reporterv2-round-trip/step-1"
+
+        with mock.patch.dict(os.environ, {"REPORTERV2_HOST": storage_root}):
+            state = {"value": torch.tensor([1.0, 2.0])}
+            dcp.save(
+                state,
+                storage_writer=ReporterV2StorageWriter(checkpoint_id),
+                checkpoint_id=checkpoint_id,
+            )
+
+            keys = store_list(checkpoint_id)
+            self.assertIn(f"{checkpoint_id}/.metadata", keys)
+            self.assertTrue(any(key.endswith(".distcp") for key in keys))
+
+            loaded_state = {"value": torch.zeros(2)}
+            dcp.load(
+                loaded_state,
+                storage_reader=ReporterV2StorageReader(checkpoint_id),
+                checkpoint_id=checkpoint_id,
+            )
+
+            torch.testing.assert_close(loaded_state["value"], state["value"])
+
+    @mock.patch("torchtitan.components.checkpoint.dcp.save")
+    def test_reporterv2_save_uses_custom_storage_writer(self, mock_save):
+        cfg = self.trainer_config.checkpoint
+        cfg.keep_latest_k = 0
+        cfg.storage_backend = "reporterv2"
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "REPORTERV2_HOST": self.test_folder,
+                "REPORTERV2_TRAINING_ID": "reporterv2-save",
+            },
+        ):
+            manager = CheckpointManager(
+                dataloader=self.data_loader,
+                model_parts=self.model_parts,
+                optimizers=self.optimizers,
+                lr_schedulers=self.lr_schedulers,
+                states=self.states,
+                config=cfg,
+                sd_adapter=None,
+                base_folder=self.trainer_config.dump_folder,
+            )
+
+            manager.save(curr_step=1)
+
+        mock_save.assert_called_once()
+        kwargs = mock_save.call_args.kwargs
+        expected = "checkpoint/reporterv2-save/step-1"
+        self.assertEqual(kwargs.get("checkpoint_id"), expected)
+        self.assertIsInstance(kwargs.get("storage_writer"), ReporterV2StorageWriter)
+        self.assertEqual(kwargs["storage_writer"].checkpoint_id, expected)
+        manager.close()
+
+    def test_reporterv2_checkpoint_requires_training_id_env(self):
+        cfg = self.trainer_config.checkpoint
+        cfg.keep_latest_k = 0
+        cfg.storage_backend = "reporterv2"
+
+        with mock.patch.dict(
+            os.environ,
+            {"REPORTERV2_HOST": self.test_folder, "REPORTERV2_TRAINING_ID": ""},
+        ):
+            with self.assertRaisesRegex(ValueError, "REPORTERV2_TRAINING_ID"):
+                CheckpointManager(
+                    dataloader=self.data_loader,
+                    model_parts=self.model_parts,
+                    optimizers=self.optimizers,
+                    lr_schedulers=self.lr_schedulers,
+                    states=self.states,
+                    config=cfg,
+                    sd_adapter=None,
+                    base_folder=self.trainer_config.dump_folder,
+                )
+
+    @mock.patch(
+        "torchtitan.components.checkpoint.dcp.async_save", side_effect=fake_async_save
+    )
+    def test_reporterv2_async_save_uses_custom_storage_writer(self, mock_async_save):
+        cfg = self.trainer_config.checkpoint
+        cfg.async_mode = "async"
+        cfg.keep_latest_k = 0
+        cfg.storage_backend = "reporterv2"
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "REPORTERV2_HOST": self.test_folder,
+                "REPORTERV2_TRAINING_ID": "reporterv2-async-save",
+            },
+        ):
+            manager = CheckpointManager(
+                dataloader=self.data_loader,
+                model_parts=self.model_parts,
+                optimizers=self.optimizers,
+                lr_schedulers=self.lr_schedulers,
+                states=self.states,
+                config=cfg,
+                sd_adapter=None,
+                base_folder=self.trainer_config.dump_folder,
+            )
+
+            manager.save(curr_step=1)
+
+        mock_async_save.assert_called_once()
+        kwargs = mock_async_save.call_args.kwargs
+        expected = "checkpoint/reporterv2-async-save/step-1"
+        self.assertEqual(kwargs.get("checkpoint_id"), expected)
+        self.assertIsInstance(kwargs.get("storage_writer"), ReporterV2StorageWriter)
+        manager.close()
+
+    @mock.patch("torchtitan.components.checkpoint.dcp.load")
+    def test_reporterv2_load_finds_latest_and_uses_custom_storage_reader(
+        self, mock_load
+    ):
+        cfg = self.trainer_config.checkpoint
+        cfg.keep_latest_k = 0
+        cfg.storage_backend = "reporterv2"
+        cfg.initial_load_model_only = False
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "REPORTERV2_HOST": self.test_folder,
+                "REPORTERV2_TRAINING_ID": "reporterv2-load",
+            },
+        ):
+            store_put("checkpoint/reporterv2-load/step-2/.metadata", b"metadata")
+            store_put("checkpoint/reporterv2-load/step-5/.metadata", b"metadata")
+
+            manager = CheckpointManager(
+                dataloader=self.data_loader,
+                model_parts=self.model_parts,
+                optimizers=self.optimizers,
+                lr_schedulers=self.lr_schedulers,
+                states=self.states,
+                config=cfg,
+                sd_adapter=None,
+                base_folder=self.trainer_config.dump_folder,
+            )
+
+            res = manager.load(step=-1)
+
+        self.assertTrue(res)
+        mock_load.assert_called_once()
+        kwargs = mock_load.call_args.kwargs
+        expected = "checkpoint/reporterv2-load/step-5"
+        self.assertEqual(kwargs.get("checkpoint_id"), expected)
+        self.assertIsInstance(kwargs.get("storage_reader"), ReporterV2StorageReader)
+        manager.close()
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    def test_reporterv2_purge_uses_store_delete(self, mock_rank):
+        cfg = self.trainer_config.checkpoint
+        cfg.keep_latest_k = 2
+        cfg.storage_backend = "reporterv2"
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "REPORTERV2_HOST": self.test_folder,
+                "REPORTERV2_TRAINING_ID": "reporterv2-purge",
+            },
+        ):
+            for step in (1, 2, 3):
+                store_put(f"checkpoint/reporterv2-purge/step-{step}/.metadata", b"m")
+
+            manager = CheckpointManager(
+                dataloader=self.data_loader,
+                model_parts=self.model_parts,
+                optimizers=self.optimizers,
+                lr_schedulers=self.lr_schedulers,
+                states=self.states,
+                config=cfg,
+                sd_adapter=None,
+                base_folder=self.trainer_config.dump_folder,
+            )
+
+            manager._purge_stale_checkpoints()
+            deadline = time.time() + 5.0
+            while True:
+                if (
+                    store_size("checkpoint/reporterv2-purge/step-1/.metadata")
+                    is None
+                ):
+                    break
+                if time.time() > deadline:
+                    self.fail("ReporterV2 checkpoint purge timed out")
+                time.sleep(0.05)
+
+            self.assertIsNotNone(
+                store_size("checkpoint/reporterv2-purge/step-2/.metadata")
+            )
+            self.assertIsNotNone(
+                store_size("checkpoint/reporterv2-purge/step-3/.metadata")
+            )
+            manager.close()
 
     @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch("torchtitan.components.checkpoint.dcp.save")
@@ -235,6 +446,52 @@ class TestCheckpointManager(unittest.TestCase):
         )
         self.assertIn("optimizer", sd)
         torch.testing.assert_close(sd["optimizer"]["fake_param"], torch.tensor([1.0]))
+        manager.close()
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch("torchtitan.components.checkpoint.dcp.save")
+    def test_exclude_from_saving_skips_states_for_all_full_saves(
+        self, mock_save, mock_rank
+    ):
+        mock_save.side_effect = self.fake_save
+        cfg = self.trainer_config.checkpoint
+        cfg.keep_latest_k = 0
+        cfg.last_save_model_only = False
+        cfg.exclude_from_saving = [
+            "optimizer",
+            "lr_scheduler",
+            "dataloader",
+            "train_state",
+        ]
+        states = {"train_state": torch.tensor([1.2347])}
+
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=states,
+            config=self.trainer_config.checkpoint,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        manager.save(curr_step=1)
+        manager.save(curr_step=2, last_step=True)
+
+        for step in (1, 2):
+            checkpoint_path = os.path.join(
+                self.test_folder, f"step-{step}", "state_dict.pt"
+            )
+            saved_data = torch.load(checkpoint_path, weights_only=False)
+
+            self.assertIn("weight", saved_data)
+            self.assertIn("bias", saved_data)
+            self.assertNotIn("optimizer", saved_data)
+            self.assertNotIn("lr_scheduler", saved_data)
+            self.assertNotIn("dataloader", saved_data)
+            self.assertNotIn("train_state", saved_data)
+
         manager.close()
 
     @mock.patch("torch.distributed.get_rank", return_value=1)
@@ -675,7 +932,7 @@ class TestCheckpointManager(unittest.TestCase):
                 self.assertNotIn("optimizer", state_dict)
             return
 
-        def fake_load(state_dict: dict, checkpoint_id=None):
+        def fake_load(state_dict: dict, checkpoint_id=None, storage_reader=None):
             self.assertIn("bias", state_dict)
             self.assertIn("weight", state_dict)
             # No model prefix
