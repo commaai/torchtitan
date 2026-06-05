@@ -176,7 +176,7 @@ generate_uuid() {
 }
 
 if [[ -z "${env_vars[REPORTERV2_HOST]+set}" ]]; then
-  env_vars["REPORTERV2_HOST"]="${REPORTERV2_HOST:-http://data-gen.comma.life:3080/reporterv2}"
+  env_vars["REPORTERV2_HOST"]="${REPORTERV2_HOST:-mkv://data-gen.comma.life:3080/reporterv2}"
 fi
 if [[ -z "${env_vars[REPORTERV2_TRAINING_ID]+set}" ]]; then
   env_vars["REPORTERV2_TRAINING_ID"]="${REPORTERV2_TRAINING_ID:-$(generate_uuid)}"

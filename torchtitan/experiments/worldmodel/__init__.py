@@ -31,7 +31,7 @@ def _worldmodel_base() -> WorldModel.Config:
             norm="RMSNorm",
         ),
         plan_head=TransformerConfig(
-            n_layer=4,
+            n_layer=-1,
             n_head=36,
             n_embd=2304,
             act="GELU",

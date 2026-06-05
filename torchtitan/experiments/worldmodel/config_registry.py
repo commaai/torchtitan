@@ -73,7 +73,7 @@ def worldmodel() -> WorldModelTrainer.Config:
         model_spec=model_registry("base", converters=[_blocks_only_float8(model_compile_enabled=True)]),
         optimizer=OptimizersContainer.Config(
             name="AdamW",
-            lr=4e-4,
+            lr=2e-4,
             beta1=0.9,
             beta2=0.95,
             weight_decay=1e-2,
@@ -93,7 +93,7 @@ def worldmodel() -> WorldModelTrainer.Config:
         # TODO: 16/8 hard coded?
         parallelism=ParallelismConfig(data_parallel_replicate_degree=32, data_parallel_shard_degree=8),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        compile=CompileConfig(enable=True, components=["model", "loss"]),
+        compile=CompileConfig(enable=True, components=["model"]),
         checkpoint=CheckpointManager.Config(
             enable=True,
             interval=512 * 5,

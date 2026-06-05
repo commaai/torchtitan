@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 
 
-DEFAULT_REPORTERV2_HOST = "http://data-gen.comma.life:3080/reporterv2"
+DEFAULT_REPORTERV2_HOST = "mkv://data-gen.comma.life:3080/reporterv2"
 
 
 def get_reporterv2_host() -> str:

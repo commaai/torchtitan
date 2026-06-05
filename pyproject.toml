@@ -74,7 +74,7 @@ xx = { path = "..", editable = true }
 openpilot = { path = "../openpilot", editable = true }
 miniray = { path = "../miniray", editable = true }
 mkv = { path = "../mkv", editable = true }
-reporterv2 = { path = "../services/reporterv2", editable = true }
+reporterv2 = { git = "https://github.com/commaai/reporterv2.git", rev = "f0856cd878f58fc648bf92d80aa90a72581af559" }
 torch = { index = "pytorch" }
 torchvision = { index = "pytorch" }
 triton = { index = "pytorch" }
