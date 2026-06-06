@@ -49,6 +49,9 @@ class BaseValidator(Configurable):
     def should_validate(self, step: int) -> bool:
         return step == 1 or step % self.config.freq == 0
 
+    def close(self) -> None:
+        pass
+
 
 class Validator(BaseValidator):
     """

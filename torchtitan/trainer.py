@@ -887,5 +887,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     def close(self) -> None:
         if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()
+        if hasattr(self, "validator") and self.validator:
+            self.validator.close()
         if hasattr(self, "metrics_processor") and self.metrics_processor:
             self.metrics_processor.close()

@@ -391,6 +391,8 @@ class Trainer(ForgeEngine):
         self.step = state_dict["step"]
 
     def close(self) -> None:
+        if hasattr(self, "validator") and self.validator:
+            self.validator.close()
         if self.metrics_processor:
             self.metrics_processor.close()
         super().close()
