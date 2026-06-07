@@ -79,10 +79,10 @@ def worldmodel() -> WorldModelTrainer.Config:
             weight_decay=1e-2,
             implementation="fused_opt_states_bf16",
         ),
-        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2*512, decay_ratio=0.1, decay_type="cosine"),
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=1*512, decay_ratio=0.5, decay_type="cosine"),
         training=TrainingConfig(
             local_batch_size=16,
-            steps=512 * 100,
+            steps=512 * 50,
             dtype="float32",
             mixed_precision_param="bfloat16",
             mixed_precision_reduce="bfloat16",

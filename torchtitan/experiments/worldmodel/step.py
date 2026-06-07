@@ -63,11 +63,21 @@ def prepare_worldmodel_batch(
             timesteps = discrete_timesteps[indexes][:, None].expand(-1, num_frames).clone()
 
         pose_mask = get_pose_dropout_mask(batch_size=batch_size, num_frames=num_frames, pose_dropout=pose_dropout, device=device, train=train)
+        pose_mask[:,:14] = True # TODO: try not drop future pose?
         augments_pos_ref_augment[pose_mask] = 0
         ref_augment_from_augments_euler[pose_mask] = 0
         pose_mask = pose_mask.to(dtype=torch.int64)
         mask = torch.ones_like(latents, device=device, dtype=torch.bool)
-        noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+
+        mask[:,:14] = False
+        fake_timesteps = timesteps.clone()
+        fake_timesteps[:, :14] = 0.
+        timesteps[:, :14] = 0.
+        if train and torch.rand(1) < 0.25:
+            fake_timesteps[:, 5:14] = scheduler.sample_timestep((batch_size,9))
+            mask[:, 5:14] = True
+
+        noisy_latents = scheduler.add_noise(latents, noise, fake_timesteps)
         targets = {**targets, "v": latents - noise, "mask": mask}
 
     return {

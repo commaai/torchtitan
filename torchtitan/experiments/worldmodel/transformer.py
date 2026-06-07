@@ -128,6 +128,12 @@ def _blockwise_lower_triangular_causal_mask(attention_mask_mini_block_size: int,
     return q_block_idx >= kv_block_idx
 
 
+def _last_frame_causal_mask(block_size, attention_mask_mini_block_size, b, h, q_idx, kv_idx):
+    q_ok = q_idx > block_size-attention_mask_mini_block_size
+    kv_ok = kv_idx < block_size-attention_mask_mini_block_size
+    return ( q_ok | kv_ok )
+
+
 def get_dense_mask(mask_fn: Callable, block_size_q: int, block_size_kv: int):
     idx_q = torch.arange(block_size_q)
     idx_kv = torch.arange(block_size_kv)
@@ -143,6 +149,10 @@ def get_mask_fn(config: TransformerConfig):
             if config.attention_mask_mini_block_size is None:
                 raise ValueError("BLOCKWISE_LOWER_TRIANGLE requires mini block size")
             return partial(_blockwise_lower_triangular_causal_mask, config.attention_mask_mini_block_size)
+        case "LAST_FRAME_CAUSAL":
+            if config.attention_mask_mini_block_size is None:
+                raise ValueError("LAST_FRAME_CAUSAL requires mini block size")
+            return partial(_last_frame_causal_mask, config.block_size, config.attention_mask_mini_block_size)
         case _:
             raise ValueError(f"unknown attention_mask {config.attention_mask}")
 

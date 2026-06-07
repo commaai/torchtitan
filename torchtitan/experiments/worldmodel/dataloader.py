@@ -234,7 +234,8 @@ class WorldModelDataset(IterableDataset, Stateful):
                     (get_data_from_seg(self.segments[idx], config=self.config, local_rank=self.local_rank))
                 )
                 yield from self._flatten_batch(batch)
-            except IGNORE_EXCEPTIONS:
+            except IGNORE_EXCEPTIONS as ex:
+                # print(f"skipping sample due to exception: {ex}")
                 continue
 
     def _mock_batch(self):
