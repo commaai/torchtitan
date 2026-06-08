@@ -73,7 +73,7 @@ def prepare_worldmodel_batch(
         fake_timesteps = timesteps.clone()
         fake_timesteps[:, :14] = 0.
         timesteps[:, :14] = 0.
-        if train and torch.rand(1) < 0.25:
+        if train and torch.rand(1) < 0.5:
             fake_timesteps[:, 5:14] = scheduler.sample_timestep((batch_size,9))
             mask[:, 5:14] = True
 

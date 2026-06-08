@@ -69,7 +69,7 @@ def worldmodel() -> WorldModelTrainer.Config:
     dataloader = _base_dataloader()
     return WorldModelTrainer.Config(
         hf_assets_path="./tests/assets/tokenizer",
-        loss=WorldModelLoss.Config(plan_loss_weight=0.1),
+        loss=WorldModelLoss.Config(plan_loss_weight=5*0.1),
         model_spec=model_registry("base", converters=[_blocks_only_float8(model_compile_enabled=True)]),
         optimizer=OptimizersContainer.Config(
             name="AdamW",
@@ -82,7 +82,7 @@ def worldmodel() -> WorldModelTrainer.Config:
         lr_scheduler=LRSchedulersContainer.Config(warmup_steps=1*512, decay_ratio=0.5, decay_type="cosine"),
         training=TrainingConfig(
             local_batch_size=16,
-            steps=512 * 50,
+            steps=512 * 25,
             dtype="float32",
             mixed_precision_param="bfloat16",
             mixed_precision_reduce="bfloat16",
