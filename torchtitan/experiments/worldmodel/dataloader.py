@@ -57,8 +57,8 @@ def _iter_segment_lines(path: str) -> Iterator[str]:
         yield from f
 
 
-def _load_segments_from_file(path: str, *, val: bool, shard_rank: int = 0, shard_world_size: int = 1) -> list[str]:
-    from openpilot.tools.lib.route import SegmentName
+def _load_segments_from_file(path: str, *, val: bool, shard_rank: int = 0, shard_world_size: int = 1) -> list[tuple[str, tuple[int, int] | None, int | None]]:
+    from xx.datasets.segment_data import SegmentData
     from xx.common.training_helpers import in_val_set
 
     segments = []
@@ -67,11 +67,13 @@ def _load_segments_from_file(path: str, *, val: bool, shard_rank: int = 0, shard
         line = line.strip()
         if not line:
             continue
-        target = SegmentName(line.split()[0]).data_name
+        sd = SegmentData(line)
+        target = sd.data_name
         if in_val_set(target) != val:
             continue
         if split_idx % shard_world_size == shard_rank:
-            segments.append(target)
+            peak = sd.metadata.get("peak") if sd.metadata else None
+            segments.append((target, sd.frame_range, peak))
         split_idx += 1
     return segments
 
@@ -105,7 +107,7 @@ def get_frame_to_frame_pos_euler(states):
     return augments_pos_ref_augment, ref_augment_from_augments_euler
 
 
-def get_data_from_seg(target: str, config, local_rank: int):
+def get_data_from_seg(target: str, config, local_rank: int, frame_range=None, peak=None):
     from openpilot.system.loggerd.config import CAMERA_FPS
     from xx.common.column_store import ColumnStoreReader
     from xx.common.frame_helpers import Perspective
@@ -117,25 +119,34 @@ def get_data_from_seg(target: str, config, local_rank: int):
 
     frame_skip = CAMERA_FPS // config.fps
     skip = config.skip // frame_skip
-    start_fidx = np.random.randint(0, frame_skip)
+    if frame_range is None:
+        start_fidx, end_fidx = np.random.randint(0, frame_skip), None
+    else:
+        start_fidx, end_fidx = frame_range          # read only the clip [a, b]
 
     inputs: dict[str, np.ndarray] = {}
     with ColumnStoreReader(msh3d_path) as mesh:
         camera_frame_times = mesh["frame_t"]
         num_frames = len(camera_frame_times)
-        max_offset = num_frames // frame_skip - config.max_future_frames - 1
-        offset = min(np.random.randint(0, skip), max_offset)
+        if frame_range is None:
+            max_offset = num_frames // frame_skip - config.max_future_frames - 1
+            offset = min(np.random.randint(0, skip), max_offset)
+        else:
+            offset = 0                              # the clip IS the one window
         states = deep_interp_np(camera_frame_times, mesh["t"], mesh["states"])
-        states_sim_times = np.ascontiguousarray(states[start_fidx::frame_skip][offset:])
+        states_sim_times = np.ascontiguousarray(states[start_fidx:end_fidx:frame_skip][offset:])
 
     with ColumnStoreReader(pt_path) as pt:
-        plan_sim_times = pt["plan"].astype(np.float32)[start_fidx::frame_skip][offset:]
+        plan_sim_times = pt["plan"].astype(np.float32)[start_fidx:end_fidx:frame_skip][offset:]
+        calib = np.asarray(pt["calib"])[-1] if frame_range is not None else None   # clip path only; default keeps the MeshCalibration warp
 
     imgs, big_imgs = zip(
         *NvSegmentFrameIterator(
             target,
             output_perspectives=[Perspective.wmedmodel, Perspective.wbigmodel],
+            calib=calib,
             start_fidx=start_fidx,
+            end_fidx=end_fidx,
             frame_skip=frame_skip,
             pipeline_dir=config.base_dir,
             gpuID=local_rank,
@@ -144,13 +155,16 @@ def get_data_from_seg(target: str, config, local_rank: int):
     imgs = np.ascontiguousarray(np.stack(imgs)[offset:])
     big_imgs = np.ascontiguousarray(np.stack(big_imgs)[offset:])
     assert imgs.shape[0] == plan_sim_times.shape[0], "weird segment"
-    idxs = np.arange(config.max_future_frames, imgs.shape[0], skip)
+    if frame_range is None:
+        idxs = np.arange(config.max_future_frames, imgs.shape[0], skip)
+    else:
+        idxs = np.array([imgs.shape[0] - 1])        # single window spanning the whole clip
     inputs["imgs"] = get_temporal_slices(imgs, idxs, config.max_future_frames, skip)
     inputs["big_imgs"] = get_temporal_slices(big_imgs, idxs, config.max_future_frames, skip)
 
     fidxs = np.tile(np.arange(config.max_future_frames, dtype=np.int64), (len(idxs), 1))
     states_sim_times = get_temporal_slices(states_sim_times, idxs, config.max_future_frames, skip)
-    in_segment_fidxs = np.arange(0, num_frames, dtype=np.int64)[start_fidx::frame_skip][offset:]
+    in_segment_fidxs = np.arange(0, num_frames, dtype=np.int64)[start_fidx:end_fidx:frame_skip][offset:]
     in_segment_fidxs = get_temporal_slices(in_segment_fidxs, idxs, config.max_future_frames, skip).squeeze(-1)
 
     batch, timesteps = states_sim_times.shape[:2]
@@ -228,11 +242,12 @@ class WorldModelDataset(IterableDataset, Stateful):
     def _iter_epoch_samples(self, order: list[int]) -> Iterator[Sample]:
         for idx in order:
             try:
-                batch = (
-                    self._mock_batch() if self.config.mock_data
-                    else
-                    (get_data_from_seg(self.segments[idx], config=self.config, local_rank=self.local_rank))
-                )
+                if self.config.mock_data:
+                    batch = self._mock_batch()
+                else:
+                    target, frame_range, peak = self.segments[idx]
+                    batch = get_data_from_seg(target, config=self.config, local_rank=self.local_rank,
+                                              frame_range=frame_range, peak=peak)
                 yield from self._flatten_batch(batch)
             except IGNORE_EXCEPTIONS as ex:
                 # print(f"skipping sample due to exception: {ex}")
