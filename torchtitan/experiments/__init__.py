@@ -15,5 +15,7 @@ _supported_experiments = frozenset(
         "ft.llama3",
         "rl",
         "shakespeare",
+        "mnist",
+        "worldmodel",
     ]
 )
