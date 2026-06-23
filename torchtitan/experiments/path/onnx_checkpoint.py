@@ -23,6 +23,9 @@ class _VisionOnnxModel(nn.Module):
     def __init__(self, model: PathModel) -> None:
         super().__init__()
         self.vision = model.vision
+        reparameterize = getattr(self.vision.encoder, "reparameterize", None)
+        if callable(reparameterize):
+            reparameterize()
         self.point_policy = model.point_policy
 
     def forward(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

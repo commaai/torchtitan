@@ -30,7 +30,7 @@ from torchtitan.protocols.module import Module, ModuleDict, ModuleList, Sequenti
 from torchtitan.tools.logging import logger
 from xx.ml_tools.constants.model import ModelInputs
 
-from . import convnext
+from . import convnext, fastvit
 
 
 @dataclass(frozen=True)
@@ -315,13 +315,36 @@ class Vision(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.encoder = convnext.create_convnext(
-            config.flavor,
-            pretrained=False,
-            in_chans=config.in_channels,
-            num_classes=config.vision_features,
-            drop_path_rate=config.drop_path_rate,
-        )
+        if config.flavor in convnext.CONVNEXT_FLAVORS:
+            flavor = convnext.CONVNEXT_FLAVORS[config.flavor]
+            self.encoder = convnext.ConvNeXt(
+                depths=flavor["depths"],
+                dims=flavor["dims"],
+                in_chans=config.in_channels,
+                num_classes=config.vision_features,
+                drop_path_rate=config.drop_path_rate,
+            )
+            self._pretrained_name = flavor["pretrained"]
+            self._first_conv_names = ("stem.0.weight",)
+            self._skip_allnorm_pretrained = False
+        elif config.flavor in fastvit.FASTVIT_FLAVORS:
+            flavor = fastvit.FASTVIT_FLAVORS[config.flavor]
+            self.encoder = fastvit.FastVit(
+                layers=flavor["layers"],
+                embed_dims=flavor["embed_dims"],
+                mlp_ratios=flavor["mlp_ratios"],
+                in_chans=config.in_channels,
+                num_classes=config.vision_features,
+                drop_path_rate=config.drop_path_rate,
+            )
+            self._pretrained_name = flavor["pretrained"]
+            self._first_conv_names = (
+                "stem.0.conv_kxk.0.conv.weight",
+                "stem.0.conv_scale.conv.weight",
+            )
+            self._skip_allnorm_pretrained = True
+        else:
+            raise ValueError(f"Unsupported path vision flavor: {config.flavor}")
         self.register_buffer("_mean", torch.empty(1, config.in_channels, 1, 1), persistent=True)
         self.register_buffer("_std", torch.empty(1, config.in_channels, 1, 1), persistent=True)
 
@@ -334,44 +357,36 @@ class Vision(Module):
         if not self.config.pretrained:
             return
 
-        state_dict = self._pretrained_state_dict()
+        from timm.models._builder import adapt_input_conv, load_state_dict_from_hf
+
+        state_dict = load_state_dict_from_hf(f"timm/{self._pretrained_name}", weights_only=True)
+        if self.config.in_channels != 3:
+            for name in self._first_conv_names:
+                state_dict[name] = adapt_input_conv(self.config.in_channels, state_dict[name])
+
         target_state = self.encoder.state_dict()
         load_state = {}
         for name, value in state_dict.items():
-            if name.startswith("head."):
+            if name.startswith("head.") or (
+                self._skip_allnorm_pretrained and fastvit.skip_pretrained_tensor(self.encoder, name)
+            ):
                 continue
             target = target_state.get(name)
             if target is None:
                 continue
-            value = self._move_pretrained_value(value, target)
+            if isinstance(target, DTensor):
+                value = distribute_tensor(value.to(dtype=target.dtype), target.device_mesh, list(target.placements))
+            else:
+                value = value.to(device=target.device, dtype=target.dtype)
             if tuple(value.shape) != tuple(target.shape):
                 continue
             load_state[name] = value
 
         missing, unexpected = self.encoder.load_state_dict(load_state, strict=False)
-        pretrained_name = convnext.pretrained_name(self.config.flavor)
         logger.info(
-            f"Loaded {len(load_state)} ConvNeXt tensors from {pretrained_name} "
+            f"Loaded {len(load_state)} {self.config.flavor} tensors from {self._pretrained_name} "
             f"({len(missing)} missing, {len(unexpected)} unexpected)"
         )
-
-    def _pretrained_state_dict(self) -> dict[str, torch.Tensor]:
-        from timm.models._builder import adapt_input_conv, load_state_dict_from_hf
-
-        state_dict = load_state_dict_from_hf(
-            f"timm/{convnext.pretrained_name(self.config.flavor)}",
-            weights_only=True,
-        )
-        state_dict = convnext.checkpoint_filter_fn(state_dict, self.encoder)
-        if self.config.in_channels != 3:
-            state_dict["stem.0.weight"] = adapt_input_conv(self.config.in_channels, state_dict["stem.0.weight"])
-        return state_dict
-
-    @staticmethod
-    def _move_pretrained_value(value: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if isinstance(target, DTensor):
-            return distribute_tensor(value.to(dtype=target.dtype), target.device_mesh, list(target.placements))
-        return value.to(device=target.device, dtype=target.dtype)
 
     def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
         x = torch.cat([inputs[name] for name in self.config.input_frame_names], dim=1)
