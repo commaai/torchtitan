@@ -190,7 +190,7 @@ def _model_config(flavor: str) -> PathModel.Config:
             input_frame_names=tuple(input_frame_names),
             in_channels=in_channels,
             vision_features=vision_features,
-            pretrained=flavor == "fastvit_t12",
+            pretrained=False,
             drop_path_rate=0.2,
             mean=255 / 2,
             std=255 / 4,
