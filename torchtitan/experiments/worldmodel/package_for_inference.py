@@ -67,6 +67,8 @@ def resolve_checkpoint_path(checkpoint_id: str) -> str:
 
 
 def default_output_path(checkpoint_path: str) -> str:
+    checkpoint_path = "mkv://data-gen.comma.life:3080/reporterv2/checkpoint/7bc60839-f13b-b27c-5933-373710cf4566/15361"
+    print(checkpoint_path)
     return posixpath.join(checkpoint_path.rstrip("/"), PACKAGE_NAME)
 
 

@@ -3,6 +3,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field
+from functools import partial
 import itertools
 import math
 from typing import Any
@@ -15,7 +16,7 @@ import torch.nn.functional as F
 from einops.layers.torch import Rearrange
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from torchtitan.config.configs import (
     ActivationCheckpointConfig,
@@ -39,6 +40,7 @@ TORCH_DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
 }
 TensorOrMask = torch.Tensor | BlockMask
+_COMPILED_FLEX_ATTENTION: Callable = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs")
 
 
 @dataclass(kw_only=True, slots=True)
@@ -299,6 +301,17 @@ def _cast_if_autocast_enabled(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _fp8_score_mod(
+    score: torch.Tensor,
+    b: torch.Tensor,
+    h: torch.Tensor,
+    q_idx: torch.Tensor,
+    kv_idx: torch.Tensor,
+) -> torch.Tensor:
+    del b, h, q_idx, kv_idx
+    return score.to(torch.float32)
+
+
 def _blockwise_lower_triangular_causal_mask(
     mini_block_size: int,
     b: torch.Tensor,
@@ -337,23 +350,17 @@ def _mask_fn(config: TransformerConfig) -> Callable | None:
     if config.attention_mask == "BLOCKWISE_LOWER_TRIANGLE":
         if config.attention_mask_mini_block_size is None:
             raise ValueError("BLOCKWISE_LOWER_TRIANGLE requires attention_mask_mini_block_size")
-        return lambda b, h, q_idx, kv_idx: _blockwise_lower_triangular_causal_mask(
+        return partial(
+            _blockwise_lower_triangular_causal_mask,
             config.attention_mask_mini_block_size,
-            b,
-            h,
-            q_idx,
-            kv_idx,
         )
     if config.attention_mask == "LAST_FRAME_CAUSAL":
         if config.attention_mask_mini_block_size is None:
             raise ValueError("LAST_FRAME_CAUSAL requires attention_mask_mini_block_size")
-        return lambda b, h, q_idx, kv_idx: _last_frame_causal_mask(
+        return partial(
+            _last_frame_causal_mask,
             config.block_size,
             config.attention_mask_mini_block_size,
-            b,
-            h,
-            q_idx,
-            kv_idx,
         )
     raise ValueError(f"unknown attention_mask {config.attention_mask}")
 
@@ -506,43 +513,102 @@ class SelfAttention(nn.Module):
         self.dropout = nn.Dropout(config.resid_pdrop)
         self.flex_attention = FlexAttention.Config().build() if config.attention_impl == "FLEX" else None
         self.sdpa = ScaledDotProductAttention.Config().build() if config.attention_impl == "SDPA" else None
+        self.kv_cache: Any | None = None
 
-    def forward(self, x: torch.Tensor, input_mask: TensorOrMask | None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_pos: torch.Tensor | None = None,
+        input_mask: TensorOrMask | None = None,
+    ) -> torch.Tensor:
         batch, seq_len, emb_dim = x.shape
         qkv = self.c_attn(self.layer_norm(x)).view(batch, seq_len, 3, self.config.n_head, self.head_dim)
-        q, k, v = qkv.unbind(2)
+
+        if self.training and input_pos is None:
+            q, k, v = qkv.unbind(2)
+            q, k = _cast_if_autocast_enabled(self.q_norm(q)), _cast_if_autocast_enabled(self.k_norm(k))
+            if self.config.attention_impl == "FLEX":
+                if k.dtype == torch.float8_e4m3fn:
+                    k, v = k.to(q.dtype), v.to(q.dtype)
+                assert self.flex_attention is not None
+                y = self.flex_attention(q, k, v, attention_masks=input_mask, scale=1.0 / math.sqrt(self.head_dim))
+            elif self.config.attention_impl == "SDPA" and input_mask is None:
+                assert self.sdpa is not None
+                y = self.sdpa(q, k, v, scale=1.0 / math.sqrt(self.head_dim), is_causal=False)
+            elif self.config.attention_impl in {"SDPA", "NAIVE"}:
+                q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                if self.config.attention_impl == "SDPA":
+                    y = F.scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        attn_mask=input_mask,
+                        dropout_p=self.config.attn_pdrop,
+                        scale=1.0 / math.sqrt(self.head_dim),
+                    ).transpose(1, 2)
+                else:
+                    attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+                    if input_mask is not None:
+                        attn = attn.masked_fill(~input_mask, float("-inf"))
+                    attn = F.softmax(attn, dim=-1)
+                    attn = F.dropout(attn, p=self.config.attn_pdrop, training=True)
+                    y = (attn @ v).transpose(1, 2)
+            else:
+                raise ValueError(f"unknown attention_impl {self.config.attention_impl}")
+            return self.dropout(self.c_proj(y.reshape(batch, seq_len, emb_dim)))
+
+        q, k, v = qkv.permute(
+            2,
+            0,
+            3,
+            1,
+            4,
+        )
         q, k = _cast_if_autocast_enabled(self.q_norm(q)), _cast_if_autocast_enabled(self.k_norm(k))
+
+        if input_pos is not None:
+            if self.training:
+                raise RuntimeError("KV cache is only supported for inference")
+            if self.kv_cache is None:
+                raise RuntimeError("KV cache must be initialized before using input_pos")
+            k, v = self.kv_cache.cache(input_pos, k, v)
 
         if self.config.attention_impl == "FLEX":
             if k.dtype == torch.float8_e4m3fn:
-                k, v = k.to(q.dtype), v.to(q.dtype)
-            assert self.flex_attention is not None
-            y = self.flex_attention(q, k, v, attention_masks=input_mask, scale=1.0 / math.sqrt(self.head_dim))
-        elif self.config.attention_impl == "SDPA" and input_mask is None:
-            assert self.sdpa is not None
-            y = self.sdpa(q, k, v, scale=1.0 / math.sqrt(self.head_dim), is_causal=False)
-        elif self.config.attention_impl in {"SDPA", "NAIVE"}:
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            if self.config.attention_impl == "SDPA":
-                y = F.scaled_dot_product_attention(
-                    q,
+                y = _COMPILED_FLEX_ATTENTION(
+                    q.to(torch.float8_e4m3fn),
                     k,
                     v,
-                    attn_mask=input_mask,
-                    dropout_p=self.config.attn_pdrop if self.training else 0.0,
-                    scale=1.0 / math.sqrt(self.head_dim),
-                ).transpose(1, 2)
+                    block_mask=input_mask,
+                    score_mod=_fp8_score_mod,
+                ).to(q.dtype)
             else:
-                attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-                if input_mask is not None:
-                    attn = attn.masked_fill(~input_mask, float("-inf"))
-                attn = F.softmax(attn, dim=-1)
-                attn = F.dropout(attn, p=self.config.attn_pdrop, training=self.training)
-                y = (attn @ v).transpose(1, 2)
+                y = _COMPILED_FLEX_ATTENTION(q, k, v, block_mask=input_mask)
+        elif self.config.attention_impl == "SDPA":
+            if k.dtype == torch.float8_e4m3fn:
+                k, v = k.to(q.dtype), v.to(q.dtype)
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=input_mask,
+                dropout_p=self.config.attn_pdrop if self.training else 0.0,
+                scale=1.0 / math.sqrt(self.head_dim),
+            )
+        elif self.config.attention_impl == "NAIVE":
+            if k.dtype == torch.float8_e4m3fn:
+                k, v = k.to(q.dtype), v.to(q.dtype)
+            attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+            if input_mask is not None:
+                attn = attn.masked_fill(~input_mask, float("-inf"))
+            attn = F.softmax(attn, dim=-1)
+            attn = F.dropout(attn, p=self.config.attn_pdrop, training=self.training)
+            y = attn @ v
         else:
             raise ValueError(f"unknown attention_impl {self.config.attention_impl}")
 
-        return self.dropout(self.c_proj(y.reshape(batch, seq_len, emb_dim)))
+        y = y.transpose(1, 2).contiguous().view(batch, seq_len, emb_dim)
+        return self.dropout(self.c_proj(y))
 
 
 def build_ffn(config: TransformerConfig, linears: FFNLinearsConfig) -> nn.Sequential:
@@ -579,7 +645,8 @@ class PlanHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for mlp in self.mlps:
             x = mlp(x)
-        return self.scale_layer(self.head(x))
+        with torch.autocast(enabled=x.device.type == "cuda" and not self.training, device_type="cuda", dtype=torch.float32):
+            return self.scale_layer(self.head(x))
 
     def init_weights(self) -> None:
         for module in self.mlps.modules():
@@ -601,10 +668,20 @@ class DiTBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.empty(1, config.num_temporal_patches, 6, config.transformer.n_embd))
         self.init_weights()
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, input_mask: TensorOrMask | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        input_pos: torch.Tensor | None = None,
+        input_pos_t: torch.Tensor | None = None,
+        input_mask: TensorOrMask | None = None,
+    ) -> torch.Tensor:
         batch = x.shape[0]
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table + t.reshape(batch, self.scale_shift_table.shape[1], 6, -1)).chunk(6, dim=2)
-        x = x + gate(self.attn(modulate(self.norm1(x), shift_msa, scale_msa), input_mask), gate_msa)
+        scale_shift_table = self.scale_shift_table if input_pos_t is None else self.scale_shift_table[:, input_pos_t]
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            scale_shift_table + t.reshape(batch, scale_shift_table.shape[1], 6, -1)
+        ).chunk(6, dim=2)
+        x = x + gate(self.attn(modulate(self.norm1(x), shift_msa, scale_msa), input_pos, input_mask), gate_msa)
         return x + gate(self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)), gate_mlp)
 
     def reset_parameters(self) -> None:
@@ -625,9 +702,15 @@ class FinalLayer(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.empty(1, config.num_temporal_patches, 2, config.transformer.n_embd))
         self.init_weights()
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        input_pos_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         batch = x.shape[0]
-        shift, scale = (self.scale_shift_table + t.reshape(batch, self.scale_shift_table.shape[1], 2, -1)).chunk(2, dim=2)
+        scale_shift_table = self.scale_shift_table if input_pos_t is None else self.scale_shift_table[:, input_pos_t]
+        shift, scale = (scale_shift_table + t.reshape(batch, scale_shift_table.shape[1], 2, -1)).chunk(2, dim=2)
         return self.linear(modulate(self.norm_final(x), shift, scale))
 
     def reset_parameters(self) -> None:
@@ -704,10 +787,28 @@ class WorldModel(BaseModel):
                 hidden,
                 getattr(self, "ref_augment_from_augments_euler_embedder", None),
             )
-            self.pose_mask_embedder = conditioning_embedder_linears_config(2, hidden, getattr(self, "pose_mask_embedder", None))
-            self.t_embedder = conditioning_embedder_linears_config(256, hidden, getattr(self, "t_embedder", None))
-            self.fidx_embedder = conditioning_embedder_linears_config(50, hidden, getattr(self, "fidx_embedder", None))
-            self.blocks = [dit_block_linears_config(self.transformer, current_blocks[i] if i < len(current_blocks) else None) for i in range(self.transformer.n_layer)]
+            self.pose_mask_embedder = conditioning_embedder_linears_config(
+                2,
+                hidden,
+                getattr(self, "pose_mask_embedder", None),
+            )
+            self.t_embedder = conditioning_embedder_linears_config(
+                256,
+                hidden,
+                getattr(self, "t_embedder", None),
+            )
+            self.fidx_embedder = conditioning_embedder_linears_config(
+                50,
+                hidden,
+                getattr(self, "fidx_embedder", None),
+            )
+            self.blocks = [
+                dit_block_linears_config(
+                    self.transformer,
+                    current_blocks[i] if i < len(current_blocks) else None,
+                )
+                for i in range(self.transformer.n_layer)
+            ]
             self.final_layer = (
                 FinalLayerLinearsConfig(
                     linear=linear_config(
@@ -720,7 +821,11 @@ class WorldModel(BaseModel):
                 if self.out_channels > 0
                 else None
             )
-            self.plan_head_linears = plan_head_linears_config(self.plan_head, current_plan) if self.plan_head.n_layer >= 0 else None
+            self.plan_head_linears = (
+                plan_head_linears_config(self.plan_head, current_plan)
+                if self.plan_head.n_layer >= 0
+                else None
+            )
 
         def build(self, **kwargs: Any) -> "WorldModel":
             if kwargs:
@@ -849,9 +954,18 @@ class WorldModel(BaseModel):
         ref_augment_from_augments_euler: torch.Tensor,
         pose_mask: torch.Tensor,
         fidx: torch.Tensor,
+        input_pos_mask_pair: Any | None = None,
         return_plan: bool = True,
     ) -> dict[str, torch.Tensor]:
-        x = self.x_embedder(x) + self.pos_embed
+        if input_pos_mask_pair is None:
+            input_pos, input_mask = None, self.mask
+        else:
+            input_pos, input_mask = input_pos_mask_pair.input_pos, input_pos_mask_pair.input_mask
+
+        pos_embed = self.pos_embed[:, input_pos] if input_pos is not None else self.pos_embed
+        input_pos_t = input_pos[:: self.config.num_spatial_patches] // self.config.num_spatial_patches if input_pos is not None else None
+
+        x = self.x_embedder(x) + pos_embed
         augments_pos_ref_augment = self.position_scale(augments_pos_ref_augment)
         ref_augment_from_augments_euler = self.euler_scale(ref_augment_from_augments_euler)
         t6, t2 = self.t_embedder(t)
@@ -862,12 +976,12 @@ class WorldModel(BaseModel):
         t6 = t6 + pos6 + euler6 + pose_mask6 + fidx6
         t2 = t2 + pos2 + euler2 + pose_mask2 + fidx2
         for block in self.blocks:
-            x = block(x, t6, self.mask)
+            x = block(x, t6, input_pos, input_pos_t, input_mask)
         outputs = {}
         if return_plan and self.plan_head is not None:
             outputs["plan"] = self.plan_head(x[:, -1, :])
         if self.final_layer is not None:
-            outputs["sample"] = self.unpatchify(self.final_layer(x, t2))
+            outputs["sample"] = self.unpatchify(self.final_layer(x, t2, input_pos_t))
         return outputs
 
 
