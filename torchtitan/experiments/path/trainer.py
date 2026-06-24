@@ -35,6 +35,8 @@ class PathTrainer(Trainer):
                 self.validator.miniray = {**self.validator.miniray, "codedir": self.codedir}
 
     def __init__(self, config: Config):
+        import torch._dynamo
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 32)
         super().__init__(config)
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:path:train")
