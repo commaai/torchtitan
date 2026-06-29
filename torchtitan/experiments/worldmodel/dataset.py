@@ -152,6 +152,9 @@ class WorldModelDataLoader(BaseDataLoader):
                 global_rank=dp_rank,
                 local_world_size=self.local_world_size,
                 global_world_size=dp_world_size,
+                redis_host=os.environ.get("GIGASHUFFLE_REDIS_HOST", "localhost"),
+                redis_port=int(os.environ.get("GIGASHUFFLE_REDIS_PORT", "6379")),
+                redis_db=int(os.environ.get("GIGASHUFFLE_REDIS_DB", "6")),
                 queue_name=f"{run_id}-{config.split}-node{node_rank}",
             ),
         )
