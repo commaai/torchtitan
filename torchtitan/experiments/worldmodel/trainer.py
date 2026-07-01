@@ -32,6 +32,7 @@ from .loss import WorldModelLoss
 from .model import WorldModel
 from .schedulers import RFScheduler
 from .tokenizer import WorldModelTokenizer
+from .torchpackage_checkpoint import WorldModelTorchPackageCheckpointManager
 
 
 ValidationContext = Callable[[], AbstractContextManager[None]]
@@ -307,6 +308,7 @@ class WorldModelTrainer(Trainer):
         dataloader: WorldModelDataLoader.Config
         tokenizer: WorldModelTokenizer.Config
         validator: WorldModelValidator.Config
+        checkpoint: WorldModelTorchPackageCheckpointManager.Config
         float8: WorldModelFloat8Config = field(
             default_factory=WorldModelFloat8Config
         )
