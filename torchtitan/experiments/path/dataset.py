@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import os
@@ -26,6 +32,7 @@ class PathDataLoader(BaseDataLoader):
         n_frames: int
         rgb: bool
         unvision: bool
+        deterministic_fidxs: bool = False
 
     def __init__(
         self,
@@ -41,10 +48,11 @@ class PathDataLoader(BaseDataLoader):
         **kwargs: Any,
     ) -> None:
         del tokenizer, seq_len, snapshot_every_n_steps, kwargs
-        from gigashuffle import DataloaderConfig
         from xx.training.lib.dataloader import DataLoader
         from xx.training.path.config import DatasetConfig as XXPathDatasetConfig
         from xx.training.path.dataloader import get_dataset
+
+        from gigashuffle import DataloaderConfig
 
         self.config = config
         self.local_batch_size = local_batch_size
@@ -72,6 +80,7 @@ class PathDataLoader(BaseDataLoader):
             n_frames=config.n_frames,
             rgb=config.rgb,
             unvision=config.unvision,
+            deterministic_fidxs=config.deterministic_fidxs,
         )
         dataset = get_dataset(config.dataset, xx_config, val, self.local_rank)
         self.dataset = dataset
@@ -91,7 +100,9 @@ class PathDataLoader(BaseDataLoader):
         self.loader = DataLoader(dataset, loader_config)
         self._iterator: Any | None = None
 
-    def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]]:
+    def __iter__(
+        self,
+    ) -> Iterator[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]]:
         iterator = iter(self.loader)
         self._iterator = iterator
         try:

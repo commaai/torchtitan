@@ -595,6 +595,7 @@ def _vit_dataloader_config(*, split: str) -> PathDataLoader.Config:
         _dataloader_config(split=split, fps=SUPERCOMBO_FPS, plan_only=True),
         dataset=os.path.join(XX_BASEDIR, dataset),
         pipeline_dir=BASE_DIR_GT_10M,
+        deterministic_fidxs=True,
     )
 
 
