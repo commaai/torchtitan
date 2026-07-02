@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from functools import partial
 
 import torch
@@ -19,6 +20,7 @@ from timm.layers import (
     to_ntuple,
     trunc_normal_,
 )
+from timm.models import build_model_with_cfg
 from timm.models._manipulate import checkpoint_seq, named_apply
 
 from .path_mup_helpers import BASE_WIDTH, hidden_std
@@ -27,6 +29,12 @@ from .path_mup_helpers import BASE_WIDTH, hidden_std
 __all__ = [
     "CONVNEXT_FLAVORS",
     "ConvNeXt",
+    "convnext_base",
+    "convnext_small",
+    "convnext_tiny",
+    "convnext_xxlarge",
+    "create_convnext",
+    "pretrained_name",
 ]
 
 
@@ -353,3 +361,76 @@ def _init_weights(
         if name and "head." in name:
             module.weight.data.mul_(head_init_scale)
             module.bias.data.mul_(head_init_scale)
+
+
+def checkpoint_filter_fn(state_dict, model):
+    if "head.norm.weight" in state_dict or "norm_pre.weight" in state_dict:
+        return state_dict
+    if "model" in state_dict:
+        state_dict = state_dict["model"]
+
+    out_dict = {}
+    if "visual.trunk.stem.0.weight" in state_dict:
+        out_dict = {k.replace("visual.trunk.", ""): v for k, v in state_dict.items() if k.startswith("visual.trunk.")}
+        if "visual.head.proj.weight" in state_dict:
+            out_dict["head.fc.weight"] = state_dict["visual.head.proj.weight"]
+            out_dict["head.fc.bias"] = torch.zeros(state_dict["visual.head.proj.weight"].shape[0])
+        elif "visual.head.mlp.fc1.weight" in state_dict:
+            out_dict["head.pre_logits.fc.weight"] = state_dict["visual.head.mlp.fc1.weight"]
+            out_dict["head.pre_logits.fc.bias"] = state_dict["visual.head.mlp.fc1.bias"]
+            out_dict["head.fc.weight"] = state_dict["visual.head.mlp.fc2.weight"]
+            out_dict["head.fc.bias"] = torch.zeros(state_dict["visual.head.mlp.fc2.weight"].shape[0])
+        return out_dict
+
+    for k, v in state_dict.items():
+        k = k.replace("downsample_layers.0.", "stem.")
+        k = re.sub(r"stages.([0-9]+).([0-9]+)", r"stages.\1.blocks.\2", k)
+        k = re.sub(r"downsample_layers.([0-9]+).([0-9]+)", r"stages.\1.downsample.\2", k)
+        k = k.replace("dwconv", "conv_dw")
+        k = k.replace("pwconv", "mlp.fc")
+        k = k.replace("head.", "head.fc.")
+        if k.startswith("norm."):
+            k = k.replace("norm", "head.norm")
+        if v.ndim == 2 and "head" not in k:
+            v = v.reshape(model.state_dict()[k].shape)
+        out_dict[k] = v
+    return out_dict
+
+def _create_convnext(variant: str, pretrained: bool = False, **kwargs):
+    return build_model_with_cfg(
+        ConvNeXt,
+        variant,
+        pretrained,
+        pretrained_filter_fn=checkpoint_filter_fn,
+        feature_cfg=dict(out_indices=(0, 1, 2, 3), flatten_sequential=True),
+        **kwargs,
+    )
+
+
+def pretrained_name(flavor: str) -> str:
+    return CONVNEXT_FLAVORS[flavor]["pretrained"]
+
+
+def create_convnext(flavor: str, pretrained: bool = False, **kwargs) -> ConvNeXt:
+    model_args = {
+        "depths": CONVNEXT_FLAVORS[flavor]["depths"],
+        "dims": CONVNEXT_FLAVORS[flavor]["dims"],
+        "norm_eps": kwargs.pop("norm_eps", 1e-5),
+    }
+    return _create_convnext(flavor, pretrained=pretrained, **dict(model_args, **kwargs))
+
+
+def convnext_tiny(pretrained: bool = False, **kwargs) -> ConvNeXt:
+    return create_convnext("convnext_tiny", pretrained=pretrained, **kwargs)
+
+
+def convnext_small(pretrained: bool = False, **kwargs) -> ConvNeXt:
+    return create_convnext("convnext_small", pretrained=pretrained, **kwargs)
+
+
+def convnext_base(pretrained: bool = False, **kwargs) -> ConvNeXt:
+    return create_convnext("convnext_base", pretrained=pretrained, **kwargs)
+
+
+def convnext_xxlarge(pretrained: bool = False, **kwargs) -> ConvNeXt:
+    return create_convnext("convnext_xxlarge", pretrained=pretrained, **kwargs)
