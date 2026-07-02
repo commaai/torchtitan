@@ -122,7 +122,7 @@ def convnext_xxlarge() -> PathTrainer.Config:
     return _path("convnext_xxlarge")
 
 
-def _convnext_sweep(*, mup: bool, width: int) -> PathTrainer.Config:
+def _convnext(*, mup: bool, width: int) -> PathTrainer.Config:
     cfg = _path("convnext_base", mup=mup, width=width)
     return dataclasses.replace(
         cfg,
@@ -137,35 +137,35 @@ def _convnext_sweep(*, mup: bool, width: int) -> PathTrainer.Config:
 
 
 def convnext_standard_w256() -> PathTrainer.Config:
-    return _convnext_sweep(mup=False, width=256)
+    return _convnext(mup=False, width=256)
 
 
 def convnext_standard_w512() -> PathTrainer.Config:
-    return _convnext_sweep(mup=False, width=512)
+    return _convnext(mup=False, width=512)
 
 
 def convnext_standard_w1024() -> PathTrainer.Config:
-    return _convnext_sweep(mup=False, width=1024)
+    return _convnext(mup=False, width=1024)
 
 
 def convnext_standard_w2048() -> PathTrainer.Config:
-    return _convnext_sweep(mup=False, width=2048)
+    return _convnext(mup=False, width=2048)
 
 
 def convnext_mup_w256() -> PathTrainer.Config:
-    return _convnext_sweep(mup=True, width=256)
+    return _convnext(mup=True, width=256)
 
 
 def convnext_mup_w512() -> PathTrainer.Config:
-    return _convnext_sweep(mup=True, width=512)
+    return _convnext(mup=True, width=512)
 
 
 def convnext_mup_w1024() -> PathTrainer.Config:
-    return _convnext_sweep(mup=True, width=1024)
+    return _convnext(mup=True, width=1024)
 
 
 def convnext_mup_w2048() -> PathTrainer.Config:
-    return _convnext_sweep(mup=True, width=2048)
+    return _convnext(mup=True, width=2048)
 
 
 def _dp_degrees() -> tuple[int, int]:
