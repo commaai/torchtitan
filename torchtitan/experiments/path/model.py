@@ -40,6 +40,7 @@ from torchtitan.protocols.module import Module, ModuleDict, ModuleList, Sequenti
 from torchtitan.tools.logging import logger
 
 from . import convnext
+from .path_mup_helpers import scale_dims
 
 
 @dataclass(frozen=True)
@@ -356,17 +357,26 @@ class Vision(Module):
         drop_path_rate: float
         mean: float
         std: float
+        width: int = 256
+        mup: bool = False
+        output_mult: float = 1.0
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.encoder = convnext.create_convnext(
-            config.flavor,
-            pretrained=False,
+        if config.flavor not in convnext.CONVNEXT_FLAVORS:
+            raise ValueError(f"Unsupported path vision flavor: {config.flavor}")
+        flavor = convnext.CONVNEXT_FLAVORS[config.flavor]
+        self.encoder = convnext.ConvNeXt(
+            depths=flavor["depths"],
+            dims=scale_dims(flavor["dims"], config.width),
             in_chans=config.in_channels,
             num_classes=config.vision_features,
             drop_path_rate=config.drop_path_rate,
+            mup=config.mup,
         )
+        self._pretrained_name = flavor["pretrained"]
+        self._first_conv_names = ("stem.0.weight",)
         self.register_buffer(
             "_mean", torch.empty(1, config.in_channels, 1, 1), persistent=True
         )
@@ -387,7 +397,13 @@ class Vision(Module):
         if not self.config.pretrained:
             return
 
-        state_dict = self._pretrained_state_dict()
+        from timm.models._builder import adapt_input_conv, load_state_dict_from_hf
+
+        state_dict = load_state_dict_from_hf(f"timm/{self._pretrained_name}", weights_only=True)
+        if self.config.in_channels != 3:
+            for name in self._first_conv_names:
+                state_dict[name] = adapt_input_conv(self.config.in_channels, state_dict[name])
+
         target_state = self.encoder.state_dict()
         load_state = {}
         for name, value in state_dict.items():
@@ -396,49 +412,26 @@ class Vision(Module):
             target = target_state.get(name)
             if target is None:
                 continue
-            value = self._move_pretrained_value(value, target)
+            if isinstance(target, DTensor):
+                value = distribute_tensor(value.to(dtype=target.dtype), target.device_mesh, list(target.placements))
+            else:
+                value = value.to(device=target.device, dtype=target.dtype)
             if tuple(value.shape) != tuple(target.shape):
                 continue
             load_state[name] = value
 
         missing, unexpected = self.encoder.load_state_dict(load_state, strict=False)
-        pretrained_name = convnext.pretrained_name(self.config.flavor)
         logger.info(
-            f"Loaded {len(load_state)} ConvNeXt tensors from {pretrained_name} "
+            f"Loaded {len(load_state)} {self.config.flavor} tensors from {self._pretrained_name} "
             f"({len(missing)} missing, {len(unexpected)} unexpected)"
         )
-
-    def _pretrained_state_dict(self) -> dict[str, torch.Tensor]:
-        from timm.models._builder import adapt_input_conv, load_state_dict_from_hf
-
-        state_dict = load_state_dict_from_hf(
-            f"timm/{convnext.pretrained_name(self.config.flavor)}",
-            weights_only=True,
-        )
-        state_dict = convnext.checkpoint_filter_fn(state_dict, self.encoder)
-        if self.config.in_channels != 3:
-            state_dict["stem.0.weight"] = adapt_input_conv(
-                self.config.in_channels, state_dict["stem.0.weight"]
-            )
-        return state_dict
-
-    @staticmethod
-    def _move_pretrained_value(
-        value: torch.Tensor, target: torch.Tensor
-    ) -> torch.Tensor:
-        if isinstance(target, DTensor):
-            return distribute_tensor(
-                value.to(dtype=target.dtype),
-                target.device_mesh,
-                list(target.placements),
-            )
-        return value.to(device=target.device, dtype=target.dtype)
 
     def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
         x = torch.cat([inputs[name] for name in self.config.input_frame_names], dim=1)
         dtype = next(self.encoder.parameters()).dtype
         x = x.to(dtype)
-        return self.encoder((x - self._mean.to(dtype)) / self._std.to(dtype))
+        out = self.encoder((x - self._mean.to(dtype)) / self._std.to(dtype))
+        return out * self.config.output_mult
 
 
 class PathModel(BaseModel):

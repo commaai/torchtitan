@@ -94,11 +94,11 @@ MUP_PATTERN = (
 )
 
 
-def model_registry(flavor: str) -> ModelSpec:
+def model_registry(flavor: str, *, mup: bool = False, width: int = 256) -> ModelSpec:
     return ModelSpec(
         name="path",
         flavor=flavor,
-        model=_model_config(flavor),
+        model=_model_config(flavor, mup=mup, width=width),
         parallelize_fn=parallelize_path,
         pipelining_fn=None,
         post_optimizer_build_fn=None,
@@ -122,6 +122,52 @@ def convnext_xxlarge() -> PathTrainer.Config:
     return _path("convnext_xxlarge")
 
 
+def _convnext_sweep(*, mup: bool, width: int) -> PathTrainer.Config:
+    cfg = _path("convnext_base", mup=mup, width=width)
+    return dataclasses.replace(
+        cfg,
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=round(VIT_STEPS * 0.1),
+            total_steps=None,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.0,
+        ),
+    )
+
+
+def convnext_standard_w256() -> PathTrainer.Config:
+    return _convnext_sweep(mup=False, width=256)
+
+
+def convnext_standard_w512() -> PathTrainer.Config:
+    return _convnext_sweep(mup=False, width=512)
+
+
+def convnext_standard_w1024() -> PathTrainer.Config:
+    return _convnext_sweep(mup=False, width=1024)
+
+
+def convnext_standard_w2048() -> PathTrainer.Config:
+    return _convnext_sweep(mup=False, width=2048)
+
+
+def convnext_mup_w256() -> PathTrainer.Config:
+    return _convnext_sweep(mup=True, width=256)
+
+
+def convnext_mup_w512() -> PathTrainer.Config:
+    return _convnext_sweep(mup=True, width=512)
+
+
+def convnext_mup_w1024() -> PathTrainer.Config:
+    return _convnext_sweep(mup=True, width=1024)
+
+
+def convnext_mup_w2048() -> PathTrainer.Config:
+    return _convnext_sweep(mup=True, width=2048)
+
+
 def _dp_degrees() -> tuple[int, int]:
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     world_size = int(os.environ.get("WORLD_SIZE", str(local_world_size)))
@@ -131,7 +177,9 @@ def _dp_degrees() -> tuple[int, int]:
     return num_nodes, local_world_size
 
 
-def _path(flavor: str) -> PathTrainer.Config:
+def _path(
+    flavor: str, *, mup: bool = False, width: int = 256, lr: float = 1e-3
+) -> PathTrainer.Config:
     steps = 1024 * 100
     validation_freq = 1024
     reports = {
@@ -157,10 +205,10 @@ def _path(flavor: str) -> PathTrainer.Config:
     plan_only = False
     return PathTrainer.Config(
         loss=PathLoss.Config(),
-        model_spec=model_registry(flavor),
+        model_spec=model_registry(flavor, mup=mup, width=width),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=_dataloader_config(split="train", fps=fps, plan_only=plan_only),
-        optimizer=_optimizer_config(),
+        optimizer=_optimizer_config(mup=mup, width=width, lr=lr),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=round(steps * 0.01),
             total_steps=steps,
@@ -210,7 +258,9 @@ def _path(flavor: str) -> PathTrainer.Config:
     )
 
 
-def _model_config(flavor: str) -> PathModel.Config:
+def _model_config(
+    flavor: str, *, mup: bool = False, width: int = 256
+) -> PathModel.Config:
     vision_features = 512
     n_frames_input = N_FRAMES
     input_frame_names = INPUT_FRAMES_NAMES
@@ -238,6 +288,9 @@ def _model_config(flavor: str) -> PathModel.Config:
             drop_path_rate=0.2,
             mean=255 / 2,
             std=255 / 4,
+            width=width,
+            mup=mup,
+            output_mult=(256 / width) if mup else 1.0,
         ),
         point_policy=Policy.Config(
             summarizer=PointSummarizer.Config(
@@ -355,23 +408,44 @@ def _si_int(value: str | int) -> int:
     )
 
 
-def _optimizer_config() -> OptimizersContainer.Config:
-    common = {"lr": 1e-3, "betas": (0.9, 0.95), "eps": 1e-8}
+CONVNEXT_MUP_PATTERN = (
+    r"^vision\.encoder\.("
+    r"stages\.\d+\.blocks\.\d+\.(mlp\.fc1|mlp\.fc2)"
+    r"|stages\.\d+\.downsample\.1"
+    r")\.weight$"
+)
+
+
+def _optimizer_config(
+    *, mup: bool = False, width: int = 256, lr: float = 1e-3
+) -> OptimizersContainer.Config:
+    common = {"betas": (0.9, 0.95), "eps": 1e-8}
     no_decay = r"(point_policy\.hydra|temporal_policy\.temporal_hydra)\.(final_layer|scale_layer)"
+    groups = [
+        ParamGroupConfig(
+            pattern=no_decay,
+            optimizer_name="AdamW",
+            optimizer_kwargs={**common, "weight_decay": 0.0},
+        ),
+    ]
+    if mup:
+        groups.append(
+            ParamGroupConfig(
+                pattern=CONVNEXT_MUP_PATTERN,
+                optimizer_name="AdamW",
+                lr_mult=256 / width,
+                optimizer_kwargs={**common, "weight_decay": 3e-2 * width / 256},
+            )
+        )
+    groups.append(
+        ParamGroupConfig(
+            pattern=r".*",
+            optimizer_name="AdamW",
+            optimizer_kwargs={**common, "weight_decay": 3e-2},
+        )
+    )
     return OptimizersContainer.Config(
-        implementation="fused_opt_states_bf16",
-        param_groups=[
-            ParamGroupConfig(
-                pattern=no_decay,
-                optimizer_name="AdamW",
-                optimizer_kwargs={**common, "weight_decay": 0.0},
-            ),
-            ParamGroupConfig(
-                pattern=r".*",
-                optimizer_name="AdamW",
-                optimizer_kwargs={**common, "weight_decay": 3e-2},
-            ),
-        ],
+        implementation="fused_opt_states_bf16", lr=lr, param_groups=groups
     )
 
 
