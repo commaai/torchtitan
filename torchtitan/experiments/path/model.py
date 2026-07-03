@@ -374,6 +374,7 @@ class Vision(Module):
             num_classes=config.vision_features,
             drop_path_rate=config.drop_path_rate,
             mup=config.mup,
+            output_mult=config.output_mult,
         )
         self.register_buffer(
             "_mean", torch.empty(1, config.in_channels, 1, 1), persistent=True
@@ -446,8 +447,7 @@ class Vision(Module):
         x = torch.cat([inputs[name] for name in self.config.input_frame_names], dim=1)
         dtype = next(self.encoder.parameters()).dtype
         x = x.to(dtype)
-        out = self.encoder((x - self._mean.to(dtype)) / self._std.to(dtype))
-        return out * self.config.output_mult
+        return self.encoder((x - self._mean.to(dtype)) / self._std.to(dtype))
 
 
 class PathModel(BaseModel):

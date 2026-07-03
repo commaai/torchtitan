@@ -68,6 +68,17 @@ CONVNEXT_FLAVORS = {
 }
 
 
+class MuReadout(nn.Linear):
+    def __init__(
+        self, in_features: int, out_features: int, *, output_mult: float, **kwargs
+    ) -> None:
+        super().__init__(in_features, out_features, **kwargs)
+        self.output_mult = output_mult
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(x * self.output_mult)
+
+
 class Downsample(nn.Module):
     def __init__(
         self,
@@ -246,6 +257,7 @@ class ConvNeXt(nn.Module):
         device=None,
         dtype=None,
         mup: bool = False,
+        output_mult: float = 1.0,
     ) -> None:
         super().__init__()
         assert output_stride in (8, 16, 32)
@@ -307,6 +319,10 @@ class ConvNeXt(nn.Module):
             act_layer="gelu",
             **dd,
         )
+        if mup:
+            self.head.fc = MuReadout(
+                self.num_features, num_classes, output_mult=output_mult, **dd
+            )
         named_apply(
             partial(_init_weights, head_init_scale=head_init_scale, mup=mup), self
         )
