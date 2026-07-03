@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Any, cast, Protocol
 
 import torch
 import torch.distributed as dist
@@ -43,6 +43,7 @@ class TorchPackageRecipe(Protocol):
 
     def build_empty_state_dict(self, state: Any) -> dict[str, torch.Tensor]:
         """Build CPU tensors matching the DCP keys this recipe needs."""
+        ...
 
     def build_package(
         self,
@@ -52,6 +53,7 @@ class TorchPackageRecipe(Protocol):
         step: int,
     ) -> bytes:
         """Return the final package bytes."""
+        ...
 
 
 def load_torch_package_recipe(recipe_path: str) -> TorchPackageRecipe:

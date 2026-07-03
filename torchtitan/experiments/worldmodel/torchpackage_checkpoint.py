@@ -21,14 +21,12 @@ from torch.package import PackageExporter
 
 from torchtitan.components import fs
 from torchtitan.components.torchpackage_checkpoint import (
-    TorchPackageCheckpointManager,
     export_torch_package as export_recipe_torch_package,
     load_recipe_state,
+    TorchPackageCheckpointManager,
 )
 from torchtitan.experiments.worldmodel.model import WorldModel
-from torchtitan.experiments.worldmodel.model_for_inference import (
-    WorldModelForInference,
-)
+from torchtitan.experiments.worldmodel.model_for_inference import WorldModelForInference
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import init_logger
 
@@ -244,9 +242,7 @@ def build_package(
 
 
 class WorldModelTorchPackageRecipe:
-    def build_empty_state_dict(
-        self, state: Any
-    ) -> dict[str, torch.Tensor]:
+    def build_empty_state_dict(self, state: Any) -> dict[str, torch.Tensor]:
         model_config = validate_model_config(state)
         model = build_meta_model(model_config)
         try:
@@ -277,7 +273,9 @@ def export_torch_package(checkpoint_path: str) -> None:
     recipe_state_path = fs.join_path(checkpoint_path, MODEL_CONFIG_FILE)
     output_path = fs.join_path(checkpoint_path, PACKAGE_NAME)
     step = fs.basename(checkpoint_path)
-    assert step.isdigit(), f"checkpoint path {checkpoint_path} does not end with a step number."
+    assert (
+        step.isdigit()
+    ), f"checkpoint path {checkpoint_path} does not end with a step number."
     model_config = load_model_config(recipe_state_path)
     try:
         export_recipe_torch_package(
@@ -285,7 +283,7 @@ def export_torch_package(checkpoint_path: str) -> None:
             checkpoint_path=checkpoint_path,
             output_path=output_path,
             recipe_state=model_config,
-            step=step,
+            step=int(step),
             recipe_state_path=recipe_state_path,
         )
     finally:

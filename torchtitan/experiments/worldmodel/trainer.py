@@ -310,9 +310,7 @@ class WorldModelTrainer(Trainer):
         tokenizer: WorldModelTokenizer.Config
         validator: WorldModelValidator.Config
         checkpoint: WorldModelTorchPackageCheckpointManager.Config
-        float8: WorldModelFloat8Config = field(
-            default_factory=WorldModelFloat8Config
-        )
+        float8: WorldModelFloat8Config = field(default_factory=WorldModelFloat8Config)
         pose_dropout: float
         noise_scheduler_steps: int
         no_noise_conditioning_frames_prob: float
