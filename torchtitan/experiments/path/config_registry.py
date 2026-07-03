@@ -137,6 +137,14 @@ def _convnext(*, mup: bool, width: int) -> PathTrainer.Config:
     )
 
 
+def convnext_standard_w64() -> PathTrainer.Config:
+    return _convnext(mup=False, width=64)
+
+
+def convnext_standard_w128() -> PathTrainer.Config:
+    return _convnext(mup=False, width=128)
+
+
 def convnext_standard_w256() -> PathTrainer.Config:
     return _convnext(mup=False, width=256)
 
@@ -151,6 +159,14 @@ def convnext_standard_w1024() -> PathTrainer.Config:
 
 def convnext_standard_w2048() -> PathTrainer.Config:
     return _convnext(mup=False, width=2048)
+
+
+def convnext_mup_w64() -> PathTrainer.Config:
+    return _convnext(mup=True, width=64)
+
+
+def convnext_mup_w128() -> PathTrainer.Config:
+    return _convnext(mup=True, width=128)
 
 
 def convnext_mup_w256() -> PathTrainer.Config:
