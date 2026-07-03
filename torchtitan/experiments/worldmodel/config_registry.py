@@ -36,8 +36,8 @@ from .model_config import (
     WORLD_MODEL_FLOAT8_FILTER_FQNS,
 )
 from .tokenizer import WorldModelTokenizer
-from .trainer import WorldModelTrainer, WorldModelValidator
 from .torchpackage_checkpoint import WorldModelTorchPackageCheckpointManager
+from .trainer import WorldModelTrainer, WorldModelValidator
 
 
 __all__ = [
@@ -87,7 +87,7 @@ def worldmodel() -> WorldModelTrainer.Config:
         ),
         training=TrainingConfig(
             local_batch_size=local_batch_size,
-            global_batch_size=local_batch_size * world_size * 2,
+            global_batch_size=local_batch_size * world_size * 2,  # 2 grad acc
             seq_len=1,
             steps=steps,
             max_norm=1.0,
