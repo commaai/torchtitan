@@ -126,6 +126,7 @@ def _convnext(*, mup: bool, width: int) -> PathTrainer.Config:
     cfg = _path("convnext_base", mup=mup, width=width)
     return dataclasses.replace(
         cfg,
+        checkpoint=CheckpointManager.Config(enable=False),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=round(VIT_STEPS * 0.1),
             total_steps=None,
