@@ -6,6 +6,10 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Any, List
+from xx.common.helpers import parse_info
+from xx.release_tests.lib.base_report import ReportFormat
+from xx.training.lib.checkpoint import wait_for_checkpoint
+from xx.training.path.test import DATASET_REPORTS, MODEL_REPORTS
 
 import torch
 import torch.distributed as dist
@@ -20,14 +24,6 @@ from torchtitan.components.validate import BaseValidator
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.tools.logging import logger
-from xx.common.helpers import parse_info
-from xx.training.lib.checkpoint import wait_for_checkpoint
-from xx.release_tests.lib.base_report import ReportFormat
-from xx.training.path.test import (
-    DATASET_REPORTS,
-    MODEL_REPORTS,
-)
-
 from .loss import PathLoss
 
 ValidationContext = Callable[[], AbstractContextManager[None]]
@@ -88,10 +84,14 @@ class PathValidator(BaseValidator):
             local_batch_size=self.local_batch_size,
             validation_steps=self.config.steps,
         )
-        #TODO centralize training_id
+        # TODO centralize training_id
         self.training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
-        self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{self.training_id}:path:validation")
-        self.report_runner = ReportRunner(metrics_processor=self.metrics_processor, enabled=global_rank() == 0)
+        self.unique_segment_counter = StringUniqueCounter(
+            f"unique_ids:{self.training_id}:path:validation"
+        )
+        self.report_runner = ReportRunner(
+            metrics_processor=self.metrics_processor, enabled=global_rank() == 0
+        )
 
     @torch.no_grad()
     def validate(self, model_parts: list[nn.Module], step: int) -> None:
@@ -110,12 +110,20 @@ class PathValidator(BaseValidator):
             for num_steps, (input_dict, targets) in enumerate(self.dataloader):
                 if self.config.steps != -1 and num_steps >= self.config.steps:
                     break
-                self.metrics_processor.ntokens_since_last_log += next(iter(input_dict.values())).shape[0]
+                self.metrics_processor.ntokens_since_last_log += next(
+                    iter(input_dict.values())
+                ).shape[0]
                 if "info" in input_dict:
-                    validation_segment_names.update(segment_names_from_info(input_dict["info"]))
+                    validation_segment_names.update(
+                        segment_names_from_info(input_dict["info"])
+                    )
                 input_dict = {k: v.to(device) for k, v in input_dict.items()}
                 targets = {k: v.to(device) for k, v in targets.items()}
-                local_samples = torch.tensor(next(iter(input_dict.values())).shape[0], dtype=torch.float32, device=device)
+                local_samples = torch.tensor(
+                    next(iter(input_dict.values())).shape[0],
+                    dtype=torch.float32,
+                    device=device,
+                )
                 global_samples = (
                     dist_utils.dist_sum(local_samples, batch_mesh)
                     if batch_mesh is not None
@@ -128,28 +136,47 @@ class PathValidator(BaseValidator):
 
                 if self.config.save_predictions:
                     infos = [parse_info(x) for x in input_dict["info"].cpu().numpy()]
-                    arrays = {k: v.double().cpu().numpy().round(4) for k, v in pred.items()}
+                    arrays = {
+                        k: v.double().cpu().numpy().round(4) for k, v in pred.items()
+                    }
                     pred_records.extend(
-                        {"name": info["name"], "fidx": int(info["fidx"])} | {k: v[i].tolist() for k, v in arrays.items()}
+                        {"name": info["name"], "fidx": int(info["fidx"])}
+                        | {k: v[i].tolist() for k, v in arrays.items()}
                         for i, info in enumerate(infos)
                     )
 
                 loss_sum = loss_vec.float().sum()
-                batch_metric_sums = {k: v.float().sum() for k, v in metrics.items() if k != "loss"}
+                batch_metric_sums = {
+                    k: v.float().sum() for k, v in metrics.items() if k != "loss"
+                }
                 if self.parallel_dims.dp_cp_enabled:
                     loss_sum = dist_utils.dist_sum(loss_sum, loss_mesh)
-                    batch_metric_sums = {k: dist_utils.dist_sum(v, loss_mesh) for k, v in batch_metric_sums.items()}
+                    batch_metric_sums = {
+                        k: dist_utils.dist_sum(v, loss_mesh)
+                        for k, v in batch_metric_sums.items()
+                    }
                 total_loss += loss_sum
                 total_samples += global_samples
                 for name, value in batch_metric_sums.items():
-                    metric_sums[name] = metric_sums.get(name, torch.zeros((), device=device)) + value
+                    metric_sums[name] = (
+                        metric_sums.get(name, torch.zeros((), device=device)) + value
+                    )
 
             self.unique_segment_counter.update(validation_segment_names)
 
             samples = torch.as_tensor(total_samples, dtype=torch.float32, device=device)
-            loss = float((torch.as_tensor(total_loss, dtype=torch.float32, device=device) / samples).item())
+            loss = float(
+                (
+                    torch.as_tensor(total_loss, dtype=torch.float32, device=device)
+                    / samples
+                ).item()
+            )
             extra_metrics = {
-                f"validation_metrics/path/{k}": float((torch.as_tensor(v, dtype=torch.float32, device=device) / samples).item())
+                f"validation_metrics/path/{k}": float(
+                    (
+                        torch.as_tensor(v, dtype=torch.float32, device=device) / samples
+                    ).item()
+                )
                 for k, v in metric_sums.items()
             }
             extra_metrics["validation_metrics/dataset/unique_segments_seen"] = (
@@ -157,7 +184,9 @@ class PathValidator(BaseValidator):
                 if batch_mesh is not None
                 else self.unique_segment_counter.local_count()
             )
-            self.metrics_processor.log_validation(loss=loss, step=step, extra_metrics=extra_metrics)
+            self.metrics_processor.log_validation(
+                loss=loss, step=step, extra_metrics=extra_metrics
+            )
             if self.config.save_predictions:
                 self._save_predictions(pred_records, step, batch_mesh)
             self._submit_reports(step)
@@ -171,7 +200,9 @@ class PathValidator(BaseValidator):
         finally:
             self.dataloader.close()
 
-    def _save_predictions(self, records: list[dict[str, Any]], step: int, batch_mesh) -> None:
+    def _save_predictions(
+        self, records: list[dict[str, Any]], step: int, batch_mesh
+    ) -> None:
         from reporterv2.storage import store_put
 
         if batch_mesh is not None:
@@ -182,14 +213,21 @@ class PathValidator(BaseValidator):
         if global_rank() != 0:
             return
         try:
-            store_put(f"runs/{self.training_id}/reports/val_preds.{step}.json", json.dumps(records))
+            store_put(
+                f"runs/{self.training_id}/reports/val_preds.{step}.json",
+                json.dumps(records),
+            )
         except Exception:
-            logger.warning(f"failed to save val predictions for step {step}", exc_info=True)
+            logger.warning(
+                f"failed to save val predictions for step {step}", exc_info=True
+            )
 
     def _submit_reports(self, step: int) -> None:
-        current_checkpoint = f'{self.training_id}/{step}'
+        current_checkpoint = f"{self.training_id}/{step}"
 
-        def _run_report(TestCls: type, test_config: Any, wait_for_checkpoint_keys: List[str]) -> tuple[Any, ...]:
+        def _run_report(
+            TestCls: type, test_config: Any, wait_for_checkpoint_keys: List[str]
+        ) -> tuple[Any, ...]:
             for k in wait_for_checkpoint_keys:
                 wait_for_checkpoint(current_checkpoint, k)
             return (TestCls(test_config).run_report(),)
@@ -198,32 +236,41 @@ class PathValidator(BaseValidator):
         report_specs: dict[str, ReportSpec] = {}
         for report_name, (TestCls, ReportConfigCls) in MODEL_REPORTS.items():
             report_config = ReportConfigCls(
-                rollout={'agent': {'supercombo': current_checkpoint, 'model_trained_fps': dataloader_config.fps}},
-                report_name=f'path_{report_name}',
+                rollout={
+                    "agent": {
+                        "supercombo": current_checkpoint,
+                        "model_trained_fps": dataloader_config.fps,
+                    }
+                },
+                report_name=f"path_{report_name}",
                 save_tmp=False,
                 format=ReportFormat.HTML,
                 miniray=self.miniray,
             )
             report_specs[report_name] = ReportSpec(
                 output_names=(report_name,),
-                output_types=('html',),
+                output_types=("html",),
                 steps=self.config.reports.get(report_name, []),
                 func=_run_report,
-                arguments=[TestCls, report_config, ['vision.onnx', 'vision.onnx.data', 'temporal_policy.onnx']],
+                arguments=[
+                    TestCls,
+                    report_config,
+                    ["vision.onnx", "vision.onnx.data", "temporal_policy.onnx"],
+                ],
             )
 
         for report_name, (TestCls, ReportConfigCls) in DATASET_REPORTS.items():
             report_config = ReportConfigCls(
                 route_list=dataloader_config.dataset,
                 pipeline_dir=dataloader_config.pipeline_dir,
-                report_name=f'path_{report_name}',
+                report_name=f"path_{report_name}",
                 save_tmp=False,
                 format=ReportFormat.HTML,
                 miniray=self.miniray,
             )
             report_specs[report_name] = ReportSpec(
                 output_names=(report_name,),
-                output_types=('html',),
+                output_types=("html",),
                 steps=self.config.reports.get(report_name, []),
                 func=_run_report,
                 arguments=[TestCls, report_config, []],
