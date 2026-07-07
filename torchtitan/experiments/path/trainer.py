@@ -31,16 +31,16 @@ def final_checkpoint_config(
     *, flavor: str, stem: str, seed: int | None, steps: int
 ) -> CheckpointManager.Config:
     reporterv2_host = os.getenv("REPORTERV2_HOST")
+    report_user = os.getenv("REPORT_USER") or getpass.getuser()
     if reporterv2_host:
         return PathOnnxCheckpointManager.Config(
             enable=True,
             checkpoint_base_folder=f"{reporterv2_host.rstrip('/')}/checkpoint",
             checkpoint_id_format="step-",
-            folder=f"{flavor}/{stem}_s{seed}",
+            folder=f"{report_user}/{flavor}/{stem}_s{seed}",
             interval=steps,
             keep_latest_k=0,
         )
-    report_user = os.getenv("REPORT_USER") or getpass.getuser()
     return CheckpointManager.Config(
         enable=True,
         folder=(
