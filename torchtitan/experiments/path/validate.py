@@ -88,7 +88,7 @@ class PathValidator(BaseValidator):
             local_batch_size=self.local_batch_size,
             validation_steps=self.config.steps,
         )
-        #TODO centralize training_id
+        # TODO centralize training_id
         self.training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{self.training_id}:path:validation")
         self.report_runner = ReportRunner(metrics_processor=self.metrics_processor, enabled=global_rank() == 0)
