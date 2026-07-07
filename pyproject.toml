@@ -46,8 +46,9 @@ dev = [
     "pyrefly==0.45.1",
 ]
 
-[tool.setuptools.dynamic]
-version = {file = "assets/version.txt"}
+[tool.hatch.version]
+path = "assets/version.txt"
+pattern = "^(?P<version>.+)$"
 
 [tool.codespell]
 skip = ["*.json"]
@@ -59,12 +60,20 @@ reporterv2 = { git = "https://github.com/commaai/reporterv2.git" }
 
 # ---- Explicit project build information ---- #
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.setuptools.packages.find]
-where = [""]
-include = ["torchtitan*"]
+[tool.hatch.build.targets.wheel]
+packages = ["torchtitan"]
+exclude = [
+    "**/*.md",
+    "**/*.png",
+    "**/*.sh",
+    "**/*.tsv",
+    "**/*.txt",
+    "**/.claude/**",
+    "**/.gitignore",
+]
 
 [tool.pytest.ini_options]
 addopts = ["--showlocals"]  # show local variables in tracebacks
