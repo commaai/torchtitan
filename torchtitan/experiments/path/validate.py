@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import json
@@ -5,7 +11,7 @@ import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from typing import Any, List
+from typing import Any
 from xx.common.helpers import parse_info
 from xx.release_tests.lib.base_report import ReportFormat
 from xx.training.lib.checkpoint import wait_for_checkpoint
@@ -226,7 +232,7 @@ class PathValidator(BaseValidator):
         current_checkpoint = f"{self.training_id}/{step}"
 
         def _run_report(
-            TestCls: type, test_config: Any, wait_for_checkpoint_keys: List[str]
+            TestCls: type, test_config: Any, wait_for_checkpoint_keys: list[str]
         ) -> tuple[Any, ...]:
             for k in wait_for_checkpoint_keys:
                 wait_for_checkpoint(current_checkpoint, k)
