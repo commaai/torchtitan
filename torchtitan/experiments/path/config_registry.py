@@ -655,9 +655,7 @@ def _vit(
             data_parallel_shard_degree=local_world_size,
         ),
         checkpoint=CheckpointManager.Config(enable=False),
-        metrics=MetricsProcessor.Config(
-            log_freq=10, enable_reporterv2=True, save_freq=VIT_STEPS
-        ),
+        metrics=MetricsProcessor.Config(log_freq=10, enable_reporterv2=True),
         validator=PathValidator.Config(
             enable=True,
             freq=1024,
