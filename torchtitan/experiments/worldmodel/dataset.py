@@ -64,7 +64,7 @@ class _MockDataset:
             {
                 "augments_pos_ref_augment": np.random.randn(batch, frames, 3).astype(np.float32),
                 "ref_augment_from_augments_euler": np.random.randn(batch, frames, 3).astype(np.float32),
-                "fidxs": np.tile(np.arange(frames, dtype=np.int64), (batch, 1)),
+                "fidxs": np.tile(np.arange(frames, dtype=np.float32), (batch, 1)),
                 "info": np.zeros((batch, 512), dtype=np.uint8),
             }
         )
@@ -233,6 +233,7 @@ def main() -> None:
     config = _dataloader_config(split="train", dataset=DEFAULT_TRAIN_LIST)
     dataset = WorldModelDataLoader._build_dataset(config, val=False)
     inputs, targets = next(iter(dataset))
+    print(inputs['fidxs'][0])
     print(
         {
             "dataset": config.dataset_path or config.dataset,

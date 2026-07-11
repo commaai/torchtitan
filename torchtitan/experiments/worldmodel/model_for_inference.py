@@ -176,7 +176,7 @@ class WorldModelForInference(WorldModel):
             "augments_pos_ref_augment": dtype,
             "ref_augment_from_augments_euler": dtype,
             "pose_mask": torch.int64,
-            "fidxs": torch.int64,
+            "fidxs": torch.float32,
         }
 
     @classmethod
@@ -189,7 +189,7 @@ class WorldModelForInference(WorldModel):
         device: torch.device | str = "meta",
     ) -> dict[str, torch.Tensor]:
         dtypes = cls.input_dtypes(dtype)
-        return {
+        inputs = {
             name: (
                 torch.randn(shape, dtype=dtypes[name], device=device)
                 if dtypes[name].is_floating_point
@@ -197,6 +197,10 @@ class WorldModelForInference(WorldModel):
             )
             for name, shape in cls.input_shapes(config, batch_size=batch_size).items()
         }
+        inputs["fidxs"] = torch.arange(
+            config.input_size[0], dtype=torch.float32, device=device
+        ).expand(batch_size, -1)
+        return inputs
 
     def get_model_io(
         self,

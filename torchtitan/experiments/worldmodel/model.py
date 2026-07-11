@@ -516,6 +516,27 @@ class DiscreteEmbedder(nn.Module):
         init_mlp_weights(self.to_t2)
 
 
+class FractionalDiscreteEmbedder(DiscreteEmbedder):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not x.dtype.is_floating_point:
+            return super().forward(x)
+
+        lower = torch.floor(x).to(dtype=torch.int64)
+        upper = torch.ceil(x).to(dtype=torch.int64)
+        lower_t6, lower_t2 = super().forward(lower)
+        upper_t6, upper_t2 = super().forward(upper)
+        weight = (x - lower).unsqueeze(-1)
+
+        def interpolate(
+            lower_output: torch.Tensor, upper_output: torch.Tensor
+        ) -> torch.Tensor:
+            output_weight = weight.to(dtype=lower_output.dtype)
+            interpolated = torch.lerp(lower_output, upper_output, output_weight)
+            return torch.where(output_weight == 0, lower_output, interpolated)
+
+        return interpolate(lower_t6, upper_t6), interpolate(lower_t2, upper_t2)
+
+
 class TimestepEmbedder(nn.Module):
     def __init__(
         self,
@@ -966,7 +987,7 @@ class WorldModel(BaseModel):
         self.t_embedder = TimestepEmbedder(
             config.t_embedder, time_factor=config.time_factor
         )
-        self.fidx_embedder = DiscreteEmbedder(
+        self.fidx_embedder = FractionalDiscreteEmbedder(
             50, config.transformer.n_embd, config.fidx_embedder
         )
         self.blocks = nn.ModuleList(

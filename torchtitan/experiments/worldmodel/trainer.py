@@ -96,7 +96,7 @@ def _prepare_worldmodel_batch(
         .to(device=device, dtype=dtype)
         .clone()
     )
-    fidxs = input_dict["fidxs"].to(device=device, dtype=torch.int64)
+    fidxs = input_dict["fidxs"].to(device=device, dtype=torch.float32)
     targets = _tensor_dict_to_device(targets, device)
     batch_size, num_frames = latents.shape[:2]
 
