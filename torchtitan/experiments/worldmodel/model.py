@@ -817,7 +817,7 @@ class WorldModel(BaseModel):
         compressor_std: float
         transformer: TransformerConfig
         plan_head: TransformerConfig
-        experimental_pose_only_xy: bool = False
+        experimental_pose_only_xy: bool
         x_embedder: PatchEmbedderLinearsConfig = field(init=False)
         augments_pos_ref_augment_embedder: ConditioningEmbedderLinearsConfig = field(
             init=False

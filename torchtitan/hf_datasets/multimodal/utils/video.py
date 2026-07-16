@@ -38,14 +38,14 @@ def load_video(
         or None if loading fails.
     """
     try:
-        import av  # pyrefly: ignore [missing-import]
+        import av
 
         with av.open(path) as container:
             stream = container.streams.video[0]
 
             video_fps = float(stream.average_rate or stream.guessed_rate or 24)
             total_frames = stream.frames
-            if total_frames == 0 and stream.duration:
+            if total_frames == 0 and stream.duration and stream.time_base is not None:
                 total_frames = int(
                     float(stream.duration * stream.time_base) * video_fps
                 )
