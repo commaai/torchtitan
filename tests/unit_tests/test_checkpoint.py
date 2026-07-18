@@ -453,6 +453,36 @@ class TestCheckpointManager(unittest.TestCase):
     @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch("torchtitan.components.checkpoint.dcp.save")
     @mock.patch("torchtitan.components.checkpoint.dcp.load")
+    def test_model_only_steps_save_only_model(
+        self, mock_load, mock_save, mock_rank
+    ):
+        cfg = self.trainer_config.checkpoint
+        cfg.interval = 100
+        cfg.model_only_steps = [3]
+        mock_save.side_effect = self.fake_save
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=cfg,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        self.assertFalse(manager.save(curr_step=2))
+        self.assertTrue(manager.save(curr_step=3))
+        saved = torch.load(
+            os.path.join(self.test_folder, "step-3", "state_dict.pt"),
+            weights_only=True,
+        )
+        self.assertEqual(set(saved), {"weight", "bias"})
+        manager.close()
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch("torchtitan.components.checkpoint.dcp.save")
+    @mock.patch("torchtitan.components.checkpoint.dcp.load")
     def test_last_save_model_only_and_initial_load_model_only(
         self, mock_load, mock_save, mock_rank
     ):

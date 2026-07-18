@@ -26,6 +26,9 @@ class PathDataLoader(BaseDataLoader):
         n_frames: int
         rgb: bool
         unvision: bool
+        val_skip: int = 1
+        one_pass: bool = False
+        shape_probe_dataset: str | None = None
 
     def __init__(
         self,
@@ -63,8 +66,8 @@ class PathDataLoader(BaseDataLoader):
             shuffle_size=str(config.shuffle_size),
             val_shuffle_size=str(val_shuffle_size),
             min_mixing=config.min_mixing,
-            num_writers=config.num_writers,
-            num_readers=config.num_readers,
+            num_writers=1 if val else config.num_writers,
+            num_readers=1 if val else config.num_readers,
             fps=config.fps,
             pipeline_dir=config.pipeline_dir,
             plan_only=config.plan_only,
@@ -72,16 +75,25 @@ class PathDataLoader(BaseDataLoader):
             n_frames=config.n_frames,
             rgb=config.rgb,
             unvision=config.unvision,
+            val_skip=config.val_skip,
+            one_pass=config.one_pass,
+            shape_probe_dataset=config.shape_probe_dataset,
         )
         dataset = get_dataset(config.dataset, xx_config, val, self.local_rank)
         self.dataset = dataset
         loader_config = DataloaderConfig(
             bs=local_batch_size,
             shuffle_size=shuffle_size,
-            min_mixing=1 if val else config.min_mixing,
+            # A finite one-pass source cannot require the shuffle buffer to be
+            # completely full: gigashuffle reserves two input batches to avoid
+            # deadlock. Reuse the dataset's normal mixing threshold instead.
+            min_mixing=1 if val and not config.one_pass else config.min_mixing,
             num_writers=1 if val else config.num_writers,
             num_readers=1 if val else config.num_readers,
-            fill_once=val,
+            # Exact one-pass validation must let every writer drain its finite
+            # shard. fill_once races writers against a shared sample count, so
+            # fast writers can wrap and replace the tail of slower shards.
+            fill_once=val and not config.one_pass,
             local_rank=self.local_rank,
             global_rank=dp_rank,
             local_world_size=self.local_world_size,

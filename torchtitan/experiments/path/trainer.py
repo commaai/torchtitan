@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+import base64
 import getpass
+import hashlib
+import json
 import os
 import time
 from collections.abc import Iterable, Iterator
@@ -22,9 +25,24 @@ from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability import structured_logger as sl
 from torchtitan.trainer import Trainer
 
+from .attention_diagnostics import (
+    PlanViTAttentionDiagnostics,
+    PlanViTAttentionDiagnosticsConfig,
+)
 from .loss import PathLoss
+from .one_pass_observability import (
+    DEFAULT_HOST_BUDGET_BYTES,
+    AuditResult,
+    OwnerShardedOnePassAudit,
+)
 from .onnx_checkpoint import PathOnnxCheckpointManager
 from .validate import PathValidator, segment_names_from_info
+
+
+def _training_id_path_component(training_id: str) -> str:
+    """Encode one Reporter run identity as a single, path-safe component."""
+    encoded = base64.urlsafe_b64encode(training_id.encode()).decode().rstrip("=")
+    return f"run-{encoded}"
 
 
 def final_checkpoint_config(
@@ -33,11 +51,16 @@ def final_checkpoint_config(
     reporterv2_host = os.getenv("REPORTERV2_HOST")
     report_user = os.getenv("REPORT_USER") or getpass.getuser()
     if reporterv2_host:
+        training_id = os.getenv("REPORTERV2_TRAINING_ID")
+        folder_parts = [report_user]
+        if training_id:
+            folder_parts.append(_training_id_path_component(training_id))
+        folder_parts.extend((flavor, f"{stem}_s{seed}"))
         return PathOnnxCheckpointManager.Config(
             enable=True,
             checkpoint_base_folder=f"{reporterv2_host.rstrip('/')}/checkpoint",
             checkpoint_id_format="step-",
-            folder=f"{report_user}/{flavor}/{stem}_s{seed}",
+            folder="/".join(folder_parts),
             interval=steps,
             keep_latest_k=0,
         )
@@ -60,6 +83,10 @@ class PathTrainer(Trainer):
         checkpoint: PathOnnxCheckpointManager.Config
         miniray: dict[str, Any] = field(default_factory=dict)
         fps: int
+        attention_diagnostics: PlanViTAttentionDiagnosticsConfig = field(
+            default_factory=PlanViTAttentionDiagnosticsConfig
+        )
+        one_pass_audit_host_budget_bytes: int = DEFAULT_HOST_BUDGET_BYTES
 
         def __post_init__(self) -> None:
             Trainer.Config.__post_init__(self)
@@ -83,6 +110,25 @@ class PathTrainer(Trainer):
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
         self.unique_segment_counter = StringUniqueCounter(
             f"unique_ids:{training_id}:path:train"
+        )
+        self.one_pass_audit: OwnerShardedOnePassAudit | None = None
+        if config.dataloader.one_pass:
+            batch_mesh = self.parallel_dims.get_optional_mesh("batch")
+            batch_world_size = batch_mesh.size() if batch_mesh is not None else 1
+            self.one_pass_audit = OwnerShardedOnePassAudit(
+                num_writers=config.dataloader.num_writers,
+                total_samples=(
+                    config.training.steps * config.training.global_batch_size
+                ),
+                world_size=batch_world_size,
+                expected_samples_per_source=7.9,
+                host_budget_bytes=config.one_pass_audit_host_budget_bytes,
+            )
+        self.attention_diagnostics = PlanViTAttentionDiagnostics(
+            config.attention_diagnostics,
+            self.model_parts,
+            total_steps=config.training.steps,
+            log_freq=config.metrics.log_freq,
         )
         self.loss_fn.to(self.device)
 
@@ -141,21 +187,52 @@ class PathTrainer(Trainer):
         ],
     ) -> None:
         self.optimizers.zero_grad()
+        will_log = self.metrics_processor.should_log(self.step) or (
+            self.one_pass_audit is not None
+            and self.step == self.config.training.steps
+        )
+        self.attention_diagnostics.begin_step(self.step, will_log=will_log)
         lr_metrics = self.lr_schedulers.get_metrics()
         parallel_dims = self.parallel_dims
         batch_mesh = parallel_dims.get_optional_mesh("batch")
 
         microbatches = []
         step_segment_names: set[str] = set()
+        step_audit_records: list[
+            tuple[list[str], list[int], list[int], list[int], list[int]]
+        ] = []
         local_samples = torch.tensor(0, dtype=torch.int64)
         for _ in range(self.gradient_accumulation_steps):
             with sl.log_trace_span("fetching_batch"):
                 input_dict, targets = next(data_iterator)
                 local_samples += next(iter(input_dict.values())).shape[0]
                 if "info" in input_dict:
-                    step_segment_names.update(
-                        segment_names_from_info(input_dict["info"])
-                    )
+                    segment_names = segment_names_from_info(input_dict["info"])
+                    step_segment_names.update(segment_names)
+                    if self.one_pass_audit is not None:
+                        from xx.training.lib.dataloader import (
+                            ONE_PASS_SOURCE_GLOBAL_RANK,
+                            ONE_PASS_SOURCE_KEYS,
+                            ONE_PASS_SOURCE_SAMPLE_INDEX,
+                            ONE_PASS_SOURCE_SEQUENCE,
+                            ONE_PASS_SOURCE_WRITER,
+                        )
+
+                        missing = [key for key in ONE_PASS_SOURCE_KEYS if key not in input_dict]
+                        if missing:
+                            raise RuntimeError(
+                                f"one-pass consumed batch is missing source metadata: {missing}"
+                            )
+                        metadata = {key: input_dict.pop(key) for key in ONE_PASS_SOURCE_KEYS}
+                        step_audit_records.append(
+                            (
+                                segment_names,
+                                metadata[ONE_PASS_SOURCE_GLOBAL_RANK].tolist(),
+                                metadata[ONE_PASS_SOURCE_WRITER].tolist(),
+                                metadata[ONE_PASS_SOURCE_SEQUENCE].tolist(),
+                                metadata[ONE_PASS_SOURCE_SAMPLE_INDEX].tolist(),
+                            )
+                        )
                 microbatches.append((input_dict, targets))
         sl.log_trace_scalar({"local_samples": int(local_samples)})
 
@@ -200,10 +277,14 @@ class PathTrainer(Trainer):
             self.optimizers.step()
             self.lr_schedulers.step()
 
-        self.unique_segment_counter.update(step_segment_names)
+        if self.one_pass_audit is None:
+            self.unique_segment_counter.update(step_segment_names)
+        else:
+            for record in step_audit_records:
+                self.one_pass_audit.observe(*record)
 
         loss = torch.sum(torch.stack(accumulated_losses))
-        if not self.metrics_processor.should_log(self.step):
+        if not will_log:
             return
 
         if parallel_dims.dp_cp_enabled:
@@ -236,19 +317,41 @@ class PathTrainer(Trainer):
             )
             for k, v in metric_sums.items()
         }
-        unique_segments_seen = (
-            self.unique_segment_counter.global_count(batch_mesh.get_group())
-            if batch_mesh is not None
-            else self.unique_segment_counter.local_count()
-        )
+        audit_result: AuditResult | None = None
+        if self.one_pass_audit is not None:
+            audit_result = self.one_pass_audit.sync(
+                group=batch_mesh.get_group() if batch_mesh is not None else None,
+                device=self.device,
+            )
+            unique_segments_seen = audit_result.segments
+            if audit_result.consumed_samples != int(global_samples_seen):
+                raise RuntimeError(
+                    "one-pass audit disagrees with trainer sample count: "
+                    f"audit={audit_result.consumed_samples} trainer={int(global_samples_seen)}"
+                )
+            if self.step == self.config.training.steps:
+                self._publish_one_pass_audit(audit_result, batch_mesh)
+        else:
+            unique_segments_seen = (
+                self.unique_segment_counter.global_count(batch_mesh.get_group())
+                if batch_mesh is not None
+                else self.unique_segment_counter.local_count()
+            )
         dataset_metrics = {
             "dataset/unique_segments_seen": unique_segments_seen,
         }
+        if audit_result is not None:
+            dataset_metrics |= {
+                "dataset/unique_source_occurrences": audit_result.occurrences,
+                "dataset/unique_source_samples": audit_result.samples,
+                "dataset/one_pass_audit_checks": audit_result.n_checks,
+            }
         extra_metrics = {
             "n_samples_seen": global_samples_seen,
             **lr_metrics,
             **path_metrics,
             **dataset_metrics,
+            **self.attention_diagnostics.metrics(batch_mesh),
         }
         self.metrics_processor.log(
             self.step,
@@ -258,7 +361,72 @@ class PathTrainer(Trainer):
             extra_metrics=extra_metrics,
         )
 
+    def _publish_one_pass_audit(self, result: AuditResult, batch_mesh) -> None:
+        assert self.one_pass_audit is not None
+        group = batch_mesh.get_group() if batch_mesh is not None else None
+        world_size = batch_mesh.size() if batch_mesh is not None else 1
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        local = {"global_rank": global_rank, **self.one_pass_audit.shard_attestation()}
+        attestations: list[dict[str, Any] | None] = [None] * world_size
+        if world_size > 1:
+            torch.distributed.all_gather_object(attestations, local, group=group)
+        else:
+            attestations[0] = local
+
+        publication_error = ""
+        if global_rank == 0:
+            try:
+                from reporterv2.storage import store_put
+                from xx.training.lib import dataloader as loader_module
+
+                def source_sha(path: str) -> str:
+                    with open(path, "rb") as file:
+                        return hashlib.sha256(file.read()).hexdigest()
+
+                document = {
+                    "schema_version": 1,
+                    "claim": "exact consumed-side one-pass proof completed before final checkpoint",
+                    "step": self.step,
+                    "global_totals": {
+                        "segments": result.segments,
+                        "occurrences": result.occurrences,
+                        "samples": result.samples,
+                        "consumed_samples": result.consumed_samples,
+                    },
+                    "n_checks": result.n_checks,
+                    "owner_shards": attestations,
+                    "memory": {
+                        "estimated_owner_bytes": self.one_pass_audit.estimated_owner_bytes,
+                        "expected_owner_bytes_at_7p9_samples_per_source": self.one_pass_audit.expected_owner_bytes,
+                        "configured_host_budget_bytes": self.one_pass_audit.host_budget_bytes,
+                    },
+                    "source_sha256": {
+                        "training/lib/dataloader.py": source_sha(loader_module.__file__),
+                        "torchtitan/torchtitan/experiments/path/one_pass_observability.py": source_sha(
+                            os.path.join(os.path.dirname(__file__), "one_pass_observability.py")
+                        ),
+                        "torchtitan/torchtitan/experiments/path/trainer.py": source_sha(__file__),
+                    },
+                    "residue": "counts and deterministic owner-shard hashes only; full shards are not uploaded",
+                    "later_reaudit": "not possible from hashes; any failed or disputed proof requires a refire",
+                }
+                training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
+                store_put(
+                    f"runs/{training_id}/reports/one_pass_audit.{self.step}.json",
+                    json.dumps(document, sort_keys=True, indent=2),
+                )
+            except Exception as error:
+                publication_error = repr(error)
+        errors = [publication_error]
+        if world_size > 1:
+            torch.distributed.broadcast_object_list(errors, src=0, group=group)
+        if errors[0]:
+            raise RuntimeError(f"failed to publish one-pass audit evidence: {errors[0]}")
+
     def close(self) -> None:
+        attention_diagnostics = getattr(self, "attention_diagnostics", None)
+        if attention_diagnostics is not None:
+            attention_diagnostics.close()
         self.dataloader.close()
         if self.config.validator.enable:
             self.validator.close()

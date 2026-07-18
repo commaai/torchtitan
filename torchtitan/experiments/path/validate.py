@@ -5,6 +5,7 @@ import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Any
 
 import torch
@@ -103,13 +104,15 @@ class PathValidator(BaseValidator):
             total_loss = torch.zeros((), device=device)
             total_samples = torch.zeros((), device=device)
             metric_sums: dict[str, torch.Tensor] = {}
+            metric_counts: dict[str, torch.Tensor] = {}
             validation_segment_names: set[str] = set()
             pred_records: list[dict[str, Any]] = []
             batch_mesh = self.parallel_dims.get_optional_mesh("batch")
             loss_mesh = self.parallel_dims.get_optional_mesh("loss")
-            for num_steps, (input_dict, targets) in enumerate(self.dataloader):
-                if self.config.steps != -1 and num_steps >= self.config.steps:
-                    break
+            batches = iter(self.dataloader)
+            if self.config.steps != -1:
+                batches = islice(batches, self.config.steps)
+            for num_steps, (input_dict, targets) in enumerate(batches):
                 self.metrics_processor.ntokens_since_last_log += next(iter(input_dict.values())).shape[0]
                 if "info" in input_dict:
                     validation_segment_names.update(segment_names_from_info(input_dict["info"]))
@@ -135,21 +138,43 @@ class PathValidator(BaseValidator):
                     )
 
                 loss_sum = loss_vec.float().sum()
-                batch_metric_sums = {k: v.float().sum() for k, v in metrics.items() if k != "loss"}
+                batch_metric_sums = {
+                    k: torch.where(torch.isfinite(v), v.float(), 0).sum()
+                    for k, v in metrics.items()
+                    if k != "loss"
+                }
+                batch_metric_counts = {
+                    k: torch.isfinite(v).sum()
+                    for k, v in metrics.items()
+                    if k != "loss"
+                }
                 if self.parallel_dims.dp_cp_enabled:
                     loss_sum = dist_utils.dist_sum(loss_sum, loss_mesh)
                     batch_metric_sums = {k: dist_utils.dist_sum(v, loss_mesh) for k, v in batch_metric_sums.items()}
+                    batch_metric_counts = {
+                        k: dist_utils.dist_sum(v, loss_mesh)
+                        for k, v in batch_metric_counts.items()
+                    }
                 total_loss += loss_sum
                 total_samples += global_samples
                 for name, value in batch_metric_sums.items():
                     metric_sums[name] = metric_sums.get(name, torch.zeros((), device=device)) + value
+                for name, value in batch_metric_counts.items():
+                    metric_counts[name] = metric_counts.get(
+                        name, torch.zeros((), device=device, dtype=torch.int64)
+                    ) + value
 
             self.unique_segment_counter.update(validation_segment_names)
 
             samples = torch.as_tensor(total_samples, dtype=torch.float32, device=device)
             loss = float((torch.as_tensor(total_loss, dtype=torch.float32, device=device) / samples).item())
             extra_metrics = {
-                f"validation_metrics/path/{k}": float((torch.as_tensor(v, dtype=torch.float32, device=device) / samples).item())
+                f"validation_metrics/path/{k}": float(
+                    (
+                        torch.as_tensor(v, dtype=torch.float32, device=device)
+                        / torch.as_tensor(metric_counts[k], dtype=torch.float32, device=device)
+                    ).item()
+                )
                 for k, v in metric_sums.items()
             }
             extra_metrics["validation_metrics/dataset/unique_segments_seen"] = (

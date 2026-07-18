@@ -66,6 +66,25 @@ class ScaleLayer(Module):
         return x * self.scale
 
 
+class MuReadout(Linear):
+    """A muP readout with input scaling before the affine bias."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Linear.Config):
+        width_mult: float
+        output_mult: float = 1.0
+
+    def __init__(self, config: Config):
+        if config.width_mult <= 0:
+            raise ValueError("width_mult must be positive")
+        super().__init__(config)
+        self.width_mult = config.width_mult
+        self.output_mult = config.output_mult
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(self.output_mult * x / self.width_mult)
+
+
 class PathMLP(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -356,16 +375,26 @@ class Vision(Module):
         drop_path_rate: float
         mean: float
         std: float
+        depths: tuple[int, ...] | None = None
+        dims: tuple[int, ...] | None = None
+        mup: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+        overrides = {}
+        if config.depths is not None:
+            overrides["depths"] = config.depths
+        if config.dims is not None:
+            overrides["dims"] = config.dims
         self.encoder = convnext.create_convnext(
             config.flavor,
             pretrained=False,
             in_chans=config.in_channels,
             num_classes=config.vision_features,
             drop_path_rate=config.drop_path_rate,
+            mup=config.mup,
+            **overrides,
         )
         self.register_buffer(
             "_mean", torch.empty(1, config.in_channels, 1, 1), persistent=True

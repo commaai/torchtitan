@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from functools import partial
 
@@ -37,6 +38,31 @@ __all__ = [
 
 
 CONVNEXT_FLAVORS = {
+    "convnext_atto": {
+        "depths": (2, 2, 6, 2),
+        "dims": (40, 80, 160, 320),
+        "pretrained": "convnext_atto.d2_in1k",
+    },
+    "convnext_femto": {
+        "depths": (2, 2, 6, 2),
+        "dims": (48, 96, 192, 384),
+        "pretrained": "convnext_femto.d1_in1k",
+    },
+    "convnext_pico": {
+        "depths": (2, 2, 6, 2),
+        "dims": (64, 128, 256, 512),
+        "pretrained": "convnext_pico.d1_in1k",
+    },
+    "convnext_teeny": {
+        "depths": (3, 3, 9, 3),
+        "dims": (48, 96, 192, 384),
+        "pretrained": "",
+    },
+    "convnext_weeny": {
+        "depths": (3, 3, 27, 3),
+        "dims": (48, 96, 192, 384),
+        "pretrained": "",
+    },
     "convnext_tiny": {
         "depths": (3, 3, 9, 3),
         "dims": (96, 192, 384, 768),
@@ -225,6 +251,7 @@ class ConvNeXt(nn.Module):
         norm_eps: float = 1e-5,
         drop_rate: float = 0.0,
         drop_path_rate: float = 0.0,
+        mup: bool = False,
         device=None,
         dtype=None,
     ) -> None:
@@ -236,6 +263,7 @@ class ConvNeXt(nn.Module):
         self.in_chans = in_chans
         self.drop_rate = drop_rate
         self.head_init_scale = head_init_scale
+        self.mup = mup
         self.feature_info = []
 
         self.stem = nn.Sequential(
@@ -324,7 +352,8 @@ class ConvNeXt(nn.Module):
         self.head.reset(num_classes, global_pool)
 
     def init_path_weights(self) -> None:
-        named_apply(partial(_init_weights, head_init_scale=self.head_init_scale), self)
+        init = _init_weights_mup if self.mup else _init_weights
+        named_apply(partial(init, head_init_scale=self.head_init_scale), self)
         for module in self.modules():
             if isinstance(module, ConvNeXtBlock):
                 module.reset_parameters()
@@ -352,6 +381,17 @@ def _init_weights(module: nn.Module, name: str | None = None, head_init_scale: f
         if name and "head." in name:
             module.weight.data.mul_(head_init_scale)
             module.bias.data.mul_(head_init_scale)
+
+
+def _init_weights_mup(
+    module: nn.Module, name: str | None = None, head_init_scale: float = 1.0
+) -> None:
+    del name, head_init_scale
+    if isinstance(module, (nn.Conv2d, nn.Linear)):
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(module.weight)
+        trunc_normal_(module.weight, std=math.sqrt(1.0 / fan_in))
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
 
 def checkpoint_filter_fn(state_dict, model):

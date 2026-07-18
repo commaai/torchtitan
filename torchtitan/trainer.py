@@ -892,7 +892,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
                     try:
                         self.train_step(data_iterator)
-                    except DataloaderExhaustedError:
+                    except DataloaderExhaustedError as ex:
+                        if getattr(config.dataloader, "one_pass", False):
+                            raise RuntimeError(
+                                "one-pass dataloader exhausted before the configured "
+                                f"{config.training.steps} steps completed; attempted step "
+                                f"{self.step}"
+                            ) from ex
                         logger.warning("Ran out of data; last step was canceled.")
                         break
 

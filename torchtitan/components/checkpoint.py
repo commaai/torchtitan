@@ -233,6 +233,9 @@ class CheckpointManager(Configurable):
         interval: int = 500
         """Checkpointing interval in steps."""
 
+        model_only_steps: list[int] = field(default_factory=list)
+        """Exact intermediate steps at which to save non-resumable model weights."""
+
         initial_load_path: str | None = None
         """
         This option specifies the path to the initial checkpoint to load, which is
@@ -424,6 +427,11 @@ class CheckpointManager(Configurable):
                 )
             if self.last_save_in_hf and not self.last_save_model_only:
                 raise ValueError("last_save_in_hf requires last_save_model_only=True.")
+            if any(step <= 0 for step in self.model_only_steps):
+                raise ValueError("checkpoint.model_only_steps must contain positive steps.")
+            if len(set(self.model_only_steps)) != len(self.model_only_steps):
+                raise ValueError("checkpoint.model_only_steps must not contain duplicates.")
+            self.model_only_steps.sort()
 
             async_lowered = self.async_mode.lower()
             if async_lowered in ("disabled", "async", "async_with_pinned_mem"):
@@ -466,6 +474,7 @@ class CheckpointManager(Configurable):
         )
         self.checkpoint_id_format = config.checkpoint_id_format
         self.interval = config.interval
+        self.model_only_steps = frozenset(config.model_only_steps)
 
         self.states = states
         self.states.update(
@@ -744,6 +753,24 @@ class CheckpointManager(Configurable):
             self._save_last_step(curr_step)
             logger.info(
                 f"Last step checkpoint completed in {time.monotonic() - begin:.2f}s"
+            )
+            return True
+
+        if curr_step in self.model_only_steps:
+            states = self.states[MODEL].state_dict()
+            if self.export_dtype != torch.float32:
+                states = {key: value.to(self.export_dtype) for key, value in states.items()}
+            logger.info(
+                f"Saving a model only checkpoint in {self.export_dtype} at step {curr_step}."
+            )
+            self.dcp_save(
+                states,
+                checkpoint_id=self._create_checkpoint_id(curr_step),
+                async_mode=AsyncMode.DISABLED,
+                enable_garbage_collection=True,
+            )
+            logger.info(
+                f"Model only checkpoint completed in {time.monotonic() - begin:.2f}s"
             )
             return True
 
@@ -1141,6 +1168,9 @@ class CheckpointManager(Configurable):
             return True
 
         if last_step:
+            return True
+
+        if curr_step in self.model_only_steps:
             return True
 
         if curr_step % self.interval == 0:

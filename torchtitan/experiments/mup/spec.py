@@ -53,5 +53,10 @@ class MuPSweepSpec:
 SPECS = {
     "plan_vit": MuPSweepSpec(name="plan_vit", base_width=256, slug="vit"),
     "convnext": MuPSweepSpec(name="convnext", base_width=256, ready=False),
+    "convnext_whole": MuPSweepSpec(
+        name="convnext_whole",
+        base_width=384,
+        widths=(7, 9, 11, 13),
+    ),
     "fastvit": MuPSweepSpec(name="fastvit", base_width=256, ready=False),
 }

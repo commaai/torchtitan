@@ -79,5 +79,8 @@ class StringUniqueCounter:
             self.reset()
             return
         self._ids = {str(name) for name in state_dict["ids"]}
-        self._pending_ids = set(self._ids)
-        self._global_ids.clear()
+        # restored ids were already synced by the run that saved them; re-marking
+        # them pending ships the full history through the TCPStore in one payload
+        # on the first sync after resume, which resets connections on large runs
+        self._pending_ids = set()
+        self._global_ids = set(self._ids)

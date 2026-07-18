@@ -44,7 +44,9 @@ def _scaled_pattern(spec) -> re.Pattern:
     width = next(w for w in spec.widths if w != spec.base_width)
     groups = _config(spec, "mup", width).optimizer.param_groups
     scaled = [g for g in groups if g.lr_mult not in (None, 1.0)]
-    return re.compile(scaled[0].pattern)
+    if not scaled:
+        raise ValueError(f"{spec.name} has no width-scaled optimizer groups")
+    return re.compile("|".join(f"(?:{group.pattern})" for group in scaled))
 
 
 def _blocks(model: nn.Module, pattern: re.Pattern):
