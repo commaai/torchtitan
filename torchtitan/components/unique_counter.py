@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import json
@@ -17,7 +23,9 @@ _STORE_CHUNK_SIZE = 4 * 1024 * 1024
 class StringUniqueCounter:
     """Counts unique strings while syncing only newly seen local strings."""
 
-    def __init__(self, store_prefix: str = "unique_ids", sync_timeout_seconds: int = 30) -> None:
+    def __init__(
+        self, store_prefix: str = "unique_ids", sync_timeout_seconds: int = 30
+    ) -> None:
         self._store_prefix = store_prefix
         self._sync_timeout_seconds = sync_timeout_seconds
         self._sync_idx = 0
@@ -51,9 +59,15 @@ class StringUniqueCounter:
 
     @staticmethod
     def _store_chunks(store: dist.Store, key_prefix: str, payload: bytes) -> int:
-        chunks = [payload[i : i + _STORE_CHUNK_SIZE] for i in range(0, len(payload), _STORE_CHUNK_SIZE)]
+        chunks = [
+            payload[i : i + _STORE_CHUNK_SIZE]
+            for i in range(0, len(payload), _STORE_CHUNK_SIZE)
+        ]
         for chunk_idx, chunk in enumerate(chunks):
-            store.set(f"{key_prefix}:chunk:{chunk_idx}", chunk)
+            store.set(
+                f"{key_prefix}:chunk:{chunk_idx}",
+                chunk,  # pyrefly: ignore[bad-argument-type]
+            )
         return len(chunks)
 
     def _get_chunks(self, store: dist.Store, key_prefix: str, num_chunks: int) -> bytes:
@@ -80,8 +94,14 @@ class StringUniqueCounter:
             self._last_global_count = self._base_count + len(self._global_ids)
             return self._last_global_count
 
-        group_ranks = dist.get_process_group_ranks(group) if group is not None else list(range(world_size))
-        store = dist.PrefixStore(self._store_prefix, dist.distributed_c10d._get_default_store())
+        group_ranks = (
+            dist.get_process_group_ranks(group)
+            if group is not None
+            else list(range(world_size))
+        )
+        store = dist.PrefixStore(
+            self._store_prefix, dist.distributed_c10d._get_default_store()
+        )
         store_key_prefix = f"sync:{self._sync_idx}:rank:"
         self._sync_idx += 1
         num_chunks = self._store_chunks(
@@ -96,7 +116,9 @@ class StringUniqueCounter:
         global_count = None
         if group_rank == 0:
             for rank, chunk_count in zip(group_ranks, chunk_counts, strict=True):
-                payload = self._get_chunks(store, f"{store_key_prefix}{rank}", chunk_count)
+                payload = self._get_chunks(
+                    store, f"{store_key_prefix}{rank}", chunk_count
+                )
                 self._global_ids.update(json.loads(payload.decode()))
             global_count = self._base_count + len(self._global_ids)
 

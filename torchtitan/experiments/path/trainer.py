@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import getpass
 import os
 import time
 from collections.abc import Iterable, Iterator
@@ -15,7 +14,6 @@ from typing import Any
 
 import torch
 
-from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.unique_counter import StringUniqueCounter
 from torchtitan.distributed import utils as dist_utils
@@ -25,31 +23,6 @@ from torchtitan.trainer import Trainer
 from .loss import PathLoss
 from .onnx_checkpoint import PathOnnxCheckpointManager
 from .validate import PathValidator, segment_names_from_info
-
-
-def final_checkpoint_config(
-    *, flavor: str, stem: str, seed: int | None, steps: int
-) -> CheckpointManager.Config:
-    reporterv2_host = os.getenv("REPORTERV2_HOST")
-    report_user = os.getenv("REPORT_USER") or getpass.getuser()
-    if reporterv2_host:
-        return PathOnnxCheckpointManager.Config(
-            enable=True,
-            checkpoint_base_folder=f"{reporterv2_host.rstrip('/')}/checkpoint",
-            checkpoint_id_format="step-",
-            folder=f"{report_user}/{flavor}/{stem}_s{seed}",
-            interval=steps,
-            keep_latest_k=0,
-        )
-    return CheckpointManager.Config(
-        enable=True,
-        folder=(
-            f"/raid.unprotected/reports/{report_user}_reports"
-            f"/prune_10m/vit/checkpoints/{flavor}/{stem}_s{seed}"
-        ),
-        interval=steps,
-        keep_latest_k=0,
-    )
 
 
 class PathTrainer(Trainer):
@@ -69,14 +42,6 @@ class PathTrainer(Trainer):
                     **self.validator.miniray,
                     "codedir": self.codedir,
                 }
-            if self.dataloader.limit and not self.checkpoint.enable:
-                stem = os.path.splitext(os.path.basename(self.dataloader.dataset))[0]
-                self.checkpoint = final_checkpoint_config(
-                    flavor=self.model_spec.flavor,
-                    stem=stem,
-                    seed=self.debug.seed,
-                    steps=self.training.steps,
-                )
 
     def __init__(self, config: Config):
         super().__init__(config)

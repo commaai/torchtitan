@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Minimal ConvNeXt copy for path training."""
 
 from __future__ import annotations
@@ -9,14 +15,14 @@ import torch
 import torch.nn as nn
 from timm.layers import (
     AvgPool2dSame,
-    DropPath,
-    Mlp,
-    NormMlpClassifierHead,
     calculate_drop_path_rates,
     create_conv2d,
+    DropPath,
     get_act_layer,
     LayerNorm,
     LayerNorm2d,
+    Mlp,
+    NormMlpClassifierHead,
     to_ntuple,
     trunc_normal_,
 )
@@ -37,6 +43,21 @@ __all__ = [
 
 
 CONVNEXT_FLAVORS = {
+    "convnext_atto": {
+        "depths": (2, 2, 6, 2),
+        "dims": (40, 80, 160, 320),
+        "pretrained": "convnext_atto.d2_in1k",
+    },
+    "convnext_femto": {
+        "depths": (2, 2, 6, 2),
+        "dims": (48, 96, 192, 384),
+        "pretrained": "convnext_femto.d1_in1k",
+    },
+    "convnext_pico": {
+        "depths": (2, 2, 6, 2),
+        "dims": (64, 128, 256, 512),
+        "pretrained": "convnext_pico.d1_in1k",
+    },
     "convnext_tiny": {
         "depths": (3, 3, 9, 3),
         "dims": (96, 192, 384, 768),
@@ -45,7 +66,17 @@ CONVNEXT_FLAVORS = {
     "convnext_small": {
         "depths": (3, 3, 27, 3),
         "dims": (96, 192, 384, 768),
+        "pretrained": "convnext_small.dinov3_lvd1689m",
+    },
+    "convnext_quarterxxl": {
+        "depths": (3, 4, 30, 3),
+        "dims": (96, 192, 384, 768),
         "pretrained": "convnext_small.in12k_ft_in1k",
+    },
+    "convnext_thirdxxl": {
+        "depths": (3, 4, 30, 3),
+        "dims": (128, 256, 512, 1024),
+        "pretrained": "convnext_base.clip_laion2b_augreg_ft_in1k",
     },
     "convnext_base": {
         "depths": (3, 3, 27, 3),
@@ -74,8 +105,12 @@ class Downsample(nn.Module):
         dd = {"device": device, "dtype": dtype}
         avg_stride = stride if dilation == 1 else 1
         if stride > 1 or dilation > 1:
-            avg_pool_fn = AvgPool2dSame if avg_stride == 1 and dilation > 1 else nn.AvgPool2d
-            self.pool = avg_pool_fn(2, avg_stride, ceil_mode=True, count_include_pad=False)
+            avg_pool_fn = (
+                AvgPool2dSame if avg_stride == 1 and dilation > 1 else nn.AvgPool2d
+            )
+            self.pool = avg_pool_fn(
+                2, avg_stride, ceil_mode=True, count_include_pad=False
+            )
         else:
             self.pool = nn.Identity()
         self.conv = (
@@ -121,8 +156,14 @@ class ConvNeXtBlock(nn.Module):
             **dd,
         )
         self.norm = LayerNorm(out_chs, eps=norm_eps, **dd)
-        self.mlp = Mlp(out_chs, int(mlp_ratio * out_chs), act_layer=get_act_layer(act_layer), **dd)
-        self.gamma = nn.Parameter(ls_init_value * torch.ones(out_chs, **dd)) if ls_init_value is not None else None
+        self.mlp = Mlp(
+            out_chs, int(mlp_ratio * out_chs), act_layer=get_act_layer(act_layer), **dd
+        )
+        self.gamma = (
+            nn.Parameter(ls_init_value * torch.ones(out_chs, **dd))
+            if ls_init_value is not None
+            else None
+        )
         self.shortcut = (
             Downsample(in_chs, out_chs, stride=stride, dilation=dilation[0], **dd)
             if in_chs != out_chs or stride != 1 or dilation[0] != dilation[1]
@@ -272,7 +313,9 @@ class ConvNeXt(nn.Module):
                 )
             )
             prev_chs = dims[i]
-            self.feature_info.append(dict(num_chs=prev_chs, reduction=curr_stride, module=f"stages.{i}"))
+            self.feature_info.append(
+                dict(num_chs=prev_chs, reduction=curr_stride, module=f"stages.{i}")
+            )
         self.stages = nn.Sequential(*stages)
         self.num_features = self.head_hidden_size = prev_chs
         self.norm_pre = nn.Identity()
@@ -319,7 +362,9 @@ class ConvNeXt(nn.Module):
     def get_classifier(self) -> nn.Module:
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: str | None = None) -> None:
+    def reset_classifier(
+        self, num_classes: int, global_pool: str | None = None
+    ) -> None:
         self.num_classes = num_classes
         self.head.reset(num_classes, global_pool)
 
@@ -341,7 +386,9 @@ class ConvNeXt(nn.Module):
         return self.forward_head(self.forward_features(x))
 
 
-def _init_weights(module: nn.Module, name: str | None = None, head_init_scale: float = 1.0) -> None:
+def _init_weights(
+    module: nn.Module, name: str | None = None, head_init_scale: float = 1.0
+) -> None:
     if isinstance(module, nn.Conv2d):
         trunc_normal_(module.weight, std=0.02)
         if module.bias is not None:
@@ -362,21 +409,33 @@ def checkpoint_filter_fn(state_dict, model):
 
     out_dict = {}
     if "visual.trunk.stem.0.weight" in state_dict:
-        out_dict = {k.replace("visual.trunk.", ""): v for k, v in state_dict.items() if k.startswith("visual.trunk.")}
+        out_dict = {
+            k.replace("visual.trunk.", ""): v
+            for k, v in state_dict.items()
+            if k.startswith("visual.trunk.")
+        }
         if "visual.head.proj.weight" in state_dict:
             out_dict["head.fc.weight"] = state_dict["visual.head.proj.weight"]
-            out_dict["head.fc.bias"] = torch.zeros(state_dict["visual.head.proj.weight"].shape[0])
+            out_dict["head.fc.bias"] = torch.zeros(
+                state_dict["visual.head.proj.weight"].shape[0]
+            )
         elif "visual.head.mlp.fc1.weight" in state_dict:
-            out_dict["head.pre_logits.fc.weight"] = state_dict["visual.head.mlp.fc1.weight"]
+            out_dict["head.pre_logits.fc.weight"] = state_dict[
+                "visual.head.mlp.fc1.weight"
+            ]
             out_dict["head.pre_logits.fc.bias"] = state_dict["visual.head.mlp.fc1.bias"]
             out_dict["head.fc.weight"] = state_dict["visual.head.mlp.fc2.weight"]
-            out_dict["head.fc.bias"] = torch.zeros(state_dict["visual.head.mlp.fc2.weight"].shape[0])
+            out_dict["head.fc.bias"] = torch.zeros(
+                state_dict["visual.head.mlp.fc2.weight"].shape[0]
+            )
         return out_dict
 
     for k, v in state_dict.items():
         k = k.replace("downsample_layers.0.", "stem.")
         k = re.sub(r"stages.([0-9]+).([0-9]+)", r"stages.\1.blocks.\2", k)
-        k = re.sub(r"downsample_layers.([0-9]+).([0-9]+)", r"stages.\1.downsample.\2", k)
+        k = re.sub(
+            r"downsample_layers.([0-9]+).([0-9]+)", r"stages.\1.downsample.\2", k
+        )
         k = k.replace("dwconv", "conv_dw")
         k = k.replace("pwconv", "mlp.fc")
         k = k.replace("head.", "head.fc.")
@@ -386,6 +445,7 @@ def checkpoint_filter_fn(state_dict, model):
             v = v.reshape(model.state_dict()[k].shape)
         out_dict[k] = v
     return out_dict
+
 
 def _create_convnext(variant: str, pretrained: bool = False, **kwargs):
     return build_model_with_cfg(
