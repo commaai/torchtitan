@@ -213,7 +213,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
         for part_idx, model in enumerate(self.model_parts):
             groups_by_opt_name, patterns_by_opt_name = self._build_param_groups(
-                model, param_group_configs, impl_kwargs,
+                model,
+                param_group_configs,
+                impl_kwargs,
             )
             for opt_name, opt_param_groups in groups_by_opt_name.items():
                 optimizer = self._resolve_optimizer_cls(opt_name)(opt_param_groups)

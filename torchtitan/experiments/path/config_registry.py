@@ -83,9 +83,7 @@ _PLAN_HEAD_INIT_LOG_SIGMA_SCALE = 5.0
 # bias init structure
 def _init_plan_head_bias(bias: nn.Parameter) -> None:
     value = torch.zeros(bias.shape, dtype=bias.dtype, device=bias.device)
-    value[bias.shape[0] // 2 :].fill_(
-        math.log(_PLAN_HEAD_INIT_LOG_SIGMA_SCALE)
-    )
+    value[bias.shape[0] // 2 :].fill_(math.log(_PLAN_HEAD_INIT_LOG_SIGMA_SCALE))
     if isinstance(bias, DTensor):
         value = distribute_tensor(value, bias.device_mesh, bias.placements)
     with torch.no_grad():
@@ -147,14 +145,21 @@ def _path(flavor: str) -> PathTrainer.Config:
         loss=PathLoss.Config(),
         model_spec=model_registry(flavor),
         tokenizer=NoOpTokenizer.Config(),
-        dataloader=_dataloader_config(dataset=DEFAULT_TRAIN_LIST, split="train", fps=fps, plan_only=plan_only, limit=None, pipeline_dir=BASE_DIR_GT),
+        dataloader=_dataloader_config(
+            dataset=DEFAULT_TRAIN_LIST,
+            split="train",
+            fps=fps,
+            plan_only=plan_only,
+            limit=None,
+            pipeline_dir=BASE_DIR_GT,
+        ),
         optimizer=_optimizer_config(),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=1024,
             total_steps=steps,
-            decay_ratio=0.,
+            decay_ratio=0.0,
             decay_type="linear",
-            min_lr_factor=0.,
+            min_lr_factor=0.0,
         ),
         training=TrainingConfig(
             local_batch_size=16,
@@ -190,7 +195,14 @@ def _path(flavor: str) -> PathTrainer.Config:
             enable=True,
             freq=validation_freq,
             steps=32,
-            dataloader=_dataloader_config(split="val", fps=fps, plan_only=plan_only, dataset=DEFAULT_TRAIN_LIST, limit=None, pipeline_dir=BASE_DIR_GT),
+            dataloader=_dataloader_config(
+                split="val",
+                fps=fps,
+                plan_only=plan_only,
+                dataset=DEFAULT_TRAIN_LIST,
+                limit=None,
+                pipeline_dir=BASE_DIR_GT,
+            ),
             mixed_precision_param=mixed_precision_param,
             reports=reports,
         ),
@@ -271,9 +283,17 @@ def _model_config(flavor: str) -> PathModel.Config:
 
 
 def _dataloader_config(
-    *, dataset:str, split: str, fps: int, plan_only: bool, limit:int|None, pipeline_dir:str,
+    *,
+    dataset: str,
+    split: str,
+    fps: int,
+    plan_only: bool,
+    limit: int | None,
+    pipeline_dir: str,
 ) -> PathDataLoader.Config:
-    base = XXPathDatasetConfig(fps=fps, plan_only=plan_only, limit=limit, pipeline_dir=pipeline_dir)
+    base = XXPathDatasetConfig(
+        fps=fps, plan_only=plan_only, limit=limit, pipeline_dir=pipeline_dir
+    )
     return PathDataLoader.Config(
         dataset=dataset,
         split=split,
@@ -437,9 +457,7 @@ def _hydra(
                 in_features=in_features,
                 out_features=head.output_size,
                 bias=True,
-                param_init=(
-                    _PLAN_HEAD_INIT if head.name == "plan" else _LINEAR_INIT
-                ),
+                param_init=(_PLAN_HEAD_INIT if head.name == "plan" else _LINEAR_INIT),
             )
             for head in heads
         },
