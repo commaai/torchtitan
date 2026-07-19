@@ -63,7 +63,7 @@ def main() -> None:
             logger.info("Created seed checkpoint")
         else:
             trainer.train()
-    except BaseException:
+    except Exception:
         if trainer:
             trainer.close()
         raise

@@ -46,8 +46,6 @@ for arg in "$@"; do
     codedir=*) TORCHTITAN_ARGS+=("--codedir=${arg#codedir=}") ;;
     master_addr=*) MASTER_ADDR="${arg#master_addr=}" ;;
     master_port=*) MASTER_PORT="${arg#master_port=}" ;;
-    --metrics.enable_reporterv2=) TORCHTITAN_ARGS+=("--metrics.enable_reporterv2") ;;
-    --validator.save_predictions=) TORCHTITAN_ARGS+=("--validator.save_predictions") ;;
     *) TORCHTITAN_ARGS+=("$arg") ;;
   esac
 done
