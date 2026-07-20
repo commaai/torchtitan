@@ -26,6 +26,8 @@ class PathDataLoader(BaseDataLoader):
         n_frames: int
         rgb: bool
         unvision: bool
+        skip: int
+        val_skip: int
 
     def __init__(
         self,
@@ -72,6 +74,8 @@ class PathDataLoader(BaseDataLoader):
             n_frames=config.n_frames,
             rgb=config.rgb,
             unvision=config.unvision,
+            skip=config.skip,
+            val_skip=config.val_skip,
         )
         dataset = get_dataset(config.dataset, xx_config, val, self.local_rank, dp_rank, dp_world_size)
         self.dataset = dataset

@@ -152,6 +152,8 @@ def _path(flavor: str) -> PathTrainer.Config:
             plan_only=plan_only,
             limit=None,
             pipeline_dir=BASE_DIR_GT,
+            skip=1,
+            val_skip=1,
         ),
         optimizer=_optimizer_config(),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -202,6 +204,8 @@ def _path(flavor: str) -> PathTrainer.Config:
                 dataset=DEFAULT_TRAIN_LIST,
                 limit=None,
                 pipeline_dir=BASE_DIR_GT,
+                skip=1,
+                val_skip=1,
             ),
             mixed_precision_param=mixed_precision_param,
             reports=reports,
@@ -290,9 +294,12 @@ def _dataloader_config(
     plan_only: bool,
     limit: int | None,
     pipeline_dir: str,
+    skip: int,
+    val_skip: int,
 ) -> PathDataLoader.Config:
+    # TODO: why is base needed?
     base = XXPathDatasetConfig(
-        fps=fps, plan_only=plan_only, limit=limit, pipeline_dir=pipeline_dir
+        fps=fps, plan_only=plan_only, limit=limit, pipeline_dir=pipeline_dir, skip=skip, val_skip=val_skip
     )
     return PathDataLoader.Config(
         dataset=dataset,
@@ -308,6 +315,8 @@ def _dataloader_config(
         n_frames=base.n_frames,
         rgb=base.rgb,
         unvision=base.unvision,
+        skip=base.skip,
+        val_skip=base.val_skip,
     )
 
 

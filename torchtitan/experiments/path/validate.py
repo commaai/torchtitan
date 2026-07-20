@@ -5,6 +5,7 @@ import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Any
 
 import torch
@@ -51,6 +52,7 @@ class PathValidator(BaseValidator):
         reports: dict[str, list[int]] = field(default_factory=dict)
         miniray: dict[str, Any] = field(default_factory=dict)
         save_predictions: bool = False
+        prediction_file_prefix: str = "val_preds"
 
     def __init__(
         self,
@@ -104,15 +106,22 @@ class PathValidator(BaseValidator):
             total_samples = torch.zeros((), device=device)
             metric_sums: dict[str, torch.Tensor] = {}
             validation_segment_names: set[str] = set()
-            pred_records: list[dict[str, Any]] = []
+            prediction_rows: list[tuple[str, int]] = []
+            prediction_batches: dict[str, list[torch.Tensor]] = {}
+            target_batches: dict[str, list[torch.Tensor]] = {}
             batch_mesh = self.parallel_dims.get_optional_mesh("batch")
             loss_mesh = self.parallel_dims.get_optional_mesh("loss")
-            for num_steps, (input_dict, targets) in enumerate(self.dataloader):
-                if self.config.steps != -1 and num_steps >= self.config.steps:
-                    break
+            batches = iter(self.dataloader)
+            if self.config.steps != -1:
+                batches = islice(batches, self.config.steps)
+            for input_dict, targets in batches:
                 self.metrics_processor.ntokens_since_last_log += next(iter(input_dict.values())).shape[0]
-                if "info" in input_dict:
-                    validation_segment_names.update(segment_names_from_info(input_dict["info"]))
+                infos = (
+                    [parse_info(x) for x in input_dict["info"].cpu().numpy()]
+                    if "info" in input_dict
+                    else []
+                )
+                validation_segment_names.update(info["name"] for info in infos)
                 input_dict = {k: v.to(device) for k, v in input_dict.items()}
                 targets = {k: v.to(device) for k, v in targets.items()}
                 local_samples = torch.tensor(next(iter(input_dict.values())).shape[0], dtype=torch.float32, device=device)
@@ -127,12 +136,18 @@ class PathValidator(BaseValidator):
                     loss_vec, metrics = self.loss_fn(pred, targets)
 
                 if self.config.save_predictions:
-                    infos = [parse_info(x) for x in input_dict["info"].cpu().numpy()]
-                    arrays = {k: v.double().cpu().numpy().round(4) for k, v in pred.items()}
-                    pred_records.extend(
-                        {"name": info["name"], "fidx": int(info["fidx"])} | {k: v[i].tolist() for k, v in arrays.items()}
-                        for i, info in enumerate(infos)
+                    prediction_rows.extend(
+                        (info["name"], int(info["fidx"]))
+                        for info in infos
                     )
+                    for name, value in pred.items():
+                        prediction_batches.setdefault(name, []).append(
+                            value.cpu()
+                        )
+                    for name, value in targets.items():
+                        target_batches.setdefault(name, []).append(
+                            value.cpu()
+                        )
 
                 loss_sum = loss_vec.float().sum()
                 batch_metric_sums = {k: v.float().sum() for k, v in metrics.items() if k != "loss"}
@@ -159,8 +174,15 @@ class PathValidator(BaseValidator):
             )
             self.metrics_processor.log_validation(loss=loss, step=step, extra_metrics=extra_metrics)
             if self.config.save_predictions:
-                self._save_predictions(pred_records, step, batch_mesh)
-            self._submit_reports(step)
+                self._save_predictions(
+                    prediction_rows,
+                    prediction_batches,
+                    target_batches,
+                    step,
+                    batch_mesh,
+                )
+            if self.config.reports:
+                self._submit_reports(step)
         finally:
             for model in model_parts:
                 model.train()
@@ -171,20 +193,58 @@ class PathValidator(BaseValidator):
         finally:
             self.dataloader.close()
 
-    def _save_predictions(self, records: list[dict[str, Any]], step: int, batch_mesh) -> None:
+    def _save_predictions(
+        self,
+        rows: list[tuple[str, int]],
+        prediction_batches: dict[str, list[torch.Tensor]],
+        target_batches: dict[str, list[torch.Tensor]],
+        step: int,
+        batch_mesh: Any,
+    ) -> None:
         from reporterv2.storage import store_put
+        from safetensors.torch import save as save_safetensors
 
-        if batch_mesh is not None:
-            group = batch_mesh.get_group()
-            gathered: list[list[dict[str, Any]] | None] = [None] * group.size()
-            dist.all_gather_object(gathered, records, group=group)
-            records = [record for rank_records in gathered for record in rank_records]
-        if global_rank() != 0:
+        group = batch_mesh.get_group() if batch_mesh is not None else None
+        rank = global_rank()
+        tensors = {
+            "fidx": torch.tensor([fidx for _, fidx in rows]),
+            **{
+                f"predictions/{name}": torch.cat(values)
+                for name, values in prediction_batches.items()
+            },
+            **{
+                f"targets/{name}": torch.cat(values)
+                for name, values in target_batches.items()
+            },
+        }
+
+        folder = (
+            f"runs/{self.training_id}/reports/"
+            f"{self.config.prediction_file_prefix}.{step}"
+        )
+        shard_file = f"__{rank}_0.safetensors"
+        shard = save_safetensors(tensors)
+        logger.info(
+            f"Saving prediction shard {shard_file} ({len(shard) / 2**20:.1f} MiB)"
+        )
+        store_put(f"{folder}/{shard_file}", shard)
+
+        shard_metadata = {
+            "file": shard_file,
+            "names": [name for name, _ in rows],
+        }
+        if group is not None:
+            shards: list[Any] | None = (
+                [None] * dist.get_world_size(group) if rank == 0 else None
+            )
+            dist.gather_object(shard_metadata, shards, dst=0, group=group)
+        else:
+            shards = [shard_metadata]
+        if rank != 0:
             return
-        try:
-            store_put(f"runs/{self.training_id}/reports/val_preds.{step}.json", json.dumps(records))
-        except Exception:
-            logger.warning(f"failed to save val predictions for step {step}", exc_info=True)
+
+        store_put(f"{folder}/.metadata", json.dumps({"shards": shards}))
+        logger.info(f"Saved prediction metadata for step {step}")
 
     def _submit_reports(self, step: int) -> None:
         current_checkpoint = f'{self.training_id}/{step}'
