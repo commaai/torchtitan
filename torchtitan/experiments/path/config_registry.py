@@ -339,7 +339,6 @@ def _checkpoint_config(
         keep_latest_k=0,  # keep all checkpoints
         enable=True,
         checkpoint_base_folder=base_folder,
-        save_model_state_dict=True,  # another copy of full state dict
         export_onnx=True,
         enable_first_step_checkpoint=True,
         folder=folder,
