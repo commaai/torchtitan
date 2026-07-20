@@ -378,7 +378,7 @@ def _last_frame_causal_mask(
     kv_idx: torch.Tensor,
 ) -> torch.Tensor:
     del b, h
-    q_ok = q_idx > block_size - mini_block_size
+    q_ok = q_idx >= block_size - mini_block_size
     kv_ok = kv_idx < block_size - mini_block_size
     return q_ok | kv_ok
 
