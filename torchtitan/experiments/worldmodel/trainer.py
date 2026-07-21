@@ -45,6 +45,13 @@ class WorldModelFloat8Config:
     emulate: bool = False
 
 
+@dataclass(kw_only=True, slots=True)
+class PrefillContextNoiseConfig:
+    prob: float = 0.0
+    std_min: float = 0.0
+    std_max: float = 0.0
+
+
 def _batch_size(inputs: dict[str, torch.Tensor]) -> int:
     return next(iter(inputs.values())).shape[0]
 
@@ -70,6 +77,28 @@ def _segment_names_from_info(info: torch.Tensor) -> list[str]:
     return names
 
 
+def _add_ascending_prefill_context_noise(
+    latents_BTCHW: torch.Tensor,
+    *,
+    start_frame: int,
+    end_frame: int,
+    std_min: float,
+    std_max: float,
+) -> None:
+    """Add a Gaussian std ramp to normalized context latents in place."""
+    num_frames = end_frame - start_frame
+    std_T = torch.linspace(
+        std_min,
+        std_max,
+        num_frames,
+        device=latents_BTCHW.device,
+        dtype=latents_BTCHW.dtype,
+    )
+    std_1T111 = std_T.view(1, num_frames, 1, 1, 1)
+    context_BTCHW = latents_BTCHW[:, start_frame:end_frame]
+    context_BTCHW.add_(torch.randn_like(context_BTCHW) * std_1T111)
+
+
 def _prepare_worldmodel_batch(
     *,
     model: WorldModel,
@@ -85,6 +114,7 @@ def _prepare_worldmodel_batch(
     future_size_frames: int,
     no_noise_prefill_frames_prob: float,
     fake_timesteps_prob: float,
+    prefill_context_noise: PrefillContextNoiseConfig | None = None,
     train: bool,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     latents = tokenizer.encode(input_dict, device=device, dtype=dtype)
@@ -123,6 +153,7 @@ def _prepare_worldmodel_batch(
 
         mask = torch.ones_like(latents, device=device, dtype=torch.bool)
         fake_timesteps = timesteps.clone()
+        prefill_context_noise_range: tuple[int, int] | None = None
         if torch.rand((), device=device) < no_noise_prefill_frames_prob:
             end = min(inference_prefill_frames, num_frames)
             mask[:, :end] = False
@@ -134,8 +165,28 @@ def _prepare_worldmodel_batch(
                     (batch_size, end - start)
                 )
                 mask[:, start:] = True
+            elif (
+                train
+                and start < end
+                and prefill_context_noise is not None
+                and prefill_context_noise.prob > 0.0
+                and torch.rand((), device=device) < prefill_context_noise.prob
+            ):
+                prefill_context_noise_range = (start, end)
 
         noisy_latents = scheduler.add_noise(latents, noise, fake_timesteps)
+        if (
+            prefill_context_noise_range is not None
+            and prefill_context_noise is not None
+        ):
+            start, end = prefill_context_noise_range
+            _add_ascending_prefill_context_noise(
+                noisy_latents,
+                start_frame=start,
+                end_frame=end,
+                std_min=prefill_context_noise.std_min,
+                std_max=prefill_context_noise.std_max,
+            )
         targets = {**targets, "v": latents - noise, "mask": mask}
 
     return {
@@ -311,6 +362,9 @@ class WorldModelTrainer(Trainer):
         validator: WorldModelValidator.Config
         checkpoint: WorldModelTorchPackageCheckpointManager.Config
         float8: WorldModelFloat8Config = field(default_factory=WorldModelFloat8Config)
+        prefill_context_noise: PrefillContextNoiseConfig = field(
+            default_factory=PrefillContextNoiseConfig
+        )
         pose_dropout: float
         noise_scheduler_steps: int
         no_noise_prefill_frames_prob: float
@@ -385,6 +439,7 @@ class WorldModelTrainer(Trainer):
                 future_size_frames=self.config.dataloader.future_size_frames,
                 no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
                 fake_timesteps_prob=self.config.fake_timesteps_prob,
+                prefill_context_noise=self.config.prefill_context_noise,
                 train=True,
             )
         self.ntokens_seen += model_inputs["x"].shape[0] * self.config.training.seq_len
@@ -587,6 +642,15 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
         raise ValueError("model input spatial size must match dataloader latent_size")
     if model_config.in_channels != config.dataloader.in_channels:
         raise ValueError("model in_channels must match dataloader in_channels")
+    prefill_context_noise = config.prefill_context_noise
+    if not 0.0 <= prefill_context_noise.prob <= 1.0:
+        raise ValueError("prefill_context_noise.prob must be in [0, 1]")
+    if prefill_context_noise.std_min < 0.0:
+        raise ValueError("prefill_context_noise.std_min must be non-negative")
+    if prefill_context_noise.std_max < prefill_context_noise.std_min:
+        raise ValueError(
+            "prefill_context_noise.std_max must be >= prefill_context_noise.std_min"
+        )
     if (
         config.parallelism.tensor_parallel_degree > 1
         or config.parallelism.pipeline_parallel_degree > 1
