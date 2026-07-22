@@ -61,17 +61,11 @@ def _rank() -> int:
 
 
 class OnnxCheckpointManager(CheckpointManager):
-    """Checkpoint manager that can write rank-0 model artifacts alongside DCP."""
+    """Checkpoint manager that exports a rank-0 ONNX model alongside DCP."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(CheckpointManager.Config):
         checkpoint_id_format: str = ""
-
-        save_model_state_dict: bool = False
-        """Save a gathered model state dict as one rank-0 torch file."""
-
-        model_state_dict_file: str = "model_state_dict.pt"
-        """File name for the gathered model state dict."""
 
         export_onnx: bool = False
         """Export a rank-0 ONNX model artifact alongside written checkpoints."""
@@ -96,8 +90,6 @@ class OnnxCheckpointManager(CheckpointManager):
 
     def __init__(self, config: Config, **kwargs) -> None:
         super().__init__(config, **kwargs)
-        self.save_model_state_dict = config.save_model_state_dict
-        self.model_state_dict_file = config.model_state_dict_file
         self.export_onnx = config.export_onnx
         self.onnx_file = config.onnx_file
         self.input_names = config.input_names
@@ -109,9 +101,9 @@ class OnnxCheckpointManager(CheckpointManager):
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> bool:
         saved = super().save(curr_step, last_step)
-        if saved and (self.save_model_state_dict or self.export_onnx):
+        if saved and self.export_onnx:
             self._async_wait()
-            self._save_rank0_artifacts(curr_step)
+            self._export_rank0_onnx(curr_step)
             self._wait_for_rank0()
         return saved
 
@@ -132,12 +124,12 @@ class OnnxCheckpointManager(CheckpointManager):
         finally:
             dist.destroy_process_group(barrier_group)
 
-    def _save_rank0_artifacts(self, curr_step: int) -> None:
+    def _export_rank0_onnx(self, curr_step: int) -> None:
         model_parts = self.states[MODEL].model
         if len(model_parts) != 1:
-            raise ValueError("ONNX checkpoint artifacts do not support PP")
+            raise ValueError("ONNX export does not support PP")
 
-        state_dict = get_model_state_dict(
+        cpu_state_dict = get_model_state_dict(
             model_parts[0],
             options=StateDictOptions(full_state_dict=True, cpu_offload=True),
         )
@@ -145,25 +137,21 @@ class OnnxCheckpointManager(CheckpointManager):
             return
 
         checkpoint_id = self._create_checkpoint_id(curr_step)
-        if self.save_model_state_dict:
-            path = fs.join_path(checkpoint_id, self.model_state_dict_file)
-            with fs.open_file(path, "wb") as f:
-                torch.save(state_dict, f)
-            logger.info("Saved gathered model state dict to %s", path)
-
-        if self.export_onnx:
-            model = self._build_cpu_model_from_state_dict(model_parts[0], state_dict)
-            path = fs.join_path(checkpoint_id, self.onnx_file)
-            self._export_onnx(model, path)
-            logger.info("Exported ONNX model to %s", path)
+        model = self._build_cpu_model_from_state_dict(model_parts[0], cpu_state_dict)
+        # load_state_dict copies by default, so the gathered CPU tensors do not need
+        # to remain resident during ONNX export.
+        del cpu_state_dict
+        path = fs.join_path(checkpoint_id, self.onnx_file)
+        self._export_onnx(model, path)
+        logger.info("Exported ONNX model to %s", path)
 
     @staticmethod
     def _build_cpu_model_from_state_dict(
         source_model: nn.Module,
         state_dict: dict[str, Any],
     ) -> nn.Module:
-        # The live training model may be FSDP-wrapped, compiled, or sharded. Export
-        # a plain CPU model from the gathered state dict instead.
+        # model may be FSDP-wrapped, compiled, or sharded. build a
+        # plain CPU model from the gathered state dict instead.
         model_config = getattr(source_model, "config", None)
         if model_config is None or not hasattr(model_config, "build"):
             raise ValueError(
