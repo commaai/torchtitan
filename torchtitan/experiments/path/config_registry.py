@@ -27,11 +27,6 @@ from xx.training.path.hydra_configs import (
     POSE_HEADS,
     TEMPORAL_META_HEADS,
 )
-
-import torch
-import torch.nn as nn
-from torch.distributed.tensor import distribute_tensor, DTensor
-
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
@@ -69,31 +64,6 @@ from .model import (
 from .onnx_checkpoint import PathOnnxCheckpointManager
 from .trainer import PathTrainer
 from .validate import PathValidator
-
-
-_LINEAR_INIT = {
-    "weight": partial(nn.init.normal_, mean=0.0, std=0.02),
-    "bias": nn.init.zeros_,
-}
-_NORM_INIT = {"weight": nn.init.ones_, "bias": nn.init.zeros_}
-_PLAN_HEAD_INIT_STD = 1e-3
-_PLAN_HEAD_INIT_LOG_SIGMA_SCALE = 5.0
-
-# init is called after sharding, need to handle DTensor properly for the half point
-# bias init structure
-def _init_plan_head_bias(bias: nn.Parameter) -> None:
-    value = torch.zeros(bias.shape, dtype=bias.dtype, device=bias.device)
-    value[bias.shape[0] // 2 :].fill_(math.log(_PLAN_HEAD_INIT_LOG_SIGMA_SCALE))
-    if isinstance(bias, DTensor):
-        value = distribute_tensor(value, bias.device_mesh, bias.placements)
-    with torch.no_grad():
-        bias.copy_(value)
-
-
-_PLAN_HEAD_INIT = {
-    "weight": partial(nn.init.normal_, mean=0.0, std=_PLAN_HEAD_INIT_STD),
-    "bias": _init_plan_head_bias,
-}
 
 
 def model_registry(flavor: str) -> ModelSpec:
@@ -269,7 +239,6 @@ def _model_config(flavor: str) -> PathModel.Config:
                 pos_embedding=Embedding.Config(
                     num_embeddings=block_size,
                     embedding_dim=dim,
-                    param_init=_LINEAR_INIT,
                 ),
                 block_size=block_size,
                 dense_training_outputs=True,
@@ -396,12 +365,12 @@ def _hidden_dim(dim: int, mlp_mult: float, multiple_of: int = 256) -> int:
 def _mlp(dim: int, *, mlp_mult: float, bias: bool, dropout: float) -> PathMLP.Config:
     hidden = _hidden_dim(dim, mlp_mult)
     return PathMLP.Config(
-        norm=LayerNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        norm=LayerNorm.Config(normalized_shape=dim),
         c_fc=Linear.Config(
-            in_features=dim, out_features=hidden, bias=bias, param_init=_LINEAR_INIT
+            in_features=dim, out_features=hidden, bias=bias
         ),
         c_proj=Linear.Config(
-            in_features=hidden, out_features=dim, bias=bias, param_init=_LINEAR_INIT
+            in_features=hidden, out_features=dim, bias=bias
         ),
         act="gelu_tanh",
         dropout=dropout,
@@ -414,10 +383,9 @@ def _encoder(in_features: int, dim: int) -> LinearEncoder.Config:
             in_features=in_features,
             out_features=dim,
             bias=True,
-            param_init=_LINEAR_INIT,
         ),
         out_layer=Linear.Config(
-            in_features=dim, out_features=dim, bias=False, param_init=_LINEAR_INIT
+            in_features=dim, out_features=dim, bias=False
         ),
     )
 
@@ -425,14 +393,14 @@ def _encoder(in_features: int, dim: int) -> LinearEncoder.Config:
 def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Config:
     head_dim = dim // n_head
     return PathSelfAttention.Config(
-        norm=LayerNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        q_norm=LayerNorm.Config(normalized_shape=head_dim, param_init=_NORM_INIT),
-        k_norm=LayerNorm.Config(normalized_shape=head_dim, param_init=_NORM_INIT),
+        norm=LayerNorm.Config(normalized_shape=dim),
+        q_norm=LayerNorm.Config(normalized_shape=head_dim),
+        k_norm=LayerNorm.Config(normalized_shape=head_dim),
         c_attn=Linear.Config(
-            in_features=dim, out_features=3 * dim, bias=True, param_init=_LINEAR_INIT
+            in_features=dim, out_features=3 * dim, bias=True
         ),
         c_proj=Linear.Config(
-            in_features=dim, out_features=dim, bias=True, param_init=_LINEAR_INIT
+            in_features=dim, out_features=dim, bias=True
         ),
         inner_attention=ScaledDotProductAttention.Config(),
         n_head=n_head,
@@ -456,7 +424,6 @@ def _hydra(
                 in_features=in_features,
                 out_features=head.output_size,
                 bias=True,
-                param_init=(_PLAN_HEAD_INIT if head.name == "plan" else _LINEAR_INIT),
             )
             for head in heads
         },
