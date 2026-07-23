@@ -27,6 +27,7 @@ from xx.training.path.hydra_configs import (
     POSE_HEADS,
     TEMPORAL_META_HEADS,
 )
+
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
@@ -366,12 +367,8 @@ def _mlp(dim: int, *, mlp_mult: float, bias: bool, dropout: float) -> PathMLP.Co
     hidden = _hidden_dim(dim, mlp_mult)
     return PathMLP.Config(
         norm=LayerNorm.Config(normalized_shape=dim),
-        c_fc=Linear.Config(
-            in_features=dim, out_features=hidden, bias=bias
-        ),
-        c_proj=Linear.Config(
-            in_features=hidden, out_features=dim, bias=bias
-        ),
+        c_fc=Linear.Config(in_features=dim, out_features=hidden, bias=bias),
+        c_proj=Linear.Config(in_features=hidden, out_features=dim, bias=bias),
         act="gelu_tanh",
         dropout=dropout,
     )
@@ -384,9 +381,7 @@ def _encoder(in_features: int, dim: int) -> LinearEncoder.Config:
             out_features=dim,
             bias=True,
         ),
-        out_layer=Linear.Config(
-            in_features=dim, out_features=dim, bias=False
-        ),
+        out_layer=Linear.Config(in_features=dim, out_features=dim, bias=False),
     )
 
 
@@ -396,12 +391,8 @@ def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Co
         norm=LayerNorm.Config(normalized_shape=dim),
         q_norm=LayerNorm.Config(normalized_shape=head_dim),
         k_norm=LayerNorm.Config(normalized_shape=head_dim),
-        c_attn=Linear.Config(
-            in_features=dim, out_features=3 * dim, bias=True
-        ),
-        c_proj=Linear.Config(
-            in_features=dim, out_features=dim, bias=True
-        ),
+        c_attn=Linear.Config(in_features=dim, out_features=3 * dim, bias=True),
+        c_proj=Linear.Config(in_features=dim, out_features=dim, bias=True),
         inner_attention=ScaledDotProductAttention.Config(),
         n_head=n_head,
         head_dim=head_dim,
