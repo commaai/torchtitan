@@ -9,8 +9,12 @@ from __future__ import annotations
 import math
 import os
 from functools import partial
-from xx.datasets.constants import BASE_DIR_GT
-from xx.datasets.helpers import DEFAULT_TRAIN_LIST
+from xx.datasets.constants import (
+    BASE_DIR_GT,
+    BASE_DIR_GT_10M,
+    DEFAULT_TEST_5K_LIST_TAGGED,
+    DEFAULT_TRAIN_LIST,
+)
 from xx.ml_tools.constants.model import (
     frame_constants_from_fps,
     FRAME_TYPE,
@@ -123,6 +127,8 @@ def _path(flavor: str) -> PathTrainer.Config:
             plan_only=plan_only,
             limit=None,
             pipeline_dir=BASE_DIR_GT,
+            skip=1,
+            val_skip=1,
         ),
         optimizer=_optimizer_config(),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -169,10 +175,12 @@ def _path(flavor: str) -> PathTrainer.Config:
             dataloader=_dataloader_config(
                 split="val",
                 fps=fps,
-                plan_only=plan_only,
-                dataset=DEFAULT_TRAIN_LIST,
-                limit=None,
-                pipeline_dir=BASE_DIR_GT,
+                plan_only=True,
+                dataset=DEFAULT_TEST_5K_LIST_TAGGED,
+                limit=6_000,
+                pipeline_dir=BASE_DIR_GT_10M,
+                skip=1,
+                val_skip=6,
             ),
             mixed_precision_param=mixed_precision_param,
             reports=reports,
@@ -260,9 +268,16 @@ def _dataloader_config(
     plan_only: bool,
     limit: int | None,
     pipeline_dir: str,
+    skip: int,
+    val_skip: int,
 ) -> PathDataLoader.Config:
     base = XXPathDatasetConfig(
-        fps=fps, plan_only=plan_only, limit=limit, pipeline_dir=pipeline_dir
+        fps=fps,
+        plan_only=plan_only,
+        limit=limit,
+        pipeline_dir=pipeline_dir,
+        skip=skip,
+        val_skip=val_skip,
     )
     return PathDataLoader.Config(
         dataset=dataset,
@@ -278,6 +293,8 @@ def _dataloader_config(
         n_frames=base.n_frames,
         rgb=base.rgb,
         unvision=base.unvision,
+        skip=base.skip,
+        val_skip=base.val_skip,
     )
 
 
