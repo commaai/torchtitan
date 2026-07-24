@@ -84,9 +84,7 @@ class PathDataLoader(BaseDataLoader):
             skip=config.skip,
             val_skip=config.val_skip,
         )
-        dataset = get_dataset(
-            config.dataset, xx_config, val, self.local_rank, dp_rank, dp_world_size
-        )
+        dataset = get_dataset(config.dataset, xx_config, val, self.local_rank, dp_rank, dp_world_size)
         self.dataset = dataset
         loader_config = DataloaderConfig(
             bs=local_batch_size,

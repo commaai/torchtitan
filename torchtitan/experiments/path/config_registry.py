@@ -86,9 +86,7 @@ def model_registry(flavor: str) -> ModelSpec:
 def _dp_degrees() -> tuple[int, int]:
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     world_size = int(os.environ.get("WORLD_SIZE", str(local_world_size)))
-    num_nodes = int(
-        os.environ.get("GROUP_WORLD_SIZE", str(world_size // local_world_size))
-    )
+    num_nodes = int(os.environ.get("GROUP_WORLD_SIZE", str(world_size // local_world_size)))
     return num_nodes, local_world_size
 
 
@@ -111,9 +109,7 @@ def _path(flavor: str) -> PathTrainer.Config:
     num_nodes, local_world_size = _dp_degrees()
     reporterv2_host = os.getenv("REPORTERV2_HOST")
     reporterv2_training_id = os.getenv("REPORTERV2_TRAINING_ID")
-    checkpoint_base_folder = (
-        f"{reporterv2_host.rstrip('/')}/checkpoint" if reporterv2_host else ""
-    )
+    checkpoint_base_folder = f"{reporterv2_host.rstrip('/')}/checkpoint" if reporterv2_host else ""
     fps = SUPERCOMBO_FPS
     plan_only = False
     return PathTrainer.Config(
@@ -165,9 +161,7 @@ def _path(flavor: str) -> PathTrainer.Config:
         fps=fps,
         activation_checkpoint=FullAC.Config(),
         compile=CompileConfig(enable=True, components=["model"]),
-        metrics=MetricsProcessor.Config(
-            log_freq=16, enable_reporterv2=True, save_freq=validation_freq
-        ),
+        metrics=MetricsProcessor.Config(log_freq=16, enable_reporterv2=True, save_freq=validation_freq),
         validator=PathValidator.Config(
             enable=True,
             freq=validation_freq,
@@ -194,12 +188,8 @@ def _model_config(flavor: str) -> PathModel.Config:
     n_frames_input = N_FRAMES
     input_frame_names = INPUT_FRAMES_NAMES
     input_frame_type = FRAME_TYPE
-    frame_constants = frame_constants_from_fps(
-        n_frames=n_frames_input, frame_type=input_frame_type
-    )
-    in_channels = sum(
-        frame_constants["frame_shapes"][name][0] for name in input_frame_names
-    )
+    frame_constants = frame_constants_from_fps(n_frames=n_frames_input, frame_type=input_frame_type)
+    in_channels = sum(frame_constants["frame_shapes"][name][0] for name in input_frame_names)
     block_size = len(frame_constants["history_idxs"])
     temporal_len = frame_constants["temporal_len"]
     dim = vision_features
@@ -229,13 +219,9 @@ def _model_config(flavor: str) -> PathModel.Config:
             temporal_summarizer=TemporalSummarizer.Config(
                 mlp1=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
                 mlp2=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
-                desire_encoder=_encoder(
-                    TEMPORAL_INPUTS[ModelInputs.DESIRE][0] * temporal_len, dim
-                ),
+                desire_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.DESIRE][0] * temporal_len, dim),
                 traffic_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0], dim),
-                action_t_encoder=_encoder(
-                    TEMPORAL_INPUTS[ModelInputs.ACTION_T][0], dim
-                ),
+                action_t_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.ACTION_T][0], dim),
                 transformer=PathTransformer.Config(
                     layers=[
                         PathTransformerBlock.Config(
@@ -252,9 +238,7 @@ def _model_config(flavor: str) -> PathModel.Config:
                 block_size=block_size,
                 dense_training_outputs=True,
             ),
-            temporal_hydra=_hydra(
-                _heads(DRIVING_HEADS + TEMPORAL_META_HEADS), in_features=dim, mlp_mult=2
-            ),
+            temporal_hydra=_hydra(_heads(DRIVING_HEADS + TEMPORAL_META_HEADS), in_features=dim, mlp_mult=2),
             history_idxs=tuple(int(x) for x in frame_constants["history_idxs"]),
         ),
     )
@@ -298,9 +282,7 @@ def _dataloader_config(
     )
 
 
-def _checkpoint_config(
-    folder: str, base_folder: str, interval: int
-) -> PathOnnxCheckpointManager.Config:
+def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnxCheckpointManager.Config:
     frame_constants = frame_constants_from_fps(n_frames=N_FRAMES, frame_type=FRAME_TYPE)
     temporal_len = frame_constants["temporal_len"]
     vision_input_names = [ModelInputs.IMG, ModelInputs.BIG_IMG]
@@ -342,11 +324,7 @@ def _checkpoint_config(
 def _si_int(value: str | int) -> int:
     suffixes = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
     value = str(value).strip().lower()
-    return (
-        int(float(value[:-1]) * suffixes[value[-1]])
-        if value[-1] in suffixes
-        else int(value)
-    )
+    return int(float(value[:-1]) * suffixes[value[-1]]) if value[-1] in suffixes else int(value)
 
 
 def _optimizer_config() -> OptimizersContainer.Config:
@@ -370,9 +348,7 @@ def _optimizer_config() -> OptimizersContainer.Config:
 
 
 def _heads(heads) -> tuple[PathHead, ...]:
-    return tuple(
-        PathHead(head.name, head.output_size, head.mlp, head.scale) for head in heads
-    )
+    return tuple(PathHead(head.name, head.output_size, head.mlp, head.scale) for head in heads)
 
 
 def _hidden_dim(dim: int, mlp_mult: float, multiple_of: int = 256) -> int:
@@ -417,15 +393,11 @@ def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Co
     )
 
 
-def _hydra(
-    heads: tuple[PathHead, ...], *, in_features: int, mlp_mult: float
-) -> Hydra.Config:
+def _hydra(heads: tuple[PathHead, ...], *, in_features: int, mlp_mult: float) -> Hydra.Config:
     return Hydra.Config(
         heads=heads,
         head_mlps={
-            head.name: _mlp(in_features, mlp_mult=mlp_mult, bias=False, dropout=0.0)
-            for head in heads
-            if head.mlp
+            head.name: _mlp(in_features, mlp_mult=mlp_mult, bias=False, dropout=0.0) for head in heads if head.mlp
         },
         final_layers={
             head.name: Linear.Config(
@@ -435,11 +407,7 @@ def _hydra(
             )
             for head in heads
         },
-        scale_layers={
-            head.name: ScaleLayer.Config(n_features=head.output_size)
-            for head in heads
-            if head.scale
-        },
+        scale_layers={head.name: ScaleLayer.Config(n_features=head.output_size) for head in heads if head.scale},
     )
 
 

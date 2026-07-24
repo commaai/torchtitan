@@ -94,7 +94,4 @@ class PathOnnxCheckpointManager(OnnxCheckpointManager):
     def _input_dict(self, names: list[str]) -> dict[str, torch.Tensor]:
         shapes = dict(zip(self.input_names, self.input_shapes, strict=True))
         dtypes = dict(zip(self.input_names, self.input_dtypes, strict=True))
-        return {
-            name: torch.zeros(shapes[name], dtype=_ONNX_DTYPE_MAP[dtypes[name]])
-            for name in names
-        }
+        return {name: torch.zeros(shapes[name], dtype=_ONNX_DTYPE_MAP[dtypes[name]]) for name in names}
