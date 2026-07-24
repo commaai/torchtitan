@@ -115,11 +115,11 @@ class PathValidator(BaseValidator):
                     validation_segment_names.update(segment_names_from_info(input_dict["info"]))
                 input_dict = {k: v.to(device) for k, v in input_dict.items()}
                 targets = {k: v.to(device) for k, v in targets.items()}
-                local_samples = torch.tensor(next(iter(input_dict.values())).shape[0], dtype=torch.float32, device=device)
+                local_samples = torch.tensor(
+                    next(iter(input_dict.values())).shape[0], dtype=torch.float32, device=device
+                )
                 global_samples = (
-                    dist_utils.dist_sum(local_samples, batch_mesh)
-                    if batch_mesh is not None
-                    else local_samples
+                    dist_utils.dist_sum(local_samples, batch_mesh) if batch_mesh is not None else local_samples
                 )
 
                 with self.validation_context():
@@ -130,7 +130,8 @@ class PathValidator(BaseValidator):
                     infos = [parse_info(x) for x in input_dict["info"].cpu().numpy()]
                     arrays = {k: v.double().cpu().numpy().round(4) for k, v in pred.items()}
                     pred_records.extend(
-                        {"name": info["name"], "fidx": int(info["fidx"])} | {k: v[i].tolist() for k, v in arrays.items()}
+                        {"name": info["name"], "fidx": int(info["fidx"])}
+                        | {k: v[i].tolist() for k, v in arrays.items()}
                         for i, info in enumerate(infos)
                     )
 
@@ -149,7 +150,9 @@ class PathValidator(BaseValidator):
             samples = torch.as_tensor(total_samples, dtype=torch.float32, device=device)
             loss = float((torch.as_tensor(total_loss, dtype=torch.float32, device=device) / samples).item())
             extra_metrics = {
-                f"validation_metrics/path/{k}": float((torch.as_tensor(v, dtype=torch.float32, device=device) / samples).item())
+                f"validation_metrics/path/{k}": float(
+                    (torch.as_tensor(v, dtype=torch.float32, device=device) / samples).item()
+                )
                 for k, v in metric_sums.items()
             }
             extra_metrics["validation_metrics/dataset/unique_segments_seen"] = (
@@ -187,7 +190,7 @@ class PathValidator(BaseValidator):
             logger.warning(f"failed to save val predictions for step {step}", exc_info=True)
 
     def _submit_reports(self, step: int) -> None:
-        current_checkpoint = f'{self.training_id}/{step}'
+        current_checkpoint = f"{self.training_id}/{step}"
 
         def _run_report(TestCls: type, test_config: Any, wait_for_checkpoint_keys: list[str]) -> tuple[Any, ...]:
             for k in wait_for_checkpoint_keys:
@@ -198,32 +201,32 @@ class PathValidator(BaseValidator):
         report_specs: dict[str, ReportSpec] = {}
         for report_name, (TestCls, ReportConfigCls) in MODEL_REPORTS.items():
             report_config = ReportConfigCls(
-                rollout={'agent': {'supercombo': current_checkpoint, 'model_trained_fps': dataloader_config.fps}},
-                report_name=f'path_{report_name}',
+                rollout={"agent": {"supercombo": current_checkpoint, "model_trained_fps": dataloader_config.fps}},
+                report_name=f"path_{report_name}",
                 save_tmp=False,
                 format=ReportFormat.HTML,
                 miniray=self.miniray,
             )
             report_specs[report_name] = ReportSpec(
                 output_names=(report_name,),
-                output_types=('html',),
+                output_types=("html",),
                 steps=self.config.reports.get(report_name, []),
                 func=_run_report,
-                arguments=[TestCls, report_config, ['vision.onnx', 'vision.onnx.data', 'temporal_policy.onnx']],
+                arguments=[TestCls, report_config, ["vision.onnx", "vision.onnx.data", "temporal_policy.onnx"]],
             )
 
         for report_name, (TestCls, ReportConfigCls) in DATASET_REPORTS.items():
             report_config = ReportConfigCls(
                 route_list=dataloader_config.dataset,
                 pipeline_dir=dataloader_config.pipeline_dir,
-                report_name=f'path_{report_name}',
+                report_name=f"path_{report_name}",
                 save_tmp=False,
                 format=ReportFormat.HTML,
                 miniray=self.miniray,
             )
             report_specs[report_name] = ReportSpec(
                 output_names=(report_name,),
-                output_types=('html',),
+                output_types=("html",),
                 steps=self.config.reports.get(report_name, []),
                 func=_run_report,
                 arguments=[TestCls, report_config, []],
