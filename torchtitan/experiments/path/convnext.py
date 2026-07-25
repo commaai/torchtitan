@@ -85,7 +85,7 @@ CONVNEXT_FLAVORS = {
     "convnext_xxlarge": {
         "depths": (3, 4, 30, 3),
         "dims": (384, 768, 1536, 3072),
-        "pretrained": "convnext_xxlarge.clip_laion2b_soup_ft_in1k",
+        "pretrained": "convnext_xxlarge.clip_laion2b_soup",
     },
 }
 
