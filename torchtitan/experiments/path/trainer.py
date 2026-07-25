@@ -109,9 +109,7 @@ class PathTrainer(Trainer):
                 local_samples += next(iter(input_dict.values())).shape[0]
                 info = input_dict.get("info")
                 if info is not None:
-                    step_segment_names.update(
-                        name for name, _ in segment_names_and_fidxs_from_info(info)
-                    )
+                    step_segment_names.update(name for name, _ in segment_names_and_fidxs_from_info(info))
                 microbatches.append((input_dict, targets))
         sl.log_trace_scalar({"local_samples": int(local_samples)})
 

@@ -16,12 +16,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import distribute_tensor, DTensor
 
-from torchtitan.config import (
-    CompileConfig,
-    ParallelismConfig,
-    TORCH_DTYPE_MAP,
-    TrainingConfig,
-)
+from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import (
     ActivationCheckpointing,
@@ -29,10 +24,7 @@ from torchtitan.distributed.activation_checkpoint import (
     FullAC,
     MemoryBudgetAC,
 )
-from torchtitan.distributed.fsdp import (
-    enable_fsdp_symm_mem,
-    get_fsdp_reshard_after_forward_policy,
-)
+from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
 from torchtitan.models.common import Embedding, LayerNorm, Linear, RMSNorm, SiLU
 from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.protocols.model import BaseModel
