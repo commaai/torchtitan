@@ -9,12 +9,7 @@ from __future__ import annotations
 import math
 import os
 from functools import partial
-from xx.datasets.constants import (
-    BASE_DIR_GT,
-    BASE_DIR_GT_10M,
-    DEFAULT_TEST_5K_LIST_TAGGED,
-    DEFAULT_TRAIN_LIST,
-)
+from xx.datasets.constants import BASE_DIR_GT, BASE_DIR_GT_10M, DEFAULT_TEST_5K_LIST_TAGGED, DEFAULT_TRAIN_LIST
 from xx.ml_tools.constants.model import (
     frame_constants_from_fps,
     FRAME_TYPE,
@@ -25,23 +20,13 @@ from xx.ml_tools.constants.model import (
     TEMPORAL_INPUTS,
 )
 from xx.training.path.config import DatasetConfig as XXPathDatasetConfig
-from xx.training.path.hydra_configs import (
-    DRIVING_HEADS,
-    META_HEADS,
-    POSE_HEADS,
-    TEMPORAL_META_HEADS,
-)
+from xx.training.path.hydra_configs import DRIVING_HEADS, META_HEADS, POSE_HEADS, TEMPORAL_META_HEADS
 
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.components.tokenizer import NoOpTokenizer
-from torchtitan.config import (
-    CompileConfig,
-    DebugConfig,
-    ParallelismConfig,
-    TrainingConfig,
-)
+from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.models.common import Embedding, LayerNorm, Linear
 from torchtitan.models.common.attention import ScaledDotProductAttention

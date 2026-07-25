@@ -1,20 +1,22 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from xx.ml_tools.constants.model import ModelInputs
+from xx.training.lib.onnx_helpers import add_onnx_metadata, patch_depthwise_convs
 
 import onnx
 import torch
 import torch.nn as nn
 
-from xx.ml_tools.constants.model import ModelInputs
-from xx.training.lib.onnx_helpers import add_onnx_metadata, patch_depthwise_convs
-
 from torchtitan.components import fs
-from torchtitan.components.onnx_checkpoint import (
-    _ONNX_DTYPE_MAP,
-    OnnxCheckpointManager,
-    OnnxInputDType,
-)
+from torchtitan.components.onnx_checkpoint import _ONNX_DTYPE_MAP, OnnxCheckpointManager, OnnxInputDType
 
 from .model import PathModel
 

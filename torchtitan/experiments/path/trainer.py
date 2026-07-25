@@ -22,7 +22,7 @@ from torchtitan.trainer import Trainer
 
 from .loss import PathLoss
 from .onnx_checkpoint import PathOnnxCheckpointManager
-from .validate import PathValidator, segment_names_from_info
+from .validate import PathValidator, segment_names_and_fidxs_from_info
 
 
 class PathTrainer(Trainer):
@@ -107,8 +107,9 @@ class PathTrainer(Trainer):
             with sl.log_trace_span("fetching_batch"):
                 input_dict, targets = next(data_iterator)
                 local_samples += next(iter(input_dict.values())).shape[0]
-                if "info" in input_dict:
-                    step_segment_names.update(segment_names_from_info(input_dict["info"]))
+                info = input_dict.get("info")
+                if info is not None:
+                    step_segment_names.update(name for name, _ in segment_names_and_fidxs_from_info(info))
                 microbatches.append((input_dict, targets))
         sl.log_trace_scalar({"local_samples": int(local_samples)})
 
