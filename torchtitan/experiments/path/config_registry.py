@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import os
 from functools import partial
-from xx.datasets.constants import BASE_DIR_GT, BASE_DIR_GT_10M, DEFAULT_TEST_5K_LIST_TAGGED, DEFAULT_TRAIN_LIST
+from xx.datasets.constants import BASE_DIR_GT, BASE_DIR_GT_10M, DEFAULT_TEST_5K_LIST_TAGGED, DEFAULT_BIG_TRAIN_LIST
 from xx.ml_tools.constants.model import (
     frame_constants_from_fps,
     FRAME_TYPE,
@@ -76,10 +76,10 @@ def _dp_degrees() -> tuple[int, int]:
 
 
 def _path(flavor: str) -> PathTrainer.Config:
-    steps = 1024 * 100
+    steps = 1024 * 55
     validation_freq = 1024
     reports = {
-        name: [validation_freq, steps // 2, steps]
+        name: [validation_freq, validation_freq * 20, steps]
         for name in (
             "analyse_driving",
             "analyse_lat_no_noise",
@@ -102,7 +102,7 @@ def _path(flavor: str) -> PathTrainer.Config:
         model_spec=model_registry(flavor),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=_dataloader_config(
-            dataset=DEFAULT_TRAIN_LIST,
+            dataset=DEFAULT_BIG_TRAIN_LIST,
             split="train",
             fps=fps,
             plan_only=plan_only,
@@ -115,7 +115,7 @@ def _path(flavor: str) -> PathTrainer.Config:
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=1024,
             total_steps=steps,
-            decay_ratio=0.0,
+            decay_ratio=0.1,
             decay_type="linear",
             min_lr_factor=0.0,
         ),
@@ -188,7 +188,7 @@ def _model_config(flavor: str) -> PathModel.Config:
             input_frame_names=tuple(input_frame_names),
             in_channels=in_channels,
             vision_features=vision_features,
-            pretrained=False,
+            pretrained=True,
             drop_path_rate=0.2,
             mean=255 / 2,
             std=255 / 4,
@@ -299,8 +299,9 @@ def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnx
         interval=interval,
         input_names=input_names,
         input_shapes=input_shapes,
+        # WIP: activations sometimes overflow, should be addressed by tinygrad runner
         input_dtypes=["float16"] * len(input_names),
-        onnx_model_dtype="float16",  # WIP: test if fp16 doesn't degrade performance
+        onnx_model_dtype="float16",
         vision_input_names=vision_input_names,
         temporal_policy_input_names=temporal_policy_input_names,
     )
