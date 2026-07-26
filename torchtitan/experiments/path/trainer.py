@@ -186,7 +186,8 @@ class PathTrainer(Trainer):
                 ),
             )
             metric_sums = {
-                k: dist_utils.dist_sum(v, loss_mesh) for k, v in metric_sums.items()
+                name: dist_utils.dist_sum(metric_sums[name], loss_mesh)
+                for name in sorted(metric_sums)
             }
         else:
             global_avg_loss = global_max_loss = float(loss.detach().item())

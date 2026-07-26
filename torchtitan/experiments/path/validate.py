@@ -153,7 +153,10 @@ class PathValidator(BaseValidator):
                 batch_metric_sums = {k: v.float().sum() for k, v in metrics.items() if k != "loss"}
                 if self.parallel_dims.dp_cp_enabled:
                     loss_sum = dist_utils.dist_sum(loss_sum, loss_mesh)
-                    batch_metric_sums = {k: dist_utils.dist_sum(v, loss_mesh) for k, v in batch_metric_sums.items()}
+                    batch_metric_sums = {
+                        name: dist_utils.dist_sum(batch_metric_sums[name], loss_mesh)
+                        for name in sorted(batch_metric_sums)
+                    }
                 total_loss += loss_sum
                 total_samples += global_samples
                 for name, value in batch_metric_sums.items():

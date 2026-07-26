@@ -354,6 +354,7 @@ class Vision(Module):
         vision_features: int
         pretrained: bool
         drop_path_rate: float
+        norm_layer: str
         mean: float
         std: float
 
@@ -366,6 +367,7 @@ class Vision(Module):
             in_chans=config.in_channels,
             num_classes=config.vision_features,
             drop_path_rate=config.drop_path_rate,
+            norm_layer=config.norm_layer,
         )
         self.register_buffer(
             "_mean", torch.empty(1, config.in_channels, 1, 1), persistent=True

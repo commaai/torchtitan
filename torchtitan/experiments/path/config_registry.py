@@ -9,8 +9,13 @@ from __future__ import annotations
 import math
 import os
 from functools import partial
-from xx.datasets.constants import BASE_DIR_GT
-from xx.datasets.helpers import DEFAULT_TRAIN_LIST
+from xx.datasets.constants import (
+    BASE_DIR_GT,
+    BASE_DIR_GT_10M,
+    DEFAULT_TEST_5K_LIST_TAGGED,
+    DEFAULT_TRAIN_LIST,
+    DEFAULT_BIG_TRAIN_LIST,
+)
 from xx.ml_tools.constants.model import (
     frame_constants_from_fps,
     FRAME_TYPE,
@@ -27,10 +32,6 @@ from xx.training.path.hydra_configs import (
     POSE_HEADS,
     TEMPORAL_META_HEADS,
 )
-
-import torch
-import torch.nn as nn
-from torch.distributed.tensor import distribute_tensor, DTensor
 
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
@@ -71,31 +72,6 @@ from .trainer import PathTrainer
 from .validate import PathValidator
 
 
-_LINEAR_INIT = {
-    "weight": partial(nn.init.normal_, mean=0.0, std=0.02),
-    "bias": nn.init.zeros_,
-}
-_NORM_INIT = {"weight": nn.init.ones_, "bias": nn.init.zeros_}
-_PLAN_HEAD_INIT_STD = 1e-3
-_PLAN_HEAD_INIT_LOG_SIGMA_SCALE = 5.0
-
-# init is called after sharding, need to handle DTensor properly for the half point
-# bias init structure
-def _init_plan_head_bias(bias: nn.Parameter) -> None:
-    value = torch.zeros(bias.shape, dtype=bias.dtype, device=bias.device)
-    value[bias.shape[0] // 2 :].fill_(math.log(_PLAN_HEAD_INIT_LOG_SIGMA_SCALE))
-    if isinstance(bias, DTensor):
-        value = distribute_tensor(value, bias.device_mesh, bias.placements)
-    with torch.no_grad():
-        bias.copy_(value)
-
-
-_PLAN_HEAD_INIT = {
-    "weight": partial(nn.init.normal_, mean=0.0, std=_PLAN_HEAD_INIT_STD),
-    "bias": _init_plan_head_bias,
-}
-
-
 def model_registry(flavor: str) -> ModelSpec:
     return ModelSpec(
         name="path",
@@ -118,10 +94,10 @@ def _dp_degrees() -> tuple[int, int]:
 
 
 def _path(flavor: str) -> PathTrainer.Config:
-    steps = 1024 * 100
+    steps = 1024 * 30
     validation_freq = 1024
     reports = {
-        name: [validation_freq, steps // 2, steps]
+        name: []
         for name in (
             "analyse_driving",
             "analyse_lat_no_noise",
@@ -131,7 +107,7 @@ def _path(flavor: str) -> PathTrainer.Config:
             "analyse_hard_brake",
         )
     }
-    reports["analyse_dataset"] = [validation_freq]
+    reports["analyse_dataset"] = []
     mixed_precision_param = "bfloat16"
     num_nodes, local_world_size = _dp_degrees()
     reporterv2_host = os.getenv("REPORTERV2_HOST")
@@ -146,7 +122,7 @@ def _path(flavor: str) -> PathTrainer.Config:
         model_spec=model_registry(flavor),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=_dataloader_config(
-            dataset=DEFAULT_TRAIN_LIST,
+            dataset=DEFAULT_BIG_TRAIN_LIST,
             split="train",
             fps=fps,
             plan_only=plan_only,
@@ -159,12 +135,12 @@ def _path(flavor: str) -> PathTrainer.Config:
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=1024,
             total_steps=steps,
-            decay_ratio=0.0,
+            decay_ratio=0.,
             decay_type="linear",
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=16,
+            local_batch_size=64,
             global_batch_size=-1,
             seq_len=1,
             steps=steps,
@@ -196,19 +172,20 @@ def _path(flavor: str) -> PathTrainer.Config:
         validator=PathValidator.Config(
             enable=True,
             freq=validation_freq,
-            steps=32,
+            steps=8,
             dataloader=_dataloader_config(
                 split="val",
                 fps=fps,
-                plan_only=plan_only,
-                dataset=DEFAULT_TRAIN_LIST,
-                limit=None,
-                pipeline_dir=BASE_DIR_GT,
+                plan_only=True,
+                dataset=DEFAULT_TEST_5K_LIST_TAGGED,
+                limit=6_000,
+                pipeline_dir=BASE_DIR_GT_10M,
                 skip=1,
-                val_skip=1,
+                val_skip=6,
             ),
             mixed_precision_param=mixed_precision_param,
             reports=reports,
+            save_predictions=False,
         ),
         debug=DebugConfig(seed=0),
     )
@@ -238,8 +215,9 @@ def _model_config(flavor: str) -> PathModel.Config:
             input_frame_names=tuple(input_frame_names),
             in_channels=in_channels,
             vision_features=vision_features,
-            pretrained=False,
+            pretrained=True,
             drop_path_rate=0.2,
+            norm_layer="layer_norm",
             mean=255 / 2,
             std=255 / 4,
         ),
@@ -273,7 +251,6 @@ def _model_config(flavor: str) -> PathModel.Config:
                 pos_embedding=Embedding.Config(
                     num_embeddings=block_size,
                     embedding_dim=dim,
-                    param_init=_LINEAR_INIT,
                 ),
                 block_size=block_size,
                 dense_training_outputs=True,
@@ -348,7 +325,6 @@ def _checkpoint_config(
         keep_latest_k=0,  # keep all checkpoints
         enable=True,
         checkpoint_base_folder=base_folder,
-        save_model_state_dict=True,  # another copy of full state dict
         export_onnx=True,
         enable_first_step_checkpoint=True,
         folder=folder,
@@ -406,12 +382,12 @@ def _hidden_dim(dim: int, mlp_mult: float, multiple_of: int = 256) -> int:
 def _mlp(dim: int, *, mlp_mult: float, bias: bool, dropout: float) -> PathMLP.Config:
     hidden = _hidden_dim(dim, mlp_mult)
     return PathMLP.Config(
-        norm=LayerNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        norm=LayerNorm.Config(normalized_shape=dim),
         c_fc=Linear.Config(
-            in_features=dim, out_features=hidden, bias=bias, param_init=_LINEAR_INIT
+            in_features=dim, out_features=hidden, bias=bias
         ),
         c_proj=Linear.Config(
-            in_features=hidden, out_features=dim, bias=bias, param_init=_LINEAR_INIT
+            in_features=hidden, out_features=dim, bias=bias
         ),
         act="gelu_tanh",
         dropout=dropout,
@@ -424,10 +400,9 @@ def _encoder(in_features: int, dim: int) -> LinearEncoder.Config:
             in_features=in_features,
             out_features=dim,
             bias=True,
-            param_init=_LINEAR_INIT,
         ),
         out_layer=Linear.Config(
-            in_features=dim, out_features=dim, bias=False, param_init=_LINEAR_INIT
+            in_features=dim, out_features=dim, bias=False
         ),
     )
 
@@ -435,14 +410,14 @@ def _encoder(in_features: int, dim: int) -> LinearEncoder.Config:
 def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Config:
     head_dim = dim // n_head
     return PathSelfAttention.Config(
-        norm=LayerNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        q_norm=LayerNorm.Config(normalized_shape=head_dim, param_init=_NORM_INIT),
-        k_norm=LayerNorm.Config(normalized_shape=head_dim, param_init=_NORM_INIT),
+        norm=LayerNorm.Config(normalized_shape=dim),
+        q_norm=LayerNorm.Config(normalized_shape=head_dim),
+        k_norm=LayerNorm.Config(normalized_shape=head_dim),
         c_attn=Linear.Config(
-            in_features=dim, out_features=3 * dim, bias=True, param_init=_LINEAR_INIT
+            in_features=dim, out_features=3 * dim, bias=True
         ),
         c_proj=Linear.Config(
-            in_features=dim, out_features=dim, bias=True, param_init=_LINEAR_INIT
+            in_features=dim, out_features=dim, bias=True
         ),
         inner_attention=ScaledDotProductAttention.Config(),
         n_head=n_head,
@@ -466,7 +441,6 @@ def _hydra(
                 in_features=in_features,
                 out_features=head.output_size,
                 bias=True,
-                param_init=(_PLAN_HEAD_INIT if head.name == "plan" else _LINEAR_INIT),
             )
             for head in heads
         },

@@ -16,6 +16,7 @@ from torchtitan.components.onnx_checkpoint import (
     OnnxInputDType,
 )
 
+from .convnext_onnx import promote_convnext_stage2_residual_path
 from .model import PathModel
 
 
@@ -84,6 +85,13 @@ class PathOnnxCheckpointManager(OnnxCheckpointManager):
     def _post_export_hook(self, onnx_data: bytes) -> bytes:
         onnx_data = patch_depthwise_convs(onnx_data)
         onnx_model = onnx.load_from_string(onnx_data)
+        if self.onnx_model_dtype == torch.float16:
+            promoted_blocks = promote_convnext_stage2_residual_path(
+                onnx_model,
+                require_match=True,
+            )
+            if promoted_blocks:
+                onnx.checker.check_model(onnx_model)
         add_onnx_metadata(
             onnx_model,
             exporter_name="comma_torchtitan",
