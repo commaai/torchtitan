@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from xx.ml_tools.constants.model import ModelInputs
+from xx.ml_tools.constants.model import frame_constants_from_fps, ModelInputs, TEMPORAL_INPUTS
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,7 @@ from einops import rearrange
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import distribute_tensor, DTensor
+from torch.utils.flop_counter import FlopCounterMode
 
 from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
@@ -417,7 +418,14 @@ class PathModel(BaseModel):
 
         def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
             nparams = sum(p.numel() for p in model.parameters())
-            return nparams, 2 * nparams
+            inputs = PathModel.example_inputs(
+                self,
+                device=next(model.parameters()).device,
+            )
+            with torch.no_grad(), FlopCounterMode(display=False) as counter:
+                model(inputs)
+            # MFU convention estimates backward as twice the counted forward work.
+            return nparams, 3 * counter.get_total_flops()
 
     def __init__(self, config: Config):
         super().__init__()
@@ -425,6 +433,52 @@ class PathModel(BaseModel):
         self.vision = config.vision.build()
         self.point_policy = config.point_policy.build()
         self.temporal_policy = config.temporal_policy.build()
+
+    @staticmethod
+    def input_shapes(
+        config: PathModel.Config,
+        batch_size: int = 1,
+    ) -> dict[str, tuple[int, ...]]:
+        frame_constants = frame_constants_from_fps(
+            n_frames=config.n_frames_input,
+            frame_type=config.frame_type,
+        )
+        history_len = len(frame_constants["history_idxs"])
+        temporal_len = frame_constants["temporal_len"]
+        shapes = {
+            name: (batch_size, history_len, *frame_constants["frame_shapes"][name])
+            for name in config.vision.input_frame_names
+        }
+        shapes.update(
+            {
+                name: (batch_size, temporal_len, *shape)
+                for name, shape in TEMPORAL_INPUTS.items()
+                if name != ModelInputs.FEATURES
+            }
+        )
+        return shapes
+
+    @staticmethod
+    def input_dtypes(config: PathModel.Config) -> dict[str, torch.dtype]:
+        dtypes = dict.fromkeys(config.vision.input_frame_names, torch.uint8)
+        for name in TEMPORAL_INPUTS:
+            if name != ModelInputs.FEATURES:
+                dtypes[name] = torch.float32
+        return dtypes
+
+    @classmethod
+    def example_inputs(
+        cls,
+        config: PathModel.Config,
+        *,
+        batch_size: int = 1,
+        device: torch.device | str = "meta",
+    ) -> dict[str, torch.Tensor]:
+        dtypes = cls.input_dtypes(config)
+        return {
+            name: torch.zeros(shape, dtype=dtypes[name], device=device)
+            for name, shape in cls.input_shapes(config, batch_size).items()
+        }
 
     def verify_module_protocol(self) -> None:
         pass
