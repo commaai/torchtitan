@@ -76,10 +76,10 @@ def _dp_degrees() -> tuple[int, int]:
 
 
 def _path(flavor: str) -> PathTrainer.Config:
-    steps = 1024 * 55
+    steps = 1024 * 30
     validation_freq = 1024
     reports = {
-        name: [validation_freq, validation_freq * 20, steps]
+        name: [validation_freq, validation_freq * 15, steps]
         for name in (
             "analyse_driving",
             "analyse_lat_no_noise",
@@ -89,7 +89,7 @@ def _path(flavor: str) -> PathTrainer.Config:
             "analyse_hard_brake",
         )
     }
-    reports["analyse_dataset"] = [validation_freq]
+    reports["analyse_dataset"] = []
     mixed_precision_param = "bfloat16"
     num_nodes, local_world_size = _dp_degrees()
     reporterv2_host = os.getenv("REPORTERV2_HOST")
@@ -121,7 +121,7 @@ def _path(flavor: str) -> PathTrainer.Config:
         ),
         training=TrainingConfig(
             local_batch_size=16,
-            global_batch_size=-1,
+            global_batch_size=2048,
             seq_len=1,
             steps=steps,
             max_norm=1.0,
@@ -176,7 +176,6 @@ def _model_config(flavor: str) -> PathModel.Config:
     frame_constants = frame_constants_from_fps(n_frames=n_frames_input, frame_type=input_frame_type)
     in_channels = sum(frame_constants["frame_shapes"][name][0] for name in input_frame_names)
     block_size = len(frame_constants["history_idxs"])
-    temporal_len = frame_constants["temporal_len"]
     dim = vision_features
 
     return PathModel.Config(
@@ -204,7 +203,7 @@ def _model_config(flavor: str) -> PathModel.Config:
             temporal_summarizer=TemporalSummarizer.Config(
                 mlp1=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
                 mlp2=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
-                desire_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.DESIRE][0] * temporal_len, dim),
+                desire_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.DESIRE][0], dim),
                 traffic_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0], dim),
                 action_t_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.ACTION_T][0], dim),
                 transformer=PathTransformer.Config(

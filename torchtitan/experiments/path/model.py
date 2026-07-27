@@ -218,7 +218,7 @@ class TemporalSummarizer(Module):
     ) -> torch.Tensor:
         feats = self.mlp1(feats) + feats
         feats = self.mlp2(feats) + feats
-        desire = rearrange(self.desire_encoder(desire), "b c -> b () c")
+        desire = self.desire_encoder(desire)
         traffic_convention = rearrange(self.traffic_encoder(traffic_convention), "b c -> b () c")
         action_t = rearrange(self.action_t_encoder(action_t), "b c -> b () c")
         pos = self.pos_embedding(torch.arange(self.block_size, device=feats.device))
@@ -289,6 +289,20 @@ class TemporalPolicy(Module):
         device = buffer_device if buffer_device is not None else self.history_idxs.device
         self.history_idxs = torch.tensor(self.config.history_idxs, dtype=torch.long, device=device)
 
+    @staticmethod
+    def _desire_age(desire_pulse_BTC: torch.Tensor) -> torch.Tensor:
+        # B: batch, T: history, C: desire type. 1 means no pulse; -1 means unknown.
+        age_BC = torch.ones_like(desire_pulse_BTC[:, 0])
+        unknown_BC = -age_BC
+        zero_BC = torch.zeros_like(age_BC)
+        age_steps = []
+        for desire_pulse_BC in desire_pulse_BTC.unbind(dim=1):
+            age_BC = torch.where(age_BC < 0, age_BC, (age_BC + 1 / desire_pulse_BTC.shape[1]).clamp(max=1))
+            age_BC = torch.where(desire_pulse_BC < 0, unknown_BC, age_BC)
+            age_BC = torch.where(desire_pulse_BC > 0.5, zero_BC, age_BC)
+            age_steps.append(age_BC)
+        return torch.stack(age_steps, dim=1)
+
     def forward(
         self,
         features: torch.Tensor,
@@ -297,10 +311,10 @@ class TemporalPolicy(Module):
         action_t: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         dtype = features.dtype
-        stacked_desire = rearrange(desire_pulse.to(dtype), "b t c -> b (t c)")
+        desire_age_BTC = self._desire_age(desire_pulse)[:, self.history_idxs].to(dtype)
         summary = self.temporal_summarizer(
             features[:, self.history_idxs],
-            stacked_desire,
+            desire_age_BTC,
             traffic_convention[:, -1].to(dtype),
             action_t[:, -1].to(dtype),
         )
