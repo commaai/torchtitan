@@ -47,6 +47,9 @@ from torchtitan.tools.logging import logger
 PLAN_SIZE = 15 * 33 * 2
 PLAN_HEAD_INIT_STD = 1e-3
 PLAN_HEAD_INIT_LOG_SIGMA_SCALE = 5.0
+FIDX_MAX = 49.0
+TIMESTEP_COMPONENTS = 2
+TIMESTEP_FREQUENCY_EMBEDDING_SIZE = 256
 TORCH_DTYPE_MAP = {
     "float16": torch.float16,
     "float32": torch.float32,
@@ -549,7 +552,12 @@ class TimestepEmbedder(nn.Module):
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
     def forward(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        t_emb = self.mlp(self.timestep_embedding(t).to(self.mlp[0].weight.dtype))
+        if t.shape[-1] != TIMESTEP_COMPONENTS:
+            raise ValueError(
+                f"expected timestep components [video, pose], got shape {tuple(t.shape)}"
+            )
+        t_freqs = self.timestep_embedding(t).flatten(start_dim=-2)
+        t_emb = self.mlp(t_freqs.to(self.mlp[0].weight.dtype))
         return self.to_t6(t_emb), self.to_t2(t_emb)
 
     def init_weights(self) -> None:
@@ -621,7 +629,16 @@ class SelfAttention(nn.Module):
             self.k_norm(k)
         )
 
-        if self.config.attention_impl == "FLEX":
+        if self.config.attention_impl == "FLEX" and input_mask is None:
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.config.attn_pdrop if self.training else 0.0,
+                scale=1.0 / math.sqrt(self.head_dim),
+            ).transpose(1, 2)
+        elif self.config.attention_impl == "FLEX":
             assert self.flex_attention is not None
             y = self.flex_attention(
                 q,
@@ -812,22 +829,18 @@ class WorldModel(BaseModel):
         in_channels: int
         out_channels: int
         pose_size: int
+        pose_min: tuple[float, ...]
+        pose_max: tuple[float, ...]
+        pose_mean: tuple[float, ...]
+        pose_std: tuple[float, ...]
         time_factor: float
         compressor_mean: float
         compressor_std: float
         transformer: TransformerConfig
         plan_head: TransformerConfig
-        experimental_pose_only_xy: bool
+        experimental_planar: bool
         x_embedder: PatchEmbedderLinearsConfig = field(init=False)
-        augments_pos_ref_augment_embedder: ConditioningEmbedderLinearsConfig = field(
-            init=False
-        )
-        ref_augment_from_augments_euler_embedder: ConditioningEmbedderLinearsConfig = (
-            field(init=False)
-        )
-        pose_mask_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         t_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
-        fidx_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         blocks: list[DiTBlockLinearsConfig] = field(init=False)
         final_layer: FinalLayerLinearsConfig | None = field(init=False)
         plan_head_linears: PlanHeadLinearsConfig | None = field(init=False)
@@ -844,48 +857,56 @@ class WorldModel(BaseModel):
         def num_patches(self) -> int:
             return self.num_spatial_patches * self.num_temporal_patches
 
+        @property
+        def pose_channels(self) -> int:
+            return self.in_channels
+
+        @property
+        def model_in_channels(self) -> int:
+            return self.in_channels + self.pose_channels + 1
+
+        @property
+        def model_out_channels(self) -> int:
+            return self.out_channels + self.pose_channels
+
         def __post_init__(self) -> None:
             self._sync_derived_fields()
 
         def _sync_derived_fields(self) -> None:
+            pose_stats = {
+                "pose_min": self.pose_min,
+                "pose_max": self.pose_max,
+                "pose_mean": self.pose_mean,
+                "pose_std": self.pose_std,
+            }
+            for name, values in pose_stats.items():
+                if len(values) != self.pose_size:
+                    raise ValueError(
+                        f"{name} must have {self.pose_size} values, got {len(values)}"
+                    )
+            if any(lo >= hi for lo, hi in zip(self.pose_min, self.pose_max, strict=True)):
+                raise ValueError("each pose_min value must be smaller than pose_max")
+            if any(std <= 0 for std in self.pose_std):
+                raise ValueError("pose_std values must be positive")
             self.transformer.block_size = self.num_patches
             self.transformer.attention_mask_mini_block_size = self.num_spatial_patches
             self.plan_head.n_embd = self.transformer.n_embd
             hidden = self.transformer.n_embd
-            pose_half = self.pose_size // 2
             current_blocks = getattr(self, "blocks", [])
             current_final = getattr(self, "final_layer", None)
             current_plan = getattr(self, "plan_head_linears", None)
 
             self.x_embedder = PatchEmbedderLinearsConfig(
                 linear=linear_config(
-                    self.in_channels * math.prod(self.patch_size),
+                    self.model_in_channels * math.prod(self.patch_size),
                     hidden,
                     current=getattr(getattr(self, "x_embedder", None), "linear", None),
                 )
             )
-            self.augments_pos_ref_augment_embedder = (
-                conditioning_embedder_linears_config(
-                    pose_half,
-                    hidden,
-                    getattr(self, "augments_pos_ref_augment_embedder", None),
-                )
-            )
-            self.ref_augment_from_augments_euler_embedder = (
-                conditioning_embedder_linears_config(
-                    pose_half,
-                    hidden,
-                    getattr(self, "ref_augment_from_augments_euler_embedder", None),
-                )
-            )
-            self.pose_mask_embedder = conditioning_embedder_linears_config(
-                2, hidden, getattr(self, "pose_mask_embedder", None)
-            )
             self.t_embedder = conditioning_embedder_linears_config(
-                256, hidden, getattr(self, "t_embedder", None)
-            )
-            self.fidx_embedder = conditioning_embedder_linears_config(
-                50, hidden, getattr(self, "fidx_embedder", None)
+                TIMESTEP_COMPONENTS * TIMESTEP_FREQUENCY_EMBEDDING_SIZE,
+                hidden,
+                getattr(self, "t_embedder", None),
             )
             self.blocks = [
                 dit_block_linears_config(
@@ -898,7 +919,7 @@ class WorldModel(BaseModel):
                 FinalLayerLinearsConfig(
                     linear=linear_config(
                         hidden,
-                        math.prod(self.patch_size) * self.out_channels,
+                        math.prod(self.patch_size) * self.model_out_channels,
                         bias=True,
                         current=None if current_final is None else current_final.linear,
                     )
@@ -952,23 +973,8 @@ class WorldModel(BaseModel):
         self.x_embedder = PatchEmbedder(
             config.patch_size, config.x_embedder, config.transformer.norm
         )
-        pose_half = config.pose_size // 2
-        self.position_scale = ScaleLayer(pose_half)
-        self.euler_scale = ScaleLayer(pose_half)
-        self.augments_pos_ref_augment_embedder = ContinuousEmbedder(
-            config.augments_pos_ref_augment_embedder
-        )
-        self.ref_augment_from_augments_euler_embedder = ContinuousEmbedder(
-            config.ref_augment_from_augments_euler_embedder
-        )
-        self.pose_mask_embedder = DiscreteEmbedder(
-            2, config.transformer.n_embd, config.pose_mask_embedder
-        )
         self.t_embedder = TimestepEmbedder(
             config.t_embedder, time_factor=config.time_factor
-        )
-        self.fidx_embedder = DiscreteEmbedder(
-            50, config.transformer.n_embd, config.fidx_embedder
         )
         self.blocks = nn.ModuleList(
             DiTBlock(config, config.blocks[i])
@@ -986,6 +992,18 @@ class WorldModel(BaseModel):
         )
         self.register_buffer(
             "pos_embed", torch.empty(1, config.num_patches, config.transformer.n_embd)
+        )
+        self.register_buffer(
+            "pose_min", torch.tensor(config.pose_min, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "pose_max", torch.tensor(config.pose_max, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "pose_mean", torch.tensor(config.pose_mean, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "pose_std", torch.tensor(config.pose_std, dtype=torch.float32)
         )
         self.mask: TensorOrMask | None = None
         self.init_states(buffer_device=self.pos_embed.device)
@@ -1028,6 +1046,15 @@ class WorldModel(BaseModel):
             temporal, "() t d -> () (t n) d", n=self.config.num_spatial_patches
         )
         self.pos_embed[:] = spatial + temporal
+        for name in ("pose_min", "pose_max", "pose_mean", "pose_std"):
+            buffer = getattr(self, name)
+            buffer.copy_(
+                torch.tensor(
+                    getattr(self.config, name),
+                    device=buffer.device,
+                    dtype=buffer.dtype,
+                )
+            )
 
     def init_states(self, *, buffer_device: torch.device | None = None) -> None:
         device = buffer_device or self.pos_embed.device
@@ -1062,11 +1089,76 @@ class WorldModel(BaseModel):
     def unscale_latents(self, latents: torch.Tensor) -> torch.Tensor:
         return latents * self.config.compressor_std + self.config.compressor_mean
 
-    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+    def normalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
+        pose_min = self.pose_min.to(device=pose.device, dtype=pose.dtype)
+        pose_max = self.pose_max.to(device=pose.device, dtype=pose.dtype)
+        pose_mean = self.pose_mean.to(device=pose.device, dtype=pose.dtype)
+        pose_std = self.pose_std.to(device=pose.device, dtype=pose.dtype)
+        pose = pose.clamp(min=pose_min, max=pose_max)
+        return (pose - pose_mean) / pose_std
+
+    def denormalize_pose(self, pose: torch.Tensor) -> torch.Tensor:
+        pose_mean = self.pose_mean.to(device=pose.device, dtype=pose.dtype)
+        pose_std = self.pose_std.to(device=pose.device, dtype=pose.dtype)
+        pose = pose * pose_std + pose_mean
+        if self.config.experimental_planar:
+            pose = pose * pose.new_tensor((1.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+        return pose
+
+    def encode_pose(
+        self,
+        pose: torch.Tensor,
+        *,
+        height: int | None = None,
+        width: int | None = None,
+    ) -> torch.Tensor:
+        if pose.shape[-1] != self.config.pose_size:
+            raise ValueError(
+                f"expected pose size {self.config.pose_size}, got {pose.shape[-1]}"
+            )
+        pose = self.normalize_pose(pose)
+        if self.config.experimental_planar:
+            component_mask = pose.new_tensor((1.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+            pose = pose * component_mask
+        height = self.config.input_size[1] if height is None else height
+        width = self.config.input_size[2] if width is None else width
+        volume = self.config.pose_channels * height * width
+        repeats = math.ceil(volume / self.config.pose_size)
+        return (
+            pose.repeat(*([1] * (pose.ndim - 1)), repeats)[..., :volume]
+            .reshape(*pose.shape[:-1], self.config.pose_channels, height, width)
+        )
+
+    def decode_pose(
+        self, pose_plane: torch.Tensor, *, denormalize: bool = False
+    ) -> torch.Tensor:
+        if pose_plane.ndim != 5:
+            raise ValueError(
+                f"expected pose plane [B,T,C,H,W], got {tuple(pose_plane.shape)}"
+            )
+        flat = pose_plane.flatten(start_dim=2)
+        complete = (flat.shape[-1] // self.config.pose_size) * self.config.pose_size
+        if complete == 0:
+            raise ValueError("pose plane is too small to contain one pose")
+        pose = flat[..., :complete].reshape(
+            *flat.shape[:-1], -1, self.config.pose_size
+        ).mean(dim=-2)
+        return self.denormalize_pose(pose) if denormalize else pose
+
+    def encode_fidx(
+        self, fidx: torch.Tensor, *, height: int, width: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        fidx = fidx.to(dtype=dtype).clamp(0.0, FIDX_MAX)
+        fidx = 2.0 * fidx / FIDX_MAX - 1.0
+        return fidx[..., None, None, None].expand(-1, -1, 1, height, width)
+
+    def unpatchify(
+        self, x: torch.Tensor, *, channels: int | None = None
+    ) -> torch.Tensor:
         return einops.rearrange(
             x,
             "b (t h w) (c pt ph pw) -> b (t pt) c (h ph) (w pw)",
-            c=self.config.out_channels,
+            c=self.config.out_channels if channels is None else channels,
             pt=self.config.patch_size[0],
             ph=self.config.patch_size[1],
             pw=self.config.patch_size[2],
@@ -1078,12 +1170,13 @@ class WorldModel(BaseModel):
         self,
         x: torch.Tensor,
         t: torch.Tensor,
-        augments_pos_ref_augment: torch.Tensor,
-        ref_augment_from_augments_euler: torch.Tensor,
-        pose_mask: torch.Tensor,
-        fidx: torch.Tensor,
+        augments_pos_ref_augment: torch.Tensor | None = None,
+        ref_augment_from_augments_euler: torch.Tensor | None = None,
+        pose_mask: torch.Tensor | None = None,
+        fidx: torch.Tensor | None = None,
         return_plan: bool = True,
         input_pos_mask_pair: Any | None = None,
+        pose_x: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if input_pos_mask_pair is None:
             input_pos, input_mask = None, self.mask
@@ -1093,12 +1186,49 @@ class WorldModel(BaseModel):
                 input_pos_mask_pair.input_mask,
             )
 
-        if self.config.experimental_pose_only_xy:
-            augments_pos_ref_augment = augments_pos_ref_augment * (
-                augments_pos_ref_augment.new_tensor((1.0, 1.0, 0.0))
+        # Keep the legacy inference call shape usable while stage 2 migrates its
+        # wrapper: pose_mask is translated to a pose noise endpoint, never
+        # embedded as a separate AdaLN condition.
+        if t.ndim == 2:
+            pose_t = (
+                torch.zeros_like(t)
+                if pose_mask is None
+                else pose_mask.to(device=t.device, dtype=t.dtype)
             )
-            ref_augment_from_augments_euler = ref_augment_from_augments_euler * (
-                ref_augment_from_augments_euler.new_tensor((0.0, 0.0, 1.0))
+            t = torch.stack((t, pose_t), dim=-1)
+        if t.ndim != 3 or t.shape[-1] != TIMESTEP_COMPONENTS:
+            raise ValueError(f"expected t shape [B,T,2], got {tuple(t.shape)}")
+        if pose_x is None:
+            if (
+                augments_pos_ref_augment is None
+                or ref_augment_from_augments_euler is None
+            ):
+                raise ValueError("raw pose inputs or pose_x must be provided")
+            pose = torch.cat(
+                (augments_pos_ref_augment, ref_augment_from_augments_euler), dim=-1
+            )
+            pose_x = self.encode_pose(
+                pose, height=x.shape[-2], width=x.shape[-1]
+            )
+            pose_t = t[..., 1].to(device=pose_x.device, dtype=pose_x.dtype)
+            pose_noise = torch.randn_like(pose_x)
+            pose_x = (
+                (1.0 - pose_t[..., None, None, None]) * pose_x
+                + pose_t[..., None, None, None] * pose_noise
+            )
+        if fidx is None:
+            raise ValueError("fidx must be provided")
+        pose_x = pose_x.to(device=x.device, dtype=x.dtype)
+        fidx_plane = self.encode_fidx(
+            fidx,
+            height=x.shape[-2],
+            width=x.shape[-1],
+            dtype=x.dtype,
+        ).to(device=x.device)
+        if pose_x.shape != x.shape:
+            raise ValueError(
+                f"pose_x must match video x shape, got {tuple(pose_x.shape)} "
+                f"and {tuple(x.shape)}"
             )
         pos_embed = (
             self.pos_embed[:, input_pos] if input_pos is not None else self.pos_embed
@@ -1110,27 +1240,25 @@ class WorldModel(BaseModel):
             else None
         )
 
-        x = self.x_embedder(x) + pos_embed
-        augments_pos_ref_augment = self.position_scale(augments_pos_ref_augment)
-        ref_augment_from_augments_euler = self.euler_scale(
-            ref_augment_from_augments_euler
-        )
+        x = self.x_embedder(torch.cat((x, pose_x, fidx_plane), dim=2)) + pos_embed
         t6, t2 = self.t_embedder(t)
-        pos6, pos2 = self.augments_pos_ref_augment_embedder(augments_pos_ref_augment)
-        euler6, euler2 = self.ref_augment_from_augments_euler_embedder(
-            ref_augment_from_augments_euler
-        )
-        pose_mask6, pose_mask2 = self.pose_mask_embedder(pose_mask)
-        fidx6, fidx2 = self.fidx_embedder(fidx)
-        t6 = t6 + pos6 + euler6 + pose_mask6 + fidx6
-        t2 = t2 + pos2 + euler2 + pose_mask2 + fidx2
         for block in self.blocks:
             x = block(x, t6, input_pos, input_pos_t, input_mask)
         outputs = {}
         if return_plan and self.plan_head is not None:
             outputs["plan"] = self.plan_head(x[:, -1, :])
         if self.final_layer is not None:
-            outputs["sample"] = self.unpatchify(self.final_layer(x, t2, input_pos_t))
+            sample = self.unpatchify(
+                self.final_layer(x, t2, input_pos_t),
+                channels=self.config.model_out_channels,
+            )
+            outputs["sample"] = sample[:, :, : self.config.out_channels]
+            pose_sample = sample[:, :, self.config.out_channels :]
+            outputs["pose_sample"] = pose_sample
+            pose_denoised = pose_x + t[..., 1, None, None, None].to(
+                dtype=pose_sample.dtype
+            ) * pose_sample
+            outputs["pose"] = self.decode_pose(pose_denoised, denormalize=True)
         return outputs
 
 
@@ -1218,14 +1346,7 @@ def _apply_compile(model: WorldModel, compile_config: CompileConfig) -> None:
     torch._dynamo.config.capture_scalar_outputs = True
     torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
     for module in (
-        model.x_embedder,
-        model.position_scale,
-        model.euler_scale,
-        model.augments_pos_ref_augment_embedder,
-        model.ref_augment_from_augments_euler_embedder,
-        model.pose_mask_embedder,
         model.t_embedder,
-        model.fidx_embedder,
     ):
         module.compile(backend=compile_config.backend, fullgraph=True)
     for block in model.blocks:
@@ -1274,13 +1395,7 @@ def _apply_fsdp(
 
     for module in (
         model.x_embedder,
-        model.position_scale,
-        model.euler_scale,
-        model.augments_pos_ref_augment_embedder,
-        model.ref_augment_from_augments_euler_embedder,
-        model.pose_mask_embedder,
         model.t_embedder,
-        model.fidx_embedder,
     ):
         fully_shard(module, **fsdp_config, reshard_after_forward=reshard_after_forward)
 

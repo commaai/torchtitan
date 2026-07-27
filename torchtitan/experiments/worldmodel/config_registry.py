@@ -55,10 +55,10 @@ __all__ = [
 
 
 def worldmodel() -> WorldModelTrainer.Config:
-    local_batch_size = 16
+    local_batch_size = 32
     validation_freq = 512
     steps = validation_freq * 30
-    validation_steps = 8
+    validation_steps = 4
     compile_config = CompileConfig(enable=True, components=["model", "loss"])
     optimizer = default_adamw(lr=2e-4, weight_decay=1e-2)
     optimizer.implementation = "fused_opt_states_bf16"
@@ -73,7 +73,12 @@ def worldmodel() -> WorldModelTrainer.Config:
             compressor_in_channels="auto",
         ),
         model_spec=model_registry("base"),
-        dataloader=_dataloader_config(split="train"),
+        dataloader=_dataloader_config(
+            split="train",
+            dataset=DEFAULT_10M_TRAIN_LIST,
+            future_size_frames=0,
+            inference_prefill_frames=0,
+        ),
         optimizer=optimizer,
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2 * validation_freq,
@@ -84,7 +89,7 @@ def worldmodel() -> WorldModelTrainer.Config:
         ),
         training=TrainingConfig(
             local_batch_size=local_batch_size,
-            global_batch_size=local_batch_size * world_size * 2,  # 2 grad acc
+            global_batch_size=local_batch_size * world_size,
             seq_len=1,
             steps=steps,
             max_norm=1.0,
@@ -123,22 +128,30 @@ def worldmodel() -> WorldModelTrainer.Config:
                 "dataloader",
                 "train_state",
             ],
-            export_torch_package=True,
+            export_torch_package=False,
         ),
         validator=WorldModelValidator.Config(
             enable=True,
             freq=validation_freq,
             steps=validation_steps,
-            dataloader=_dataloader_config(split="val", fill_once=True),
+            dataloader=_dataloader_config(
+                split="val",
+                dataset=DEFAULT_10M_TRAIN_LIST,
+                future_size_frames=0,
+                inference_prefill_frames=0,
+                fill_once=True,
+            ),
             pose_dropout=0.0,
+            pose_clean_prob=0.5,
             noise_scheduler_steps=10,
             no_noise_prefill_frames_prob=0.0,
             fake_timesteps_prob=0.0,
         ),
         pose_dropout=0.1,
+        pose_clean_prob=0.5,
         noise_scheduler_steps=10,
-        no_noise_prefill_frames_prob=0.5,
-        fake_timesteps_prob=0.5,
+        no_noise_prefill_frames_prob=0.0,
+        fake_timesteps_prob=0.0,
         debug=DebugConfig(seed=0),
     )
 

@@ -86,6 +86,7 @@ def _prepare_worldmodel_batch(
     no_noise_prefill_frames_prob: float,
     fake_timesteps_prob: float,
     train: bool,
+    pose_clean_prob: float = 0.5,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     latents = tokenizer.encode(input_dict, device=device, dtype=dtype)
     augments = (
@@ -96,54 +97,73 @@ def _prepare_worldmodel_batch(
         .to(device=device, dtype=dtype)
         .clone()
     )
-    fidxs = input_dict["fidxs"].to(device=device, dtype=torch.int64)
+    poses = torch.cat((augments, eulers), dim=-1)
+    fidxs = input_dict["fidxs"].to(device=device, dtype=torch.float32)
     targets = _tensor_dict_to_device(targets, device)
     batch_size, num_frames = latents.shape[:2]
 
+    if inference_prefill_frames != 0 or future_size_frames != 0:
+        raise ValueError(
+            "bidirectional stage-1 training requires zero prefill and future frames"
+        )
+    if no_noise_prefill_frames_prob != 0.0 or fake_timesteps_prob != 0.0:
+        raise ValueError(
+            "bidirectional stage-1 training does not support prefill or fake timesteps"
+        )
+
     with torch.no_grad():
         latents = model.scale_latents(latents)
-        noise = torch.randn_like(latents)
+        latent_noise = torch.randn_like(latents)
         if train:
-            timesteps = scheduler.sample_timestep((batch_size,))
+            video_t = scheduler.sample_timestep((batch_size,))
         else:
             indexes = torch.randint(
                 0, discrete_timesteps.numel(), (batch_size,), device=device
             )
-            timesteps = discrete_timesteps[indexes]
-        timesteps = einops.repeat(timesteps, "b -> b t", t=num_frames).clone()
+            video_t = discrete_timesteps[indexes]
+        video_t = einops.repeat(video_t, "b -> b t", t=num_frames).clone()
 
-        pose_mask = torch.ones(
-            (batch_size, num_frames), device=device, dtype=torch.bool
+        # Per-clip modality mixture: fully noised pose, clean pose conditioning,
+        # then joint video/pose diffusion for the remaining probability mass.
+        pose_mode = torch.rand((batch_size, 1), device=device)
+        drop_pose = pose_mode < pose_dropout
+        clean_pose = (pose_mode >= pose_dropout) & (
+            pose_mode < pose_dropout + pose_clean_prob
         )
-        if inference_prefill_frames < num_frames:
-            drop = torch.rand((batch_size, 1), device=device) < pose_dropout
-            pose_mask[:, inference_prefill_frames:] = drop
-        augments[pose_mask] = 0
-        eulers[pose_mask] = 0
+        pose_t = torch.where(
+            clean_pose,
+            scheduler.no_noise_timestep.to(device=device, dtype=video_t.dtype),
+            video_t,
+        )
+        pose_t = torch.where(
+            drop_pose,
+            scheduler.full_noise_timestep.to(device=device, dtype=pose_t.dtype),
+            pose_t,
+        )
+        pose_t = torch.where(
+            fidxs == 0,
+            scheduler.full_noise_timestep.to(device=device, dtype=pose_t.dtype),
+            pose_t,
+        )
 
-        mask = torch.ones_like(latents, device=device, dtype=torch.bool)
-        fake_timesteps = timesteps.clone()
-        if torch.rand((), device=device) < no_noise_prefill_frames_prob:
-            end = min(inference_prefill_frames, num_frames)
-            mask[:, :end] = False
-            timesteps[:, :end] = scheduler.no_noise_timestep
-            fake_timesteps[:, :end] = scheduler.no_noise_timestep
-            start = min(future_size_frames, end)
-            if start < end and torch.rand((), device=device) < fake_timesteps_prob:
-                fake_timesteps[:, start:end] = scheduler.sample_timestep(
-                    (batch_size, end - start)
-                )
-                mask[:, start:] = True
-
-        noisy_latents = scheduler.add_noise(latents, noise, fake_timesteps)
-        targets = {**targets, "v": latents - noise, "mask": mask}
+        pose_clean = model.encode_pose(
+            poses, height=latents.shape[-2], width=latents.shape[-1]
+        )
+        pose_noise = torch.randn_like(pose_clean)
+        noisy_latents = scheduler.add_noise(latents, latent_noise, video_t)
+        noisy_pose = scheduler.add_noise(pose_clean, pose_noise, pose_t)
+        targets = {
+            **targets,
+            "v": latents - latent_noise,
+            "mask": torch.ones_like(latents, device=device, dtype=torch.bool),
+            "pose_v": pose_clean - pose_noise,
+            "pose_loss_mask": (pose_t > scheduler.no_noise_timestep) & (fidxs != 0),
+        }
 
     return {
         "x": noisy_latents,
-        "t": timesteps,
-        "augments_pos_ref_augment": augments,
-        "ref_augment_from_augments_euler": eulers,
-        "pose_mask": pose_mask.to(dtype=torch.int64),
+        "pose_x": noisy_pose,
+        "t": torch.stack((video_t, pose_t), dim=-1),
         "fidx": fidxs,
     }, targets
 
@@ -155,6 +175,7 @@ class WorldModelValidator(BaseValidator):
         steps: int
         dataloader: WorldModelDataLoader.Config
         pose_dropout: float
+        pose_clean_prob: float
         noise_scheduler_steps: int
         no_noise_prefill_frames_prob: float
         fake_timesteps_prob: float
@@ -248,6 +269,7 @@ class WorldModelValidator(BaseValidator):
                     no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
                     fake_timesteps_prob=self.config.fake_timesteps_prob,
                     train=False,
+                    pose_clean_prob=self.config.pose_clean_prob,
                 )
                 with self.validation_context():
                     outputs = model(**model_inputs)
@@ -312,6 +334,7 @@ class WorldModelTrainer(Trainer):
         checkpoint: WorldModelTorchPackageCheckpointManager.Config
         float8: WorldModelFloat8Config = field(default_factory=WorldModelFloat8Config)
         pose_dropout: float
+        pose_clean_prob: float
         noise_scheduler_steps: int
         no_noise_prefill_frames_prob: float
         fake_timesteps_prob: float
@@ -386,6 +409,7 @@ class WorldModelTrainer(Trainer):
                 no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
                 fake_timesteps_prob=self.config.fake_timesteps_prob,
                 train=True,
+                pose_clean_prob=self.config.pose_clean_prob,
             )
         self.ntokens_seen += model_inputs["x"].shape[0] * self.config.training.seq_len
         with self.train_context():
@@ -587,6 +611,35 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
         raise ValueError("model input spatial size must match dataloader latent_size")
     if model_config.in_channels != config.dataloader.in_channels:
         raise ValueError("model in_channels must match dataloader in_channels")
+    if model_config.transformer.attention_mask != "NONE":
+        raise ValueError("stage-1 worldmodel requires bidirectional attention")
+    if model_config.plan_head.n_layer >= 0:
+        raise ValueError("stage-1 worldmodel does not use a plan head")
+    if not model_config.experimental_planar:
+        raise ValueError("stage-1 worldmodel requires planar pose conditioning")
+    for name, dataloader in (
+        ("train", config.dataloader),
+        ("validation", config.validator.dataloader),
+    ):
+        if dataloader.future_size_frames != 0:
+            raise ValueError(f"{name} dataloader must use future_size_frames=0")
+        if dataloader.inference_prefill_frames != 0:
+            raise ValueError(f"{name} dataloader must use inference_prefill_frames=0")
+    if (
+        config.pose_dropout < 0.0
+        or config.pose_clean_prob < 0.0
+        or config.pose_dropout + config.pose_clean_prob > 1.0
+    ):
+        raise ValueError(
+            "pose_dropout and pose_clean_prob must be non-negative and sum to <= 1"
+        )
+    if (
+        config.no_noise_prefill_frames_prob != 0.0
+        or config.fake_timesteps_prob != 0.0
+        or config.validator.no_noise_prefill_frames_prob != 0.0
+        or config.validator.fake_timesteps_prob != 0.0
+    ):
+        raise ValueError("bidirectional stage-1 training does not use prefill/fake timesteps")
     if (
         config.parallelism.tensor_parallel_degree > 1
         or config.parallelism.pipeline_parallel_degree > 1
@@ -626,6 +679,7 @@ def _stock_trainer_mock_config() -> WorldModelTrainer.Config:
         num_readers=1,
         feature_dir="mock",
         latent_size=model_spec.model.input_size[1:],
+        inference_prefill_frames=0,
         mock_data=True,
         mock_segment_batch_size=2,
     )
@@ -640,10 +694,12 @@ def _stock_trainer_mock_config() -> WorldModelTrainer.Config:
     config.checkpoint.enable = False
     config.activation_checkpoint = None
     config.compile.enable = False
+    config.float8.enable = False
     config.metrics.log_freq = 1
     config.metrics.enable_reporterv2 = False
     config.validator.enable = False
     config.pose_dropout = 0.0
+    config.pose_clean_prob = 0.5
     config.noise_scheduler_steps = 2
     config.no_noise_prefill_frames_prob = 0.0
     config.fake_timesteps_prob = 0.0

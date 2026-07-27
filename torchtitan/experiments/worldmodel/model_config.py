@@ -19,14 +19,30 @@ from .model import parallelize_worldmodel, TransformerConfig, WorldModel
 COMPRESSOR_MODEL = "c04337f8-b83f-4e34-b07a-5f7396978d67"
 LATENT_CHANNELS = 32
 LATENT_SIZE = (16, 32)
+POSE_MIN = (-0.25, -0.40, -0.15, -0.05, -0.05, -0.25)
+POSE_MAX = (9.00, 0.40, 0.15, 0.05, 0.05, 0.25)
+# Frozen population statistics from a deterministic 64-segment loader sample.
+# Clamp bounds remain deliberately wider to retain hard turns and road grade.
+POSE_MEAN = (
+    3.47339063,
+    0.000784361,
+    -0.000068790,
+    -0.0000276394,
+    0.0000452321,
+    0.000339160,
+)
+POSE_STD = (
+    1.84381996,
+    0.029424726,
+    0.012880157,
+    0.003131699,
+    0.003404612,
+    0.010374016,
+)
 
 WORLD_MODEL_FLOAT8_FILTER_FQNS = [
     "x_embedder",
-    "augments_pos_ref_augment_embedder",
-    "ref_augment_from_augments_euler_embedder",
-    "pose_mask_embedder",
     "t_embedder",
-    "fidx_embedder",
     "final_layer",
     "plan_head",
 ]
@@ -54,12 +70,12 @@ def _worldmodel_configs() -> dict[str, Callable[[], WorldModel.Config]]:
 
 def _debug_model_config() -> WorldModel.Config:
     return _model_config(
-        input_size=(15, 4, 4),
+        input_size=(10, 4, 4),
         patch_size=(1, 2, 2),
         hidden=128,
         heads=4,
         layers=1,
-        plan_layers=1,
+        plan_layers=-1,
         mlp_multiple_of=16,
         attention_impl="FLEX",
     )
@@ -67,17 +83,17 @@ def _debug_model_config() -> WorldModel.Config:
 
 def _model_config(
     *,
-    input_size: tuple[int, int, int] = (15, *LATENT_SIZE),
+    input_size: tuple[int, int, int] = (10, *LATENT_SIZE),
     patch_size: tuple[int, int, int] = (1, 2, 2),
-    hidden: int = 2304,
-    heads: int = 36,
-    layers: int = 56,
-    plan_layers: int = 4,
+    hidden: int = 1600,
+    heads: int = 25,
+    layers: int = 36,
+    plan_layers: int = -1,
     mlp_multiple_of: int = 256,
     attention_impl: str = "FLEX",
-    attention_mask: str = "LAST_FRAME_CAUSAL",
+    attention_mask: str = "NONE",
     norm: str = "RMSNorm",
-    experimental_pose_only_xy: bool = False,
+    experimental_planar: bool = True,
 ) -> WorldModel.Config:
     stats = COMPRESSOR_STATS[COMPRESSOR_MODEL]
     return WorldModel.Config(
@@ -86,10 +102,14 @@ def _model_config(
         in_channels=LATENT_CHANNELS,
         out_channels=LATENT_CHANNELS,
         pose_size=6,
+        pose_min=POSE_MIN,
+        pose_max=POSE_MAX,
+        pose_mean=POSE_MEAN,
+        pose_std=POSE_STD,
         time_factor=1.0,
         compressor_mean=stats["mean"],
         compressor_std=stats["std"],
-        experimental_pose_only_xy=experimental_pose_only_xy,
+        experimental_planar=experimental_planar,
         transformer=TransformerConfig(
             n_layer=layers,
             n_embd=hidden,

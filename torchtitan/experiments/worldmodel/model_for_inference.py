@@ -72,7 +72,7 @@ def _fp8_score_mod(
 
 class InferenceSelfAttention(SelfAttention):
     def upcast_kv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if k.dtype == torch.float8_e4m3fn:
+        if k.dtype != q.dtype:
             return k.to(q.dtype), v.to(q.dtype)
         return k, v
 
@@ -99,7 +99,17 @@ class InferenceSelfAttention(SelfAttention):
             raise RuntimeError("KV cache must be initialized before using input_pos")
         k, v = self.kv_cache.cache(input_pos, k, v)
 
-        if self.config.attention_impl == "FLEX":
+        if self.config.attention_impl == "FLEX" and input_mask is None:
+            k, v = self.upcast_kv(q, k, v)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                scale=1.0 / math.sqrt(self.head_dim),
+            ).transpose(1, 2)
+        elif self.config.attention_impl == "FLEX":
             assert self.flex_attention is not None
             if k.dtype == torch.float8_e4m3fn:
                 y = self.flex_attention(
@@ -176,7 +186,7 @@ class WorldModelForInference(WorldModel):
             "augments_pos_ref_augment": dtype,
             "ref_augment_from_augments_euler": dtype,
             "pose_mask": torch.int64,
-            "fidxs": torch.int64,
+            "fidxs": torch.float32,
         }
 
     @classmethod
@@ -189,7 +199,7 @@ class WorldModelForInference(WorldModel):
         device: torch.device | str = "meta",
     ) -> dict[str, torch.Tensor]:
         dtypes = cls.input_dtypes(dtype)
-        return {
+        inputs = {
             name: (
                 torch.randn(shape, dtype=dtypes[name], device=device)
                 if dtypes[name].is_floating_point
@@ -197,6 +207,10 @@ class WorldModelForInference(WorldModel):
             )
             for name, shape in cls.input_shapes(config, batch_size=batch_size).items()
         }
+        inputs["fidxs"] = torch.arange(
+            config.input_size[0], dtype=torch.float32, device=device
+        ).expand(batch_size, -1)
+        return inputs
 
     def get_model_io(
         self,
@@ -204,7 +218,7 @@ class WorldModelForInference(WorldModel):
         batch_size: int = 1,
         dtype: torch.dtype = torch.bfloat16,
         steps: int = 1,
-        num_prefill_frames: int = 14,
+        num_prefill_frames: int = 0,
     ) -> dict[str, dict[str, torch.Size] | dict[str, torch.dtype]]:
         inputs = self.example_inputs(self.config, batch_size=batch_size, dtype=dtype, device=self.pos_embed.device)
         outputs = self.generate(
@@ -336,33 +350,43 @@ class WorldModelForInference(WorldModel):
         batch, frames = x.shape[:2]
         trajectory = [x.clone()] if return_trajectory else None
 
+        pose = torch.cat(
+            (augments_pos_ref_augment, ref_augment_from_augments_euler), dim=-1
+        )
+        pose_clean = self.encode_pose(
+            pose, height=x.shape[-2], width=x.shape[-1]
+        ).to(dtype=x.dtype)
+        pose_t = pose_mask.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+        pose_t = torch.where(fidxs == 0, torch.ones_like(pose_t), pose_t)
+        pose_noise = torch.randn_like(pose_clean)
+        pose_x = scheduler.add_noise(pose_clean, pose_noise, pose_t)
         if cfg > 0.0:
-            pose_mask_u = torch.ones_like(pose_mask)
-            augments_pos_ref_augment_u = torch.zeros_like(augments_pos_ref_augment)
-            ref_augment_from_augments_euler_u = torch.zeros_like(ref_augment_from_augments_euler)
+            pose_t_u = torch.ones_like(pose_t)
+            # Couple CFG branches to the same noise. Otherwise frames that are
+            # already dropped in both branches differ only by random pose noise,
+            # and guidance amplifies that unrelated difference.
+            pose_x_u = pose_noise
 
         dummy_timestep = torch.ones(batch, frames, device=device, dtype=torch.float32)
         model_output: dict[str, torch.Tensor] = {}
         for step_idx in range(steps):
-            timesteps = dummy_timestep * scheduler.timesteps[step_idx]
+            video_t = dummy_timestep * scheduler.timesteps[step_idx]
+            timesteps = torch.stack((video_t, pose_t), dim=-1)
             model_output = self(
                 x,
                 timesteps,
-                augments_pos_ref_augment,
-                ref_augment_from_augments_euler,
-                pose_mask,
-                fidxs,
+                fidx=fidxs,
+                pose_x=pose_x,
                 input_pos_mask_pair=input_pos_mask_pair,
             )
             velocity = model_output["sample"]
             if cfg > 0.0:
+                timesteps_u = torch.stack((video_t, pose_t_u), dim=-1)
                 unconditional_output = self(
                     x,
-                    timesteps,
-                    augments_pos_ref_augment_u,
-                    ref_augment_from_augments_euler_u,
-                    pose_mask_u,
-                    fidxs,
+                    timesteps_u,
+                    fidx=fidxs,
+                    pose_x=pose_x_u,
                     input_pos_mask_pair=input_pos_mask_pair,
                 )
                 unconditional_velocity = unconditional_output["sample"]
@@ -383,7 +407,7 @@ class WorldModelForInference(WorldModel):
         fidxs: torch.Tensor,
         *,
         steps: int = 15,
-        num_prefill_frames: int = 14,
+        num_prefill_frames: int = 0,
         dtype: torch.dtype = torch.bfloat16,
         inference_schedule: str = "linear",
         cfg: float = 0.0,
@@ -424,6 +448,8 @@ class WorldModelForInference(WorldModel):
             outputs = {"latents": output_latents}
             if "plan" in model_output:
                 outputs["plan"] = model_output["plan"]
+            if "pose" in model_output:
+                outputs["pose"] = model_output["pose"]
             if return_trajectory:
                 outputs["trajectory"] = output_latents.unsqueeze(1)
             return outputs
@@ -467,6 +493,8 @@ class WorldModelForInference(WorldModel):
         outputs = {"latents": self.unscale_latents(decode_frames)}
         if "plan" in model_output:
             outputs["plan"] = model_output["plan"]
+        if "pose" in model_output:
+            outputs["pose"] = model_output["pose"]
         if trajectory is not None:
             outputs["trajectory"] = self.unscale_latents(trajectory)
         return outputs
@@ -560,7 +588,7 @@ def main() -> None:
         **inputs,
         dtype=torch.bfloat16,
         steps=2,
-        num_prefill_frames=14,
+        num_prefill_frames=0,
         cfg=2.0
     )
     print(
