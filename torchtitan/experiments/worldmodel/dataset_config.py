@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 from xx.datasets.constants import BASE_DIR_GT_10M, DEFAULT_10M_TRAIN_LIST
@@ -32,7 +38,7 @@ def _dataloader_config(
     train_skip: int = 40,
     val_skip: int = 800,
     nan_engaged_plans: bool = False,
-    limit: int | None = None,
+    limit: int | str | None = None,
     mock_data: bool = False,
     mock_segment_batch_size: int = 8,
 ) -> WorldModelDataLoader.Config:

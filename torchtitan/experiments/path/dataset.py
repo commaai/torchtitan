@@ -28,7 +28,7 @@ class PathDataLoader(BaseDataLoader):
         fps: int
         pipeline_dir: str
         plan_only: bool
-        limit: int | None
+        limit: int | str | None
         n_frames: int
         rgb: bool
         unvision: bool

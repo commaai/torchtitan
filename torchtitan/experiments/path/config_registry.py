@@ -235,7 +235,7 @@ def _dataloader_config(
     split: str,
     fps: int,
     plan_only: bool,
-    limit: int | None,
+    limit: int | str | None,
     pipeline_dir: str,
     skip: int,
     val_skip: int,
