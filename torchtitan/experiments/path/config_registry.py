@@ -106,7 +106,7 @@ def _path(flavor: str) -> PathTrainer.Config:
             split="train",
             fps=fps,
             plan_only=plan_only,
-            limit=None,
+            limit=2_500_000,
             pipeline_dir=BASE_DIR_GT,
             skip=1,
             val_skip=1,
