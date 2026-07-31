@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import os
 from functools import partial
-from xx.datasets.constants import BASE_DIR_GT, BASE_DIR_GT_10M, DEFAULT_BIG_TRAIN_LIST, DEFAULT_TEST_5K_LIST_TAGGED
+from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TEST_5K_LIST_TAGGED, DEFAULT_TRAIN_LIST
 from xx.ml_tools.constants.model import (
     frame_constants_from_fps,
     FRAME_TYPE,
@@ -102,7 +102,7 @@ def _path(flavor: str) -> PathTrainer.Config:
         model_spec=model_registry(flavor),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=_dataloader_config(
-            dataset=DEFAULT_BIG_TRAIN_LIST,
+            dataset=DEFAULT_TRAIN_LIST,
             split="train",
             fps=fps,
             plan_only=plan_only,
@@ -157,7 +157,7 @@ def _path(flavor: str) -> PathTrainer.Config:
                 plan_only=True,
                 dataset=DEFAULT_TEST_5K_LIST_TAGGED,
                 limit=6_000,
-                pipeline_dir=BASE_DIR_GT_10M,
+                pipeline_dir=BASE_DIR_GT,
                 skip=1,
                 val_skip=6,
             ),
