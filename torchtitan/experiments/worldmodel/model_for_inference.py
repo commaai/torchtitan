@@ -31,56 +31,8 @@ def _create_block_mask_fn(device: torch.device):
     return create_block_mask if device.type == "meta" else torch.compile(create_block_mask)
 
 
-@dataclass(frozen=True, slots=True)
-class InputPosMaskPair:
-    input_pos: torch.Tensor
-    cache_pos: torch.Tensor
-    cache_seq_length: int
-    input_mask: TensorOrMask | None
-
-
-@dataclass(frozen=True, slots=True)
-class BranchLayout:
-    branch_count: int
-    prefix_tokens: int
-    tokens_per_branch: int
-    input_pos: torch.Tensor
-    cache_pos: torch.Tensor
-    cache_seq_length: int
-
-    @property
-    def packed_tokens(self) -> int:
-        return self.branch_count * self.tokens_per_branch
-
-
-def build_branch_layout(
-    *,
-    prefix_tokens: int,
-    tokens_per_branch: int,
-    cfg_enabled: bool,
-    device: torch.device | str,
-) -> BranchLayout:
-    if prefix_tokens < 0:
-        raise ValueError(f"prefix_tokens must be nonnegative, got {prefix_tokens}")
-    if tokens_per_branch <= 0:
-        raise ValueError(f"tokens_per_branch must be positive, got {tokens_per_branch}")
-
-    branch_count = 2 if cfg_enabled else 1
-    semantic_suffix = torch.arange(prefix_tokens, prefix_tokens + tokens_per_branch, device=device)
-    input_pos = semantic_suffix.repeat(branch_count)
-    cache_pos = torch.arange(prefix_tokens, prefix_tokens + branch_count * tokens_per_branch, device=device)
-    return BranchLayout(
-        branch_count=branch_count,
-        prefix_tokens=prefix_tokens,
-        tokens_per_branch=tokens_per_branch,
-        input_pos=input_pos,
-        cache_pos=cache_pos,
-        cache_seq_length=prefix_tokens + branch_count * tokens_per_branch,
-    )
-
-
-def pack_branch_inputs(
-    layout: BranchLayout,
+def pack_cfg_inputs(
+    cfg: float,
     x: torch.Tensor,
     timesteps: torch.Tensor,
     augments_pos_ref_augment: torch.Tensor,
@@ -89,42 +41,51 @@ def pack_branch_inputs(
     fidxs: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
     inputs = (x, timesteps, augments_pos_ref_augment, ref_augment_from_augments_euler, pose_mask, fidxs)
-    if layout.branch_count == 1:
+    if cfg <= 0.0:
         return inputs
-    unconditional = (
-        x, timesteps, torch.zeros_like(augments_pos_ref_augment),
-        torch.zeros_like(ref_augment_from_augments_euler), torch.ones_like(pose_mask), fidxs,
+    return (
+        torch.cat((x, x), dim=1),
+        torch.cat((timesteps, timesteps), dim=1),
+        torch.cat((torch.zeros_like(augments_pos_ref_augment), augments_pos_ref_augment), dim=1),
+        torch.cat((torch.zeros_like(ref_augment_from_augments_euler), ref_augment_from_augments_euler), dim=1),
+        torch.cat((torch.ones_like(pose_mask), pose_mask), dim=1),
+        torch.cat((fidxs, fidxs), dim=1),
     )
-    return tuple(torch.cat(pair, dim=1) for pair in zip(unconditional, inputs))
 
 
-def branch_mask_predicate(
+def prefill_mask_predicate(
     mask_fn: Callable | None,
-    layout: BranchLayout,
-    prefill: bool,
+    prefix_tokens: int,
     b: torch.Tensor,
     h: torch.Tensor,
     q_idx: torch.Tensor,
     kv_idx: torch.Tensor,
 ) -> torch.Tensor:
-    if prefill:
-        logical = True if mask_fn is None else mask_fn(b, h, q_idx, kv_idx)
-        return (kv_idx < layout.prefix_tokens) & logical
+    logical = True if mask_fn is None else mask_fn(b, h, q_idx, kv_idx)
+    return (kv_idx < prefix_tokens) & logical
 
-    prefix_tokens = layout.prefix_tokens
-    tokens_per_branch = layout.tokens_per_branch
-    semantic_q_idx = prefix_tokens + q_idx % tokens_per_branch
+
+def packed_cfg_mask(
+    mask_fn: Callable | None,
+    prefix_tokens: int,
+    decode_tokens: int,
+    b: torch.Tensor,
+    h: torch.Tensor,
+    q_idx: torch.Tensor,
+    kv_idx: torch.Tensor,
+) -> torch.Tensor:
+    semantic_q_idx = prefix_tokens + q_idx % decode_tokens
     suffix_kv_idx = kv_idx - prefix_tokens
     is_prefix = kv_idx < prefix_tokens
     semantic_kv_idx = torch.where(
         is_prefix,
         kv_idx,
-        prefix_tokens + suffix_kv_idx % tokens_per_branch,
+        prefix_tokens + suffix_kv_idx % decode_tokens,
     )
-    same_branch = q_idx // tokens_per_branch == suffix_kv_idx // tokens_per_branch
-    branch_visible = is_prefix | (same_branch & (suffix_kv_idx >= 0))
+    same_cfg_copy = q_idx // decode_tokens == suffix_kv_idx // decode_tokens
+    visible = is_prefix | (same_cfg_copy & (suffix_kv_idx >= 0))
     logical = True if mask_fn is None else mask_fn(b, h, semantic_q_idx, semantic_kv_idx)
-    return branch_visible & logical
+    return visible & logical
 
 
 class KVCache(nn.Module):
@@ -253,7 +214,7 @@ class WorldModelForInference(WorldModel):
         super().__init__(config)
         for block in self.blocks:
             block.attn.__class__ = InferenceSelfAttention
-        self.inference_masks: dict[tuple[str, int, int, int], tuple[TensorOrMask | None, TensorOrMask | None]] = {}
+        self.inference_masks: dict[tuple[str, int, int, bool], tuple[TensorOrMask | None, TensorOrMask | None]] = {}
         self.max_batch_size = -1
         self.max_seq_length = -1
         self.cache_dtype: torch.dtype | None = None
@@ -328,29 +289,33 @@ class WorldModelForInference(WorldModel):
             block.compile(mode="max-autotune-no-cudagraphs")
 
     @torch.no_grad()
-    def setup_inference_attention_attrs(
+    def get_inference_masks(
         self,
         device: torch.device,
-        layout: BranchLayout,
+        prefix_tokens: int,
+        decode_tokens: int,
+        cfg_enabled: bool,
     ) -> tuple[TensorOrMask | None, TensorOrMask | None]:
-        key = (str(device), layout.prefix_tokens, layout.tokens_per_branch, layout.branch_count)
+        packed_decode_tokens = decode_tokens * (2 if cfg_enabled else 1)
+        cache_seq_length = prefix_tokens + packed_decode_tokens
+        key = (str(device), prefix_tokens, decode_tokens, cfg_enabled)
         if key in self.inference_masks:
             return self.inference_masks[key]
 
         mask_fn = _mask_fn(self.config.transformer)
-        prefill_mask_fn = partial(branch_mask_predicate, mask_fn, layout, True)
-        decode_mask_fn = partial(branch_mask_predicate, mask_fn, layout, False)
+        prefill_mask_fn = partial(prefill_mask_predicate, mask_fn, prefix_tokens)
+        decode_mask_fn = partial(packed_cfg_mask, mask_fn, prefix_tokens, decode_tokens)
 
         if self.config.transformer.attention_impl == "FLEX":
             create_mask = _create_block_mask_fn(device)
             prefill_mask = None
-            if layout.prefix_tokens:
+            if prefix_tokens:
                 prefill_mask = create_mask(
                     prefill_mask_fn,
                     B=None,
                     H=None,
-                    Q_LEN=layout.prefix_tokens,
-                    KV_LEN=layout.cache_seq_length,
+                    Q_LEN=prefix_tokens,
+                    KV_LEN=cache_seq_length,
                     device=device,
                 )
                 prefill_mask.device = device
@@ -358,23 +323,23 @@ class WorldModelForInference(WorldModel):
                 decode_mask_fn,
                 B=None,
                 H=None,
-                Q_LEN=layout.packed_tokens,
-                KV_LEN=layout.cache_seq_length,
+                Q_LEN=packed_decode_tokens,
+                KV_LEN=cache_seq_length,
                 device=device,
             )
             decode_mask.device = device
         elif self.config.transformer.attention_impl == "SDPA":
             prefill_mask = None
-            if layout.prefix_tokens:
+            if prefix_tokens:
                 prefill_mask = _dense_mask(
                     prefill_mask_fn,
-                    layout.prefix_tokens,
-                    layout.cache_seq_length,
+                    prefix_tokens,
+                    cache_seq_length,
                 )[None, None].to(device=device, dtype=torch.bool)
             decode_mask = _dense_mask(
                 decode_mask_fn,
-                layout.packed_tokens,
-                layout.cache_seq_length,
+                packed_decode_tokens,
+                cache_seq_length,
             )[None, None].to(device=device, dtype=torch.bool)
             if not decode_mask.is_meta and bool(decode_mask.all()):
                 decode_mask = None
@@ -385,7 +350,7 @@ class WorldModelForInference(WorldModel):
         self.inference_masks[key] = masks
         return masks
 
-    def cleanup_inference_attention_attrs(self) -> None:
+    def clear_inference_masks(self) -> None:
         self.inference_masks = {}
 
     def _has_compatible_caches(
@@ -442,12 +407,14 @@ class WorldModelForInference(WorldModel):
         ref_augment_from_augments_euler: torch.Tensor,
         pose_mask: torch.Tensor,
         fidxs: torch.Tensor,
-        input_pos_mask_pair: InputPosMaskPair,
-        layout: BranchLayout,
+        *,
+        semantic_pos: torch.Tensor,
+        cache_pos: torch.Tensor,
+        cache_seq_length: int,
+        input_mask: TensorOrMask | None,
         cfg: float,
         scheduler: RFScheduler,
         steps: int,
-        *,
         return_trajectory: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor | None]:
         device = x.device
@@ -458,8 +425,8 @@ class WorldModelForInference(WorldModel):
         model_output: dict[str, torch.Tensor] = {}
         for step_idx in range(steps):
             timesteps = dummy_timestep * scheduler.timesteps[step_idx]
-            packed_inputs = pack_branch_inputs(
-                layout,
+            model_inputs = pack_cfg_inputs(
+                cfg,
                 x,
                 timesteps,
                 augments_pos_ref_augment,
@@ -467,16 +434,18 @@ class WorldModelForInference(WorldModel):
                 pose_mask,
                 fidxs,
             )
-            packed_output = self(
-                *packed_inputs,
-                input_pos_mask_pair=input_pos_mask_pair,
+            model_output = self(
+                *model_inputs,
+                input_pos=semantic_pos,
+                cache_pos=cache_pos,
+                cache_seq_length=cache_seq_length,
+                input_mask=input_mask,
             )
-            velocity = packed_output["sample"]
-            if layout.branch_count == 2:
+            velocity = model_output["sample"]
+            if cfg > 0.0:
                 unconditional, conditional = velocity.chunk(2, dim=1)
                 velocity = unconditional + cfg * (conditional - unconditional)
-            packed_output["sample"] = velocity
-            model_output = packed_output
+            model_output["sample"] = velocity
             x = scheduler.step(velocity, step_idx, x).to(x.dtype)
             if trajectory is not None:
                 trajectory.append(x.clone())
@@ -534,7 +503,6 @@ class WorldModelForInference(WorldModel):
                 ref_augment_from_augments_euler,
                 pose_mask,
                 fidxs,
-                input_pos_mask_pair=None,
             )
             start = max(0, num_prefill_frames - 1)
             output_latents = self.unscale_latents(latents[:, start:])
@@ -553,19 +521,22 @@ class WorldModelForInference(WorldModel):
         scheduler = RFScheduler(
             steps=steps, inference_schedule=inference_schedule, **scheduler_kwargs
         ).to(device=device)
-        layout = build_branch_layout(
-            prefix_tokens=num_prefill_frames * self.config.num_spatial_patches,
-            tokens_per_branch=((frames - num_prefill_frames) * self.config.num_spatial_patches),
-            cfg_enabled=cfg > 0.0,
-            device=device,
-        )
+        prefix_tokens = num_prefill_frames * self.config.num_spatial_patches
+        decode_tokens = (frames - num_prefill_frames) * self.config.num_spatial_patches
+        packed_decode_tokens = decode_tokens * (2 if cfg > 0.0 else 1)
+        cache_seq_length = prefix_tokens + packed_decode_tokens
         self.setup_caches(
             batch,
-            layout.cache_seq_length,
+            cache_seq_length,
             dtype=_cache_dtype_for_device(device),
             device=device,
         )
-        prefill_mask, decode_mask = self.setup_inference_attention_attrs(device, layout)
+        prefill_mask, decode_mask = self.get_inference_masks(
+            device,
+            prefix_tokens,
+            decode_tokens,
+            cfg > 0.0,
+        )
 
         latents[:, :num_prefill_frames] = self.scale_latents(latents[:, :num_prefill_frames])
         self._prefill(
@@ -576,22 +547,27 @@ class WorldModelForInference(WorldModel):
             fidxs=fidxs,
             scheduler=scheduler,
             num_prefill_frames=num_prefill_frames,
-            layout=layout,
+            cache_seq_length=cache_seq_length,
             prefill_mask=prefill_mask,
         )
 
         decode_frames = latents[:, num_prefill_frames:]
-        decode_frames, model_output, trajectory = self._decode(
-            decode_frames=decode_frames,
-            augments_pos_ref_augment=augments_pos_ref_augment,
-            ref_augment_from_augments_euler=ref_augment_from_augments_euler,
-            pose_mask=pose_mask,
-            fidxs=fidxs,
-            scheduler=scheduler,
-            num_prefill_frames=num_prefill_frames,
-            layout=layout,
-            decode_mask=decode_mask,
+        num_cfg_copies = 2 if cfg > 0.0 else 1
+        # CFG copies repeat the trained positions but need unique cache slots.
+        semantic_pos = torch.arange(prefix_tokens, prefix_tokens + decode_tokens, device=device).repeat(num_cfg_copies)
+        cache_pos = torch.arange(prefix_tokens, cache_seq_length, device=device)
+        decode_frames, model_output, trajectory = self.forward_n_steps(
+            decode_frames,
+            augments_pos_ref_augment[:, num_prefill_frames:],
+            ref_augment_from_augments_euler[:, num_prefill_frames:],
+            pose_mask[:, num_prefill_frames:],
+            fidxs[:, num_prefill_frames:],
+            semantic_pos=semantic_pos,
+            cache_pos=cache_pos,
+            cache_seq_length=cache_seq_length,
+            input_mask=decode_mask,
             cfg=cfg,
+            scheduler=scheduler,
             steps=steps,
             return_trajectory=return_trajectory,
         )
@@ -617,7 +593,7 @@ class WorldModelForInference(WorldModel):
         fidxs: torch.Tensor,
         scheduler: RFScheduler,
         num_prefill_frames: int,
-        layout: BranchLayout,
+        cache_seq_length: int,
         prefill_mask: TensorOrMask | None,
     ) -> dict[str, torch.Tensor]:
         if num_prefill_frames <= 0:
@@ -625,16 +601,10 @@ class WorldModelForInference(WorldModel):
 
         batch = latents.shape[0]
         device = latents.device
-        input_pos = torch.arange(0, num_prefill_frames * self.config.num_spatial_patches, device=device)
+        prefix_pos = torch.arange(0, num_prefill_frames * self.config.num_spatial_patches, device=device)
         timesteps = torch.ones(
             (batch, num_prefill_frames), device=device, dtype=torch.float32
         ) * scheduler.no_noise_timestep
-        input_pos_mask_pair = InputPosMaskPair(
-            input_pos=input_pos,
-            cache_pos=input_pos,
-            cache_seq_length=layout.cache_seq_length,
-            input_mask=prefill_mask,
-        )
         return self(
             latents[:, :num_prefill_frames],
             timesteps,
@@ -642,43 +612,10 @@ class WorldModelForInference(WorldModel):
             ref_augment_from_augments_euler[:, :num_prefill_frames],
             pose_mask[:, :num_prefill_frames],
             fidxs[:, :num_prefill_frames],
-            input_pos_mask_pair=input_pos_mask_pair,
-        )
-
-    def _decode(
-        self,
-        *,
-        decode_frames: torch.Tensor,
-        augments_pos_ref_augment: torch.Tensor,
-        ref_augment_from_augments_euler: torch.Tensor,
-        pose_mask: torch.Tensor,
-        fidxs: torch.Tensor,
-        scheduler: RFScheduler,
-        num_prefill_frames: int,
-        layout: BranchLayout,
-        decode_mask: TensorOrMask | None,
-        cfg: float,
-        steps: int,
-        return_trajectory: bool,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor | None]:
-        input_pos_mask_pair = InputPosMaskPair(
-            input_pos=layout.input_pos,
-            cache_pos=layout.cache_pos,
-            cache_seq_length=layout.cache_seq_length,
-            input_mask=decode_mask,
-        )
-        return self.forward_n_steps(
-            decode_frames,
-            augments_pos_ref_augment[:, num_prefill_frames:],
-            ref_augment_from_augments_euler[:, num_prefill_frames:],
-            pose_mask[:, num_prefill_frames:],
-            fidxs[:, num_prefill_frames:],
-            input_pos_mask_pair,
-            layout,
-            cfg,
-            scheduler,
-            steps,
-            return_trajectory=return_trajectory,
+            input_pos=prefix_pos,
+            cache_pos=prefix_pos,
+            cache_seq_length=cache_seq_length,
+            input_mask=prefill_mask,
         )
 
 

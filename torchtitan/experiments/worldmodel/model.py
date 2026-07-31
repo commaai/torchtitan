@@ -723,9 +723,10 @@ class DiTBlock(nn.Module):
         self,
         x: torch.Tensor,
         t: torch.Tensor,
-        input_pos: torch.Tensor | None = None,
         input_pos_t: torch.Tensor | None = None,
         input_mask: TensorOrMask | None = None,
+        cache_pos: torch.Tensor | None = None,
+        cache_seq_length: int | None = None,
     ) -> torch.Tensor:
         batch = x.shape[0]
         scale_shift_table = (
@@ -737,11 +738,14 @@ class DiTBlock(nn.Module):
             scale_shift_table + t.reshape(batch, scale_shift_table.shape[1], 6, -1)
         ).chunk(6, dim=2)
         attn_input = modulate(self.norm1(x), shift_msa, scale_msa)
-        if input_pos is None:
+        if cache_pos is None:
             attn_output = self.attn(attn_input, input_mask=input_mask)
         else:
             attn_output = self.attn(
-                attn_input, input_pos=input_pos, input_mask=input_mask
+                attn_input,
+                cache_pos=cache_pos,
+                cache_seq_length=cache_seq_length,
+                input_mask=input_mask,
             )
         x = x + gate(attn_output, gate_msa)
         return x + gate(
@@ -856,12 +860,14 @@ class WorldModel(BaseModel):
             current_blocks = getattr(self, "blocks", [])
             current_final = getattr(self, "final_layer", None)
             current_plan = getattr(self, "plan_head_linears", None)
+            current_x = getattr(getattr(self, "x_embedder", None), "linear", None)
 
             self.x_embedder = PatchEmbedderLinearsConfig(
                 linear=linear_config(
                     self.in_channels * math.prod(self.patch_size),
                     hidden,
-                    current=getattr(getattr(self, "x_embedder", None), "linear", None),
+                    bias=current_x.bias if current_x else False,
+                    current=current_x,
                 )
             )
             self.augments_pos_ref_augment_embedder = (
@@ -1083,15 +1089,13 @@ class WorldModel(BaseModel):
         pose_mask: torch.Tensor,
         fidx: torch.Tensor,
         return_plan: bool = True,
-        input_pos_mask_pair: Any | None = None,
+        input_pos: torch.Tensor | None = None,
+        cache_pos: torch.Tensor | None = None,
+        cache_seq_length: int | None = None,
+        input_mask: TensorOrMask | None = None,
     ) -> dict[str, torch.Tensor]:
-        if input_pos_mask_pair is None:
-            input_pos, input_mask = None, self.mask
-        else:
-            input_pos, input_mask = (
-                input_pos_mask_pair.input_pos,
-                input_pos_mask_pair.input_mask,
-            )
+        if input_pos is None:
+            input_mask = self.mask
 
         if self.config.experimental_pose_only_xy:
             augments_pos_ref_augment = augments_pos_ref_augment * (
@@ -1125,7 +1129,7 @@ class WorldModel(BaseModel):
         t6 = t6 + pos6 + euler6 + pose_mask6 + fidx6
         t2 = t2 + pos2 + euler2 + pose_mask2 + fidx2
         for block in self.blocks:
-            x = block(x, t6, input_pos, input_pos_t, input_mask)
+            x = block(x, t6, input_pos_t, input_mask, cache_pos, cache_seq_length)
         outputs = {}
         if return_plan and self.plan_head is not None:
             outputs["plan"] = self.plan_head(x[:, -1, :])

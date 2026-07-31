@@ -170,6 +170,7 @@ def build_package(
     model_config: WorldModel.Config,
     state_dict: dict[str, torch.Tensor],
     step: int,
+    provenance: dict[str, Any] | None = None,
 ) -> bytes:
 
     with sl.log_trace_span("worldmodel_package_convert_fp8"):
@@ -188,6 +189,7 @@ def build_package(
             dtype=torch.bfloat16,
             steps=1,
             num_prefill_frames=num_prefill_frames,
+            cfg=2.0,
         )
         del io_model, io_model_config
         model = build_meta_model(model_config)
@@ -222,9 +224,10 @@ def build_package(
             )
             exporter.save_pickle("model", "model.pkl", model)
             del model
-            exporter.save_pickle(
-                "meta", "meta.pkl", {"model_io": model_io, "step": step}
-            )
+            meta = {"model_io": model_io, "step": step}
+            if provenance is not None:
+                meta["conversion"] = provenance
+            exporter.save_pickle("meta", "meta.pkl", meta)
             del model_io
 
             state_dict_buffer = io.BytesIO()
@@ -273,7 +276,7 @@ class WorldModelTorchPackageRecipe:
 def export_torch_package(checkpoint_path: str) -> None:
     recipe_state_path = fs.join_path(checkpoint_path, MODEL_CONFIG_FILE)
     output_path = fs.join_path(checkpoint_path, PACKAGE_NAME)
-    step = fs.basename(checkpoint_path)
+    step = fs.basename(checkpoint_path).removeprefix("step-")
     assert (
         step.isdigit()
     ), f"checkpoint path {checkpoint_path} does not end with a step number."
