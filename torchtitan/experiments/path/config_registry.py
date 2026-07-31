@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import os
 from functools import partial
-from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TRAIN_LIST, DEFAULT_TEST_5K_LIST_TAGGED
+from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TEST_5K_LIST_TAGGED, DEFAULT_TRAIN_LIST
 from xx.ml_tools.constants.model import (
     frame_constants_from_fps,
     FRAME_TYPE,
