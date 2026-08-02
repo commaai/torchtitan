@@ -29,6 +29,7 @@ class PathDataLoader(BaseDataLoader):
         pipeline_dir: str
         plan_only: bool
         limit: int | None
+        deterministic_fidxs: bool
         n_frames: int
         rgb: bool
         unvision: bool
@@ -78,6 +79,7 @@ class PathDataLoader(BaseDataLoader):
             pipeline_dir=config.pipeline_dir,
             plan_only=config.plan_only,
             limit=config.limit,
+            deterministic_fidxs=config.deterministic_fidxs,
             n_frames=config.n_frames,
             rgb=config.rgb,
             unvision=config.unvision,
