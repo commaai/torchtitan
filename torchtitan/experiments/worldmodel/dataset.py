@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import os
@@ -124,8 +130,9 @@ class WorldModelDataLoader(BaseDataLoader):
         **kwargs: Any,
     ) -> None:
         del tokenizer, seq_len, snapshot_every_n_steps, kwargs
-        from gigashuffle import DataloaderConfig
         from xx.training.lib.dataloader import DataLoader
+
+        from gigashuffle import DataloaderConfig
 
         self.config = config
         self.local_batch_size = local_batch_size
@@ -195,15 +202,15 @@ class WorldModelDataLoader(BaseDataLoader):
             return _MockDataset(config)
 
         from xx.common.training_helpers import train_and_test_targets_from_file
-        from xx.training.diffusion.dataloader import IGNORE_EXCEPTIONS, get_data_from_seg
+        from xx.training.diffusion.dataloader import get_data_from_seg, IGNORE_EXCEPTIONS
         from xx.training.lib.dataloader import GenericDataset
 
-        train_segments, val_segments = train_and_test_targets_from_file(config.dataset_path or config.dataset)
+        train_segments, val_segments = train_and_test_targets_from_file(
+            config.dataset_path or config.dataset, limit=config.limit
+        )
         segments = val_segments if val else train_segments
         np.random.seed(42)
         np.random.shuffle(segments)
-        if config.limit is not None:
-            segments = segments[: config.limit]
         return GenericDataset(
             segments=segments,
             get_data_from_seg=get_data_from_seg,
@@ -229,8 +236,9 @@ class WorldModelDataLoader(BaseDataLoader):
 
 
 def main() -> None:
-    from torchtitan.experiments.worldmodel.dataset_config import _dataloader_config
     from xx.datasets.constants import DEFAULT_TRAIN_LIST
+
+    from torchtitan.experiments.worldmodel.dataset_config import _dataloader_config
 
     config = _dataloader_config(split="train", dataset=DEFAULT_TRAIN_LIST)
     dataset = WorldModelDataLoader._build_dataset(config, val=False, global_rank=0, global_world_size=1)

@@ -11,20 +11,10 @@ import os
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
-from torchtitan.config import (
-    CompileConfig,
-    DebugConfig,
-    ParallelismConfig,
-    TrainingConfig,
-)
+from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 
-from .dataset_config import (
-    _dataloader_config,
-    BASE_DIR_GT_10M,
-    DEFAULT_10M_TRAIN_LIST,
-    IMAGE_SIZE,
-)
+from .dataset_config import _dataloader_config, BASE_DIR_GT, DEFAULT_TRAIN_LIST, IMAGE_SIZE
 from .loss import WorldModelLoss
 from .model_config import (
     _blocks_only_float8,
@@ -40,9 +30,9 @@ from .trainer import WorldModelTrainer, WorldModelValidator
 
 
 __all__ = [
-    "BASE_DIR_GT_10M",
+    "BASE_DIR_GT",
     "COMPRESSOR_MODEL",
-    "DEFAULT_10M_TRAIN_LIST",
+    "DEFAULT_TRAIN_LIST",
     "IMAGE_SIZE",
     "LATENT_CHANNELS",
     "LATENT_SIZE",
@@ -146,11 +136,7 @@ def worldmodel() -> WorldModelTrainer.Config:
 def _world_sizes() -> tuple[int, int, int]:
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     world_size = int(os.environ.get("WORLD_SIZE", str(local_world_size)))
-    num_nodes = int(
-        os.environ.get(
-            "GROUP_WORLD_SIZE", str(max(1, world_size // max(1, local_world_size)))
-        )
-    )
+    num_nodes = int(os.environ.get("GROUP_WORLD_SIZE", str(max(1, world_size // max(1, local_world_size)))))
     return local_world_size, world_size, num_nodes
 
 
