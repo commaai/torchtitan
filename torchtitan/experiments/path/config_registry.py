@@ -25,9 +25,9 @@ from xx.training.path.hydra_configs import DRIVING_HEADS, META_HEADS, POSE_HEADS
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
-from torchtitan.components.tokenizer import NoOpTokenizer
 from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.experiments.worldmodel.model_config import COMPRESSOR_MODEL
 from torchtitan.models.common import Embedding, LayerNorm, Linear
 from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.protocols.model_spec import ModelSpec
@@ -52,6 +52,7 @@ from .model import (
     Vision,
 )
 from .onnx_checkpoint import PathOnnxCheckpointManager
+from .tokenizer import PathTokenizer
 from .trainer import PathTrainer
 from .validate import PathValidator
 
@@ -76,10 +77,10 @@ def _dp_degrees() -> tuple[int, int]:
 
 
 def _path(flavor: str) -> PathTrainer.Config:
-    steps = 1024 * 55
+    steps = 1024 * 12
     validation_freq = 1024
     reports = {
-        name: [validation_freq, validation_freq * 20, steps]
+        name: [validation_freq, steps]
         for name in (
             "analyse_driving",
             "analyse_lat_no_noise",
@@ -100,7 +101,10 @@ def _path(flavor: str) -> PathTrainer.Config:
     return PathTrainer.Config(
         loss=PathLoss.Config(),
         model_spec=model_registry(flavor),
-        tokenizer=NoOpTokenizer.Config(),
+        tokenizer=PathTokenizer.Config(
+            compressor_model=COMPRESSOR_MODEL,
+            compressor_in_channels="auto",
+        ),
         dataloader=_dataloader_config(
             dataset=DEFAULT_TRAIN_LIST,
             split="train",
@@ -116,7 +120,7 @@ def _path(flavor: str) -> PathTrainer.Config:
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=1024,
             total_steps=steps,
-            decay_ratio=0.1,
+            decay_ratio=0.25,
             decay_type="linear",
             min_lr_factor=0.0,
         ),
@@ -318,7 +322,7 @@ def _si_int(value: str | int) -> int:
 
 
 def _optimizer_config() -> OptimizersContainer.Config:
-    common = {"lr": 1e-3, "betas": (0.9, 0.95), "eps": 1e-8}
+    common = {"lr": 1e-4, "betas": (0.9, 0.95), "eps": 1e-8}
     no_decay = r"(point_policy\.hydra|temporal_policy\.temporal_hydra)\.(final_layer|scale_layer)"
     return OptimizersContainer.Config(
         implementation="fused_opt_states_bf16",

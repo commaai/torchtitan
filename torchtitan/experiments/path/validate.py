@@ -15,10 +15,9 @@ import torch.nn as nn
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.report_runner import ReportRunner, ReportSpec
-from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.components.unique_counter import StringUniqueCounter
 from torchtitan.components.validate import BaseValidator
-from torchtitan.config import ParallelismConfig
+from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.tools.logging import logger
 from xx.common.helpers import parse_info
@@ -30,6 +29,7 @@ from xx.training.path.test import (
 )
 
 from .loss import PathLoss
+from .tokenizer import PathTokenizer
 
 ValidationContext = Callable[[], AbstractContextManager[None]]
 
@@ -64,7 +64,7 @@ class PathValidator(BaseValidator):
         parallelism: ParallelismConfig,
         dp_world_size: int,
         dp_rank: int,
-        tokenizer: BaseTokenizer,
+        tokenizer: PathTokenizer,
         parallel_dims: ParallelDims,
         loss_fn: PathLoss,
         validation_context: ValidationContext,
@@ -84,6 +84,7 @@ class PathValidator(BaseValidator):
         self.metrics_processor = metrics_processor
         self.seq_len = seq_len
         self.local_batch_size = local_batch_size
+        self.tokenizer_dtype = TORCH_DTYPE_MAP[config.mixed_precision_param]
         self.miniray = dict(self.config.miniray)
         self.dataloader = self.config.dataloader.build(
             dp_world_size=self.dp_world_size,
@@ -127,6 +128,11 @@ class PathValidator(BaseValidator):
                 )
                 validation_segment_names.update(name for name, _ in info_rows)
                 input_dict = {k: v.to(device) for k, v in input_dict.items()}
+                input_dict = self.tokenizer.reconstruct(
+                    input_dict,
+                    device=device,
+                    dtype=self.tokenizer_dtype,
+                )
                 targets = {k: v.to(device) for k, v in targets.items()}
                 local_samples = torch.tensor(
                     next(iter(input_dict.values())).shape[0], dtype=torch.float32, device=device

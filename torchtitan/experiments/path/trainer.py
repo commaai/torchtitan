@@ -10,18 +10,20 @@ import os
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import torch
 
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.unique_counter import StringUniqueCounter
+from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability import structured_logger as sl
 from torchtitan.trainer import Trainer
 
 from .loss import PathLoss
 from .onnx_checkpoint import PathOnnxCheckpointManager
+from .tokenizer import PathTokenizer
 from .validate import PathValidator, segment_names_and_fidxs_from_info
 
 
@@ -48,6 +50,8 @@ class PathTrainer(Trainer):
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:path:train")
         self.loss_fn.to(self.device)
+        self.image_tokenizer = cast(PathTokenizer, self.tokenizer)
+        self.tokenizer_dtype = TORCH_DTYPE_MAP[config.training.mixed_precision_param]
 
     def batch_generator(
         self,
@@ -71,7 +75,14 @@ class PathTrainer(Trainer):
         labels: dict[str, torch.Tensor],
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         self.ntokens_seen += next(iter(input_dict.values())).shape[0]
-        return input_dict, labels
+        return (
+            self.image_tokenizer.reconstruct(
+                input_dict,
+                device=self.device,
+                dtype=self.tokenizer_dtype,
+            ),
+            labels,
+        )
 
     @sl.log_trace_span("fwd_bwd")
     def forward_backward_step(
