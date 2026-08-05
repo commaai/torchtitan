@@ -17,6 +17,16 @@ from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.tokenizer import BaseTokenizer
 
 
+def _select_latest_targets(
+    targets: dict[str, torch.Tensor],
+    latest_only_targets: frozenset[str],
+) -> dict[str, torch.Tensor]:
+    return {
+        name: target[:, -1] if name in latest_only_targets else target
+        for name, target in targets.items()
+    }
+
+
 class PathDataLoader(BaseDataLoader):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
@@ -35,6 +45,7 @@ class PathDataLoader(BaseDataLoader):
         unvision: bool
         skip: int
         val_skip: int
+        latest_only_targets: tuple[str, ...]
 
     def __init__(
         self,
@@ -62,6 +73,7 @@ class PathDataLoader(BaseDataLoader):
         self.dp_rank = dp_rank
         self.local_rank = int(os.environ.get("LOCAL_RANK", dp_rank))
         self.local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", dp_world_size))
+        self.latest_only_targets = frozenset(config.latest_only_targets)
         node_rank = int(os.environ.get("GROUP_RANK", dp_rank // self.local_world_size))
         run_id = os.environ.get("REPORTERV2_TRAINING_ID") or "path"
         val = config.split != "train"
@@ -111,7 +123,7 @@ class PathDataLoader(BaseDataLoader):
         self._iterator = iterator
         try:
             for inputs, targets in iterator:
-                yield inputs, targets
+                yield inputs, _select_latest_targets(targets, self.latest_only_targets)
         finally:
             iterator.close()
             if self._iterator is iterator:

@@ -29,7 +29,6 @@ from torchtitan.components.tokenizer import NoOpTokenizer
 from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.models.common import Embedding, LayerNorm, Linear
-from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .dataset import PathDataLoader
@@ -38,10 +37,10 @@ from .model import (
     Hydra,
     LinearEncoder,
     parallelize_path,
+    PathCrossAttention,
     PathHead,
     PathMLP,
     PathModel,
-    PathSelfAttention,
     PathTransformer,
     PathTransformerBlock,
     PointSummarizer,
@@ -76,10 +75,10 @@ def _dp_degrees() -> tuple[int, int]:
 
 
 def _path(flavor: str) -> PathTrainer.Config:
-    steps = 1024 * 55
+    steps = 1024 * 30
     validation_freq = 1024
     reports = {
-        name: [validation_freq, validation_freq * 20, steps]
+        name: [validation_freq, validation_freq * 15, steps]
         for name in (
             "analyse_driving",
             "analyse_lat_no_noise",
@@ -212,7 +211,12 @@ def _model_config(flavor: str) -> PathModel.Config:
                 transformer=PathTransformer.Config(
                     layers=[
                         PathTransformerBlock.Config(
-                            attention=_attention(dim=dim, n_head=8, dropout=0.1),
+                            attention=_attention(
+                                dim=dim,
+                                n_head=8,
+                                window_size=block_size,
+                                dropout=0.1,
+                            ),
                             mlp=_mlp(dim, mlp_mult=2, bias=True, dropout=0.1),
                         )
                         for _ in range(4)
@@ -223,7 +227,7 @@ def _model_config(flavor: str) -> PathModel.Config:
                     embedding_dim=dim,
                 ),
                 block_size=block_size,
-                dense_training_outputs=True,
+                dense_training_outputs=False,
             ),
             temporal_hydra=_hydra(_heads(DRIVING_HEADS + TEMPORAL_META_HEADS), in_features=dim, mlp_mult=2),
             history_idxs=tuple(int(x) for x in frame_constants["history_idxs"]),
@@ -268,12 +272,16 @@ def _dataloader_config(
         unvision=base.unvision,
         skip=base.skip,
         val_skip=base.val_skip,
+        latest_only_targets=tuple(head.name for head in DRIVING_HEADS + TEMPORAL_META_HEADS),
     )
 
 
 def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnxCheckpointManager.Config:
     frame_constants = frame_constants_from_fps(n_frames=N_FRAMES, frame_type=FRAME_TYPE)
     temporal_len = frame_constants["temporal_len"]
+    # torch.export specializes example dimensions whose value is 0 or 1. Use
+    # batch 2 so batch-dependent reshapes remain symbolic in the ONNX graphs.
+    export_batch_size = 2
     vision_input_names = [ModelInputs.IMG, ModelInputs.BIG_IMG]
     temporal_policy_input_names = [
         ModelInputs.FEATURES,
@@ -286,12 +294,12 @@ def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnx
         *temporal_policy_input_names,
     ]
     input_shapes = [
-        [1, *frame_constants["frame_shapes"][ModelInputs.IMG]],
-        [1, *frame_constants["frame_shapes"][ModelInputs.BIG_IMG]],
-        [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.FEATURES][0]],
-        [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.DESIRE][0]],
-        [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0]],
-        [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.ACTION_T][0]],
+        [export_batch_size, *frame_constants["frame_shapes"][ModelInputs.IMG]],
+        [export_batch_size, *frame_constants["frame_shapes"][ModelInputs.BIG_IMG]],
+        [export_batch_size, temporal_len, TEMPORAL_INPUTS[ModelInputs.FEATURES][0]],
+        [export_batch_size, temporal_len, TEMPORAL_INPUTS[ModelInputs.DESIRE][0]],
+        [export_batch_size, temporal_len, TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0]],
+        [export_batch_size, temporal_len, TEMPORAL_INPUTS[ModelInputs.ACTION_T][0]],
     ]
     return PathOnnxCheckpointManager.Config(
         keep_latest_k=0,  # keep all checkpoints
@@ -368,17 +376,17 @@ def _encoder(in_features: int, dim: int) -> LinearEncoder.Config:
     )
 
 
-def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Config:
+def _attention(*, dim: int, n_head: int, window_size: int, dropout: float) -> PathCrossAttention.Config:
     head_dim = dim // n_head
-    return PathSelfAttention.Config(
+    return PathCrossAttention.Config(
         norm=LayerNorm.Config(normalized_shape=dim),
         q_norm=LayerNorm.Config(normalized_shape=head_dim),
         k_norm=LayerNorm.Config(normalized_shape=head_dim),
         c_attn=Linear.Config(in_features=dim, out_features=3 * dim, bias=True),
         c_proj=Linear.Config(in_features=dim, out_features=dim, bias=True),
-        inner_attention=ScaledDotProductAttention.Config(),
         n_head=n_head,
         head_dim=head_dim,
+        window_size=window_size,
         dropout=dropout,
     )
 

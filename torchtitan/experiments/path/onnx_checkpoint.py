@@ -21,6 +21,24 @@ from torchtitan.components.onnx_checkpoint import _ONNX_DTYPE_MAP, OnnxCheckpoin
 from .model import PathModel
 
 
+def _require_symbolic_batch_axes(onnx_model: onnx.ModelProto) -> None:
+    invalid_axes: list[str] = []
+    for kind, values in (
+        ("input", onnx_model.graph.input),
+        ("output", onnx_model.graph.output),
+    ):
+        for value in values:
+            dims = value.type.tensor_type.shape.dim
+            if not dims or not dims[0].HasField("dim_param") or dims[0].dim_param != "b":
+                invalid_axes.append(f"{kind} {value.name!r}")
+
+    if invalid_axes:
+        raise ValueError(
+            "PATH ONNX inputs and outputs must use symbolic batch dimension "
+            f"'b'; invalid axes: {', '.join(invalid_axes)}"
+        )
+
+
 class _VisionOnnxModel(nn.Module):
     def __init__(self, model: PathModel) -> None:
         super().__init__()
@@ -91,6 +109,7 @@ class PathOnnxCheckpointManager(OnnxCheckpointManager):
             exporter_name="comma_torchtitan",
             exporter_version="0.1",
         )
+        _require_symbolic_batch_axes(onnx_model)
         return onnx_model.SerializeToString()
 
     def _input_dict(self, names: list[str]) -> dict[str, torch.Tensor]:

@@ -7,15 +7,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from xx.ml_tools.constants.model import frame_constants_from_fps, ModelInputs, TEMPORAL_INPUTS
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import distribute_tensor, DTensor
 from torch.utils.flop_counter import FlopCounterMode
+from xx.ml_tools.constants.model import frame_constants_from_fps, ModelInputs, TEMPORAL_INPUTS
 
 from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
@@ -27,12 +28,15 @@ from torchtitan.distributed.activation_checkpoint import (
 )
 from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
 from torchtitan.models.common import Embedding, LayerNorm, Linear, RMSNorm, SiLU
-from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict, ModuleList, Sequential
 from torchtitan.tools.logging import logger
 
 from . import convnext
+
+# Shape suffixes used by the temporal attention stack:
+# B: batch, L: query sequence, S: memory sequence, D: model dim,
+# N: attention heads, H: head dim.
 
 
 @dataclass(frozen=True)
@@ -80,7 +84,9 @@ class PathMLP(Module):
         return self.dropout(self.c_proj(self.act(self.c_fc(self.norm(x)))))
 
 
-class PathSelfAttention(Module):
+class PathCrossAttention(Module):
+    """Refine hidden queries against an independently projected input memory."""
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         norm: LayerNorm.Config | RMSNorm.Config
@@ -88,9 +94,9 @@ class PathSelfAttention(Module):
         k_norm: LayerNorm.Config | RMSNorm.Config | None
         c_attn: Linear.Config
         c_proj: Linear.Config
-        inner_attention: ScaledDotProductAttention.Config
         n_head: int
         head_dim: int
+        window_size: int
         dropout: float
         is_causal: bool = True
 
@@ -98,28 +104,73 @@ class PathSelfAttention(Module):
         super().__init__()
         self.n_head = config.n_head
         self.head_dim = config.head_dim
+        self.window_size = config.window_size
         self.is_causal = config.is_causal
         self.norm = config.norm.build()
         self.q_norm = config.q_norm.build() if config.q_norm is not None else nn.Identity()
         self.k_norm = config.k_norm.build() if config.k_norm is not None else nn.Identity()
         self.c_attn = config.c_attn.build()
         self.c_proj = config.c_proj.build()
-        self.inner_attention = config.inner_attention.build()
         self.dropout = nn.Dropout(config.dropout)
+        self.position_bias = nn.Parameter(torch.empty(config.n_head, config.window_size))
+        self.reset_parameters()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, t, _ = x.shape
-        qkv = self.c_attn(self.norm(x)).view(b, t, 3, self.n_head, self.head_dim)
-        q, k, v = qkv.unbind(2)
-        q, k = self.q_norm(q), self.k_norm(k)
-        x = self.inner_attention(q, k, v, is_causal=self.is_causal)
-        return self.dropout(self.c_proj(x.reshape(b, t, self.n_head * self.head_dim)))
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.position_bias)
+
+    def forward(self, hidden_BLD: torch.Tensor, memory_BSD: torch.Tensor) -> torch.Tensor:
+        batch_size, query_len, _ = hidden_BLD.shape
+        memory_len = memory_BSD.shape[1]
+
+        query_qkv_BL3NH = self.c_attn(self.norm(hidden_BLD)).view(
+            batch_size,
+            query_len,
+            3,
+            self.n_head,
+            self.head_dim,
+        )
+        memory_qkv_BS3NH = self.c_attn(memory_BSD).view(
+            batch_size,
+            memory_len,
+            3,
+            self.n_head,
+            self.head_dim,
+        )
+        q_BLNH = self.q_norm(query_qkv_BL3NH[:, :, 0])
+        k_BSNH = self.k_norm(memory_qkv_BS3NH[:, :, 1])
+        v_BSNH = memory_qkv_BS3NH[:, :, 2]
+
+        query_position_L = torch.arange(query_len, device=hidden_BLD.device)
+        key_position_S = torch.arange(memory_len, device=hidden_BLD.device)
+        window_position_LS = self.window_size - 1 - query_position_L[:, None] + key_position_S[None, :]
+        window_position_LS = window_position_LS.clamp(0, self.window_size - 1)
+        attention_bias_1NLS = self.position_bias[:, window_position_LS][None]
+        if self.is_causal:
+            causal_mask_LS = key_position_S[None, :] <= query_position_L[:, None]
+            attention_bias_1NLS = attention_bias_1NLS.masked_fill(
+                ~causal_mask_LS[None, None],
+                float("-inf"),
+            )
+        attention_bias_1NLS = attention_bias_1NLS.to(q_BLNH.dtype)
+
+        output_BNLH = F.scaled_dot_product_attention(
+            q_BLNH.transpose(1, 2),
+            k_BSNH.transpose(1, 2),
+            v_BSNH.transpose(1, 2),
+            attn_mask=attention_bias_1NLS,
+        )
+        output_BLD = output_BNLH.transpose(1, 2).contiguous().reshape(
+            batch_size,
+            query_len,
+            self.n_head * self.head_dim,
+        )
+        return self.dropout(self.c_proj(output_BLD))
 
 
 class PathTransformerBlock(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        attention: PathSelfAttention.Config
+        attention: PathCrossAttention.Config
         mlp: PathMLP.Config
 
     def __init__(self, config: Config):
@@ -127,9 +178,9 @@ class PathTransformerBlock(Module):
         self.attention = config.attention.build()
         self.mlp = config.mlp.build()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attention(x)
-        return x + self.mlp(x)
+    def forward(self, hidden_BLD: torch.Tensor, memory_BLD: torch.Tensor) -> torch.Tensor:
+        hidden_BLD = hidden_BLD + self.attention(hidden_BLD, memory_BLD)
+        return hidden_BLD + self.mlp(hidden_BLD)
 
 
 class PathTransformer(Module):
@@ -141,10 +192,13 @@ class PathTransformer(Module):
         super().__init__()
         self.layers = ModuleList([layer.build() for layer in config.layers])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
+        # Keep the input memory unchanged while queries are refined layer by layer.
+        memory_BLD = x_BLD
+        hidden_BLD = x_BLD
         for layer in self.layers:
-            x = layer(x)
-        return x
+            hidden_BLD = layer(hidden_BLD, memory_BLD)
+        return hidden_BLD
 
     def apply_activation_checkpointing(self, wrap, base_fqn: str) -> None:
         for layer_id, layer in enumerate(self.layers):
