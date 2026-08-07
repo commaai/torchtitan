@@ -4,13 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import io
+from __future__ import annotations
+
 import os
 import shutil
 import tempfile
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, cast, Literal
+from typing import Any, cast, Literal, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,9 @@ from torchtitan.components import fs
 from torchtitan.components.checkpoint import CheckpointManager, MODEL
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_module
+
+if TYPE_CHECKING:
+    import onnx
 
 
 OnnxInputDType = Literal[
@@ -51,7 +55,7 @@ _ONNX_DTYPE_MAP: dict[str, torch.dtype] = {
     "uint8": torch.uint8,
     "bool": torch.bool,
 }
-_ARTIFACT_BARRIER_TIMEOUT = timedelta(minutes=5)
+_ARTIFACT_BARRIER_TIMEOUT = timedelta(minutes=10)
 
 
 def _rank() -> int:
@@ -88,6 +92,12 @@ class OnnxCheckpointManager(CheckpointManager):
         input_dtypes: list[OnnxInputDType] = field(default_factory=list)
         """Dummy input dtypes used for ONNX export."""
 
+        convert_to_dtype: Literal["float16"] | None = None
+        """Optional dtype conversion applied after ONNX export."""
+
+        op_block_list: list[str] = field(default_factory=list)
+        """Extra ONNX ops kept in float32 during float16 lowering."""
+
     def __init__(self, config: Config, **kwargs) -> None:
         super().__init__(config, **kwargs)
         self.export_onnx = config.export_onnx
@@ -97,6 +107,8 @@ class OnnxCheckpointManager(CheckpointManager):
         self.dynamic_axes = config.dynamic_axes
         self.input_shapes = config.input_shapes
         self.input_dtypes = config.input_dtypes
+        self.convert_to_dtype = config.convert_to_dtype
+        self.op_block_list = config.op_block_list
 
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> bool:
@@ -202,28 +214,47 @@ class OnnxCheckpointManager(CheckpointManager):
         else:
             export_inputs = inputs
 
-        buffer = io.BytesIO()
-        with torch.no_grad():
-            torch.onnx.export(
-                model,
-                export_inputs,
-                cast(Any, buffer),
-                input_names=input_names,
-                output_names=output_names,
-                dynamic_axes=dynamic_axes,
-                dynamic_shapes=dynamic_shapes,
-                dynamo=dynamo,
-                optimize=optimize,
-                external_data=False,
-                export_params=export_params,
-                keep_initializers_as_inputs=keep_initializers_as_inputs,
-            )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "model.onnx")
+            with torch.no_grad():
+                torch.onnx.export(
+                    model,
+                    export_inputs,
+                    local_path,
+                    input_names=input_names,
+                    output_names=output_names,
+                    dynamic_axes=dynamic_axes,
+                    dynamic_shapes=dynamic_shapes,
+                    dynamo=dynamo,
+                    optimize=optimize,
+                    external_data=True,
+                    export_params=export_params,
+                    keep_initializers_as_inputs=keep_initializers_as_inputs,
+                )
 
-        onnx_data = self._post_export_hook(buffer.getvalue())
-        self._write_onnx_data(onnx_data, path, external_data=external_data)
+            if self.convert_to_dtype == "float16":
+                from onnx.checker import MAXIMUM_PROTOBUF
+                from onnxconverter_common.float16 import sort_topology
+                from onnxruntime.transformers import float16
 
-    def _post_export_hook(self, onnx_data: bytes) -> bytes:
-        return onnx_data
+                onnx_model = float16.convert_float_to_float16(
+                    local_path,
+                    op_block_list=[*float16.DEFAULT_OP_BLOCK_LIST, *self.op_block_list],
+                )
+                sort_topology(onnx_model.graph)
+                assert onnx_model.ByteSize() < MAXIMUM_PROTOBUF, (
+                    "Converted ONNX model exceeds the 2 GiB protobuf limit"
+                )
+            else:
+                import onnx
+
+                onnx_model = onnx.load(local_path)
+
+        onnx_model = self._post_export_hook(onnx_model)
+        self._write_onnx_model(onnx_model, path, external_data=external_data)
+
+    def _post_export_hook(self, onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+        return onnx_model
 
     @staticmethod
     def _output_names(
@@ -235,20 +266,19 @@ class OnnxCheckpointManager(CheckpointManager):
         return list(outputs.keys()) if isinstance(outputs, dict) else None
 
     @staticmethod
-    def _write_onnx_data(
-        onnx_data: bytes,
+    def _write_onnx_model(
+        onnx_model: onnx.ModelProto,
         path: str,
         *,
         external_data: bool,
     ) -> None:
         if not external_data:
             with fs.open_file(path, "wb") as f:
-                f.write(onnx_data)
+                f.write(onnx_model.SerializeToString())
             return
 
         import onnx
 
-        onnx_model = onnx.load_from_string(onnx_data)
         filename = fs.basename(path)
         data_filename = f"{filename}.data"
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -191,6 +191,8 @@ class TemporalSummarizer(Module):
         mlp1: PathMLP.Config
         mlp2: PathMLP.Config
         desire_encoder: LinearEncoder.Config
+        desire_window_len: int
+        desire_window_starts: tuple[int, ...]
         traffic_encoder: LinearEncoder.Config
         action_t_encoder: LinearEncoder.Config
         transformer: PathTransformer.Config
@@ -202,13 +204,45 @@ class TemporalSummarizer(Module):
         super().__init__()
         self.block_size = config.block_size
         self.dense_training_outputs = config.dense_training_outputs
+        if len(config.desire_window_starts) != self.block_size:
+            raise ValueError(f"Expected {self.block_size} desire window starts, got {len(config.desire_window_starts)}")
+        self.desire_window_len = config.desire_window_len
+        self.desire_window_starts = config.desire_window_starts
+        self.register_buffer(
+            "desire_window_idxs",
+            self._make_desire_window_idxs(),
+            persistent=False,
+        )
         self.mlp1 = config.mlp1.build()
         self.mlp2 = config.mlp2.build()
         self.desire_encoder = config.desire_encoder.build()
+        self.unknown_desire_embedding = nn.Parameter(torch.empty(config.desire_encoder.out_layer.out_features))
         self.traffic_encoder = config.traffic_encoder.build()
         self.action_t_encoder = config.action_t_encoder.build()
         self.transformer = config.transformer.build()
         self.pos_embedding = config.pos_embedding.build()
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.unknown_desire_embedding)
+
+    def _make_desire_window_idxs(self, device: torch.device | None = None) -> torch.Tensor:
+        starts = torch.tensor(self.desire_window_starts, dtype=torch.long, device=device)
+        offsets = torch.arange(self.desire_window_len, dtype=torch.long, device=device)
+        return (starts[:, None] + offsets[None, :]).flatten()
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        device = buffer_device if buffer_device is not None else self.desire_window_idxs.device
+        self.desire_window_idxs = self._make_desire_window_idxs(device)
+
+    def _window_desire(self, desire: torch.Tensor) -> torch.Tensor:
+        selected = desire.index_select(1, self.desire_window_idxs)
+        return selected.reshape(desire.shape[0], self.block_size, -1)
+
+    def _encode_desire(self, desire: torch.Tensor) -> torch.Tensor:
+        unknown = (desire < 0).any(dim=-1, keepdim=True)
+        encoded = self.desire_encoder(desire.clamp_min(0))
+        unknown_embedding = self.unknown_desire_embedding.to(dtype=encoded.dtype)
+        return torch.where(unknown, unknown_embedding, encoded)
 
     def forward(
         self,
@@ -219,7 +253,7 @@ class TemporalSummarizer(Module):
     ) -> torch.Tensor:
         feats = self.mlp1(feats) + feats
         feats = self.mlp2(feats) + feats
-        desire = rearrange(self.desire_encoder(desire), "b c -> b () c")
+        desire = self._encode_desire(self._window_desire(desire))
         traffic_convention = rearrange(self.traffic_encoder(traffic_convention), "b c -> b () c")
         action_t = rearrange(self.action_t_encoder(action_t), "b c -> b () c")
         pos = self.pos_embedding(torch.arange(self.block_size, device=feats.device))
@@ -298,10 +332,9 @@ class TemporalPolicy(Module):
         action_t: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         dtype = features.dtype
-        stacked_desire = rearrange(desire_pulse.to(dtype), "b t c -> b (t c)")
         summary = self.temporal_summarizer(
             features[:, self.history_idxs],
-            stacked_desire,
+            desire_pulse.to(dtype),
             traffic_convention[:, -1].to(dtype),
             action_t[:, -1].to(dtype),
         )
