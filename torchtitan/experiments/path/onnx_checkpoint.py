@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from xx.ml_tools.constants.model import ModelInputs
-from xx.training.lib.onnx_helpers import add_onnx_metadata, patch_depthwise_convs
+from xx.training.lib.onnx_helpers import add_onnx_metadata, patch_depthwise_convs_model
 
 import onnx
 import torch
@@ -83,15 +83,14 @@ class PathOnnxCheckpointManager(OnnxCheckpointManager):
             optimize=True,
         )
 
-    def _post_export_hook(self, onnx_data: bytes) -> bytes:
-        onnx_data = patch_depthwise_convs(onnx_data)
-        onnx_model = onnx.load_from_string(onnx_data)
+    def _post_export_hook(self, onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+        onnx_model = patch_depthwise_convs_model(onnx_model)
         add_onnx_metadata(
             onnx_model,
             exporter_name="comma_torchtitan",
             exporter_version="0.1",
         )
-        return onnx_model.SerializeToString()
+        return onnx_model
 
     def _input_dict(self, names: list[str]) -> dict[str, torch.Tensor]:
         shapes = dict(zip(self.input_names, self.input_shapes, strict=True))

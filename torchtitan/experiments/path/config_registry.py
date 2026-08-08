@@ -303,9 +303,10 @@ def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnx
         interval=interval,
         input_names=input_names,
         input_shapes=input_shapes,
-        # WIP: activations sometimes overflow, should be addressed by tinygrad runner
-        input_dtypes=["float16"] * len(input_names),
-        onnx_model_dtype="float16",
+        input_dtypes=["float32"] * len(input_names),
+        onnx_model_dtype="float32",
+        convert_to_dtype="float16",
+        op_block_list=["ReduceMean"],
         vision_input_names=vision_input_names,
         temporal_policy_input_names=temporal_policy_input_names,
     )
