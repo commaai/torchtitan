@@ -178,7 +178,9 @@ def _model_config(flavor: str) -> PathModel.Config:
     frame_constants = frame_constants_from_fps(n_frames=n_frames_input, frame_type=input_frame_type)
     in_channels = sum(frame_constants["frame_shapes"][name][0] for name in input_frame_names)
     block_size = len(frame_constants["history_idxs"])
-    temporal_len = frame_constants["temporal_len"]
+    desire_window_len = frame_constants["desire_window_len"]
+    history_idxs = tuple(int(x) for x in frame_constants["history_idxs"])
+    desire_window_starts = tuple(idx - history_idxs[0] for idx in history_idxs)
     dim = vision_features
 
     return PathModel.Config(
@@ -206,7 +208,9 @@ def _model_config(flavor: str) -> PathModel.Config:
             temporal_summarizer=TemporalSummarizer.Config(
                 mlp1=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
                 mlp2=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
-                desire_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.DESIRE][0] * temporal_len, dim),
+                desire_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.DESIRE][0] * desire_window_len, dim),
+                desire_window_len=desire_window_len,
+                desire_window_starts=desire_window_starts,
                 traffic_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0], dim),
                 action_t_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.ACTION_T][0], dim),
                 transformer=PathTransformer.Config(
@@ -226,7 +230,7 @@ def _model_config(flavor: str) -> PathModel.Config:
                 dense_training_outputs=True,
             ),
             temporal_hydra=_hydra(_heads(DRIVING_HEADS + TEMPORAL_META_HEADS), in_features=dim, mlp_mult=2),
-            history_idxs=tuple(int(x) for x in frame_constants["history_idxs"]),
+            history_idxs=history_idxs,
         ),
     )
 
