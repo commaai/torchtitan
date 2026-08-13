@@ -1,7 +1,14 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -9,12 +16,12 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
 from torchtitan.experiments.worldmodel.model import (
-    SelfAttention,
-    TensorOrMask,
-    WorldModel,
     _cast_if_autocast_enabled,
     _dense_mask,
     _mask_fn,
+    SelfAttention,
+    TensorOrMask,
+    WorldModel,
 )
 from torchtitan.experiments.worldmodel.schedulers import RFScheduler
 
@@ -380,16 +387,12 @@ class WorldModelForInference(WorldModel):
         elif self.config.transformer.attention_impl == "SDPA":
             prefill_mask = None
             if prefix_tokens:
-                prefill_mask = _dense_mask(
-                    prefill_mask_fn,
-                    prefix_tokens,
-                    cache_seq_length,
-                )[None, None].to(device=device, dtype=torch.bool)
-            decode_mask = _dense_mask(
-                decode_mask_fn,
-                packed_decode_tokens,
-                cache_seq_length,
-            )[None, None].to(device=device, dtype=torch.bool)
+                prefill_mask = _dense_mask(prefill_mask_fn, prefix_tokens, cache_seq_length,)[
+                    None, None
+                ].to(device=device, dtype=torch.bool)
+            decode_mask = _dense_mask(decode_mask_fn, packed_decode_tokens, cache_seq_length,)[
+                None, None
+            ].to(device=device, dtype=torch.bool)
             if not decode_mask.is_meta and bool(decode_mask.all()):
                 decode_mask = None
         else:
@@ -524,9 +527,9 @@ class WorldModelForInference(WorldModel):
             num_prefill_frames = 14 if num_conditioning_frames is None else num_conditioning_frames
         elif num_conditioning_frames is not None and num_conditioning_frames != num_prefill_frames:
             raise ValueError("num_prefill_frames and legacy num_conditioning_frames must match when both are provided")
-        assert self.config.transformer.attention_mask != "NONE" or num_prefill_frames == 0, (
-            "prefill and decode masks only make sense if we have some causal attention masking"
-        )
+        assert (
+            self.config.transformer.attention_mask != "NONE" or num_prefill_frames == 0
+        ), "prefill and decode masks only make sense if we have some causal attention masking"
 
         batch, frames = latents.shape[:2]
         if not 0 <= num_prefill_frames <= frames:
@@ -568,17 +571,15 @@ class WorldModelForInference(WorldModel):
         if num_prefill_frames == frames:
             raise ValueError("diffusion sampling requires at least one frame after the prefill")
 
-        scheduler = RFScheduler(
-            steps=steps, inference_schedule=inference_schedule, **scheduler_kwargs
-        ).to(device=device)
+        scheduler = RFScheduler(steps=steps, inference_schedule=inference_schedule, **scheduler_kwargs).to(
+            device=device
+        )
         prefix_tokens = num_prefill_frames * self.config.num_spatial_patches
         decode_tokens = (frames - num_prefill_frames) * self.config.num_spatial_patches
         packed_decode_tokens = decode_tokens * (2 if cfg > 0.0 else 1)
         cache_seq_length = prefix_tokens + packed_decode_tokens
         requested_kv_cache_dtype = (
-            getattr(self, "default_kv_cache_dtype", FP8_KV_CACHE_DTYPE)
-            if kv_cache_dtype is None
-            else kv_cache_dtype
+            getattr(self, "default_kv_cache_dtype", FP8_KV_CACHE_DTYPE) if kv_cache_dtype is None else kv_cache_dtype
         )
         self.setup_caches(
             batch,
@@ -657,9 +658,9 @@ class WorldModelForInference(WorldModel):
         batch = latents.shape[0]
         device = latents.device
         prefix_pos = torch.arange(0, num_prefill_frames * self.config.num_spatial_patches, device=device)
-        timesteps = torch.ones(
-            (batch, num_prefill_frames), device=device, dtype=torch.float32
-        ) * scheduler.no_noise_timestep
+        timesteps = (
+            torch.ones((batch, num_prefill_frames), device=device, dtype=torch.float32) * scheduler.no_noise_timestep
+        )
         return self(
             latents[:, :num_prefill_frames],
             timesteps,
@@ -693,13 +694,7 @@ def main() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    outputs = model.generate(
-        **inputs,
-        dtype=torch.bfloat16,
-        steps=2,
-        num_prefill_frames=14,
-        cfg=2.0
-    )
+    outputs = model.generate(**inputs, dtype=torch.bfloat16, steps=2, num_prefill_frames=14, cfg=2.0)
     print(
         {
             "device": str(device),
