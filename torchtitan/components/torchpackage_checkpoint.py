@@ -119,6 +119,17 @@ def export_torch_package(
     if isinstance(recipe, str):
         recipe = load_torch_package_recipe(recipe)
 
+    export_packages = getattr(recipe, "export_packages", None)
+    if export_packages is not None:
+        export_packages(
+            checkpoint_path=checkpoint_path,
+            output_path_template=output_path,
+            recipe_state=recipe_state,
+            step=step,
+            recipe_state_path=recipe_state_path,
+        )
+        return
+
     sl.set_step(step)
     logger.info("Packaging torch checkpoint step=%s", step)
     logger.info("DCP checkpoint path: %s", checkpoint_path)

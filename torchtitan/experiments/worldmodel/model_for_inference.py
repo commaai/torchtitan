@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import torch
 import torch.nn as nn
@@ -19,12 +19,16 @@ from torchtitan.experiments.worldmodel.model import (
 from torchtitan.experiments.worldmodel.schedulers import RFScheduler
 
 
-def _is_sm_at_least_89(device: torch.device) -> bool:
-    return device.type == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_capability(device) >= (8, 9)
+KVCacheDType = Literal["bfloat16", "float8_e4m3fn"]
+WeightFormat = Literal["bf16", "fp8", "fp8_nvfp4"]
+
+BF16_KV_CACHE_DTYPE: KVCacheDType = "bfloat16"
+FP8_KV_CACHE_DTYPE: KVCacheDType = "float8_e4m3fn"
+WEIGHT_FORMATS: tuple[WeightFormat, ...] = ("bf16", "fp8", "fp8_nvfp4")
 
 
-def _cache_dtype_for_device(device: torch.device) -> torch.dtype:
-    return torch.float8_e4m3fn if _is_sm_at_least_89(device) else torch.bfloat16
+def _resolve_kv_cache_dtype(requested_dtype: KVCacheDType) -> torch.dtype:
+    return torch.float8_e4m3fn if requested_dtype == FP8_KV_CACHE_DTYPE else torch.bfloat16
 
 
 def _create_block_mask_fn(device: torch.device):
@@ -210,7 +214,12 @@ class ModelIO:
 
 
 class WorldModelForInference(WorldModel):
-    def __init__(self, config: WorldModel.Config):
+    def __init__(
+        self,
+        config: WorldModel.Config,
+        *,
+        default_kv_cache_dtype: KVCacheDType = FP8_KV_CACHE_DTYPE,
+    ):
         super().__init__(config)
         for block in self.blocks:
             block.attn.__class__ = InferenceSelfAttention
@@ -218,6 +227,7 @@ class WorldModelForInference(WorldModel):
         self.max_batch_size = -1
         self.max_seq_length = -1
         self.cache_dtype: torch.dtype | None = None
+        self.default_kv_cache_dtype = default_kv_cache_dtype
 
     @staticmethod
     def input_shapes(config: WorldModel.Config, batch_size: int = 1) -> dict[str, tuple[int, ...]]:
@@ -288,10 +298,23 @@ class WorldModelForInference(WorldModel):
         for block in self.blocks:
             block.compile(mode="max-autotune-no-cudagraphs")
 
-    def quantize_for_inference(self) -> None:
-        from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig
+    def quantize_for_inference(self, weight_format: WeightFormat = "fp8_nvfp4") -> None:
+        if weight_format == "bf16":
+            return
+
         from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, Float8MMConfig, quantize_
         from torchao.quantization.granularity import PerTensor
+
+        fp8_config = Float8DynamicActivationFloat8WeightConfig(
+            granularity=PerTensor(),
+            mm_config=Float8MMConfig(),
+        )
+
+        if weight_format == "fp8":
+            quantize_(self.blocks, fp8_config)
+            return
+
+        from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig
 
         def is_attention_linear(module: nn.Module, fqn: str) -> bool:
             return isinstance(module, nn.Linear) and ".attn." in f".{fqn}."
@@ -301,10 +324,7 @@ class WorldModelForInference(WorldModel):
 
         quantize_(
             self.blocks,
-            Float8DynamicActivationFloat8WeightConfig(
-                granularity=PerTensor(),
-                mm_config=Float8MMConfig(),
-            ),
+            fp8_config,
             filter_fn=is_attention_linear,
         )
         self.to(device="cuda")
@@ -497,6 +517,7 @@ class WorldModelForInference(WorldModel):
         inference_schedule: str = "linear",
         cfg: float = 0.0,
         return_trajectory: bool = False,
+        kv_cache_dtype: KVCacheDType | None = None,
         **scheduler_kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         if num_prefill_frames is None:
@@ -554,10 +575,15 @@ class WorldModelForInference(WorldModel):
         decode_tokens = (frames - num_prefill_frames) * self.config.num_spatial_patches
         packed_decode_tokens = decode_tokens * (2 if cfg > 0.0 else 1)
         cache_seq_length = prefix_tokens + packed_decode_tokens
+        requested_kv_cache_dtype = (
+            getattr(self, "default_kv_cache_dtype", FP8_KV_CACHE_DTYPE)
+            if kv_cache_dtype is None
+            else kv_cache_dtype
+        )
         self.setup_caches(
             batch,
             cache_seq_length,
-            dtype=_cache_dtype_for_device(device),
+            dtype=_resolve_kv_cache_dtype(requested_kv_cache_dtype),
             device=device,
         )
         prefill_mask, decode_mask = self.get_inference_masks(
