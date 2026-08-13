@@ -295,49 +295,47 @@ class WorldModelTorchPackageRecipe:
         state: Any,
         state_dict: dict[str, torch.Tensor],
         step: int,
-    ) -> bytes:
+    ) -> dict[str, bytes]:
         model_config = validate_model_config(state)
-        return build_package(
-            model_config=model_config,
-            state_dict=state_dict,
-            step=step,
-            weight_format=self.weight_format,
-        )
+        return {
+            PACKAGE_NAME: build_package(
+                model_config=model_config,
+                state_dict=state_dict,
+                step=step,
+                weight_format=self.weight_format,
+            )
+        }
 
 
 class WorldModelTrainingTorchPackageRecipe(WorldModelTorchPackageRecipe):
     weight_formats = WEIGHT_FORMATS
 
-    def export_packages(
+    def build_package(
         self,
         *,
-        checkpoint_path: str,
-        output_path_template: str,
-        recipe_state: Any,
+        state: Any,
+        state_dict: dict[str, torch.Tensor],
         step: int,
-        recipe_state_path: str | None,
-    ) -> None:
-        for weight_format in self.weight_formats:
-            export_recipe_torch_package(
-                recipe=WorldModelTorchPackageRecipe(weight_format=weight_format),
-                checkpoint_path=checkpoint_path,
-                output_path=output_path_template.format(weight_format=weight_format),
-                recipe_state=recipe_state,
+    ) -> dict[str, bytes]:
+        model_config = validate_model_config(state)
+        return {
+            FORMAT_PACKAGE_NAME.format(weight_format=weight_format): build_package(
+                model_config=model_config,
+                state_dict=state_dict.copy(),
                 step=step,
-                recipe_state_path=recipe_state_path,
+                weight_format=weight_format,
             )
+            for weight_format in self.weight_formats
+        }
 
 
 def export_torch_package(
     checkpoint_path: str,
     *,
     weight_format: WeightFormat = DEFAULT_WEIGHT_FORMAT,
-    output_path: str | None = None,
     model_flavor: str | None = None,
 ) -> None:
     recipe_state_path = fs.join_path(checkpoint_path, MODEL_CONFIG_FILE)
-    if output_path is None:
-        output_path = fs.join_path(checkpoint_path, PACKAGE_NAME)
     step = fs.basename(checkpoint_path)
     assert step.isdigit(), f"checkpoint path {checkpoint_path} does not end with a step number."
     if model_flavor is None:
@@ -350,7 +348,6 @@ def export_torch_package(
         export_recipe_torch_package(
             recipe=WorldModelTorchPackageRecipe(weight_format=weight_format),
             checkpoint_path=checkpoint_path,
-            output_path=output_path,
             recipe_state=model_config,
             step=int(step),
             recipe_state_path=(recipe_state_path if model_flavor is None else None),
@@ -366,7 +363,6 @@ class WorldModelTorchPackageCheckpointManager(TorchPackageCheckpointManager):
     @dataclass(kw_only=True, slots=True)
     class Config(TorchPackageCheckpointManager.Config):
         torch_package_recipe: str = WORLD_MODEL_TRAINING_TORCH_PACKAGE_RECIPE
-        torch_package_file: str = FORMAT_PACKAGE_NAME
         torch_package_recipe_state_file: str = MODEL_CONFIG_FILE
         torch_package_structured_log_dir: str = STRUCTURED_LOG_DIR
 
@@ -379,7 +375,6 @@ def main() -> None:
         choices=WEIGHT_FORMATS,
         default=DEFAULT_WEIGHT_FORMAT,
     )
-    parser.add_argument("--output-path")
     parser.add_argument("--model-flavor")
     args = parser.parse_args()
 
@@ -392,7 +387,6 @@ def main() -> None:
         export_torch_package(
             args.checkpoint_path,
             weight_format=args.weight_format,
-            output_path=args.output_path,
             model_flavor=args.model_flavor,
         )
 

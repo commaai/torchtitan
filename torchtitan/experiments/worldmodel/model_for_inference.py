@@ -334,15 +334,15 @@ class WorldModelForInference(WorldModel):
             fp8_config,
             filter_fn=is_attention_linear,
         )
-        self.to(device="cuda")
-        quantize_(
-            self.blocks,
-            NVFP4DynamicActivationNVFP4WeightConfig(
-                use_dynamic_per_tensor_scale=True,
-                use_triton_kernel=False,
-            ),
-            filter_fn=is_mlp_linear,
+        nvfp4_config = NVFP4DynamicActivationNVFP4WeightConfig(
+            use_dynamic_per_tensor_scale=True,
+            use_triton_kernel=False,
         )
+        for fqn, module in self.blocks.named_modules():
+            if is_mlp_linear(module, fqn):
+                module.to(device="cuda")
+                quantize_(module, nvfp4_config)
+                module.to(device="cpu")
 
     @torch.no_grad()
     def get_inference_masks(

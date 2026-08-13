@@ -51,6 +51,7 @@ OPTIMIZER = "optimizer"
 LR_SCHEDULER = "lr_scheduler"
 DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
+CHECKPOINT_UPLOAD_TIMEOUT_SECONDS = 600.0
 
 
 class AsyncMode(str, enum.Enum):
@@ -606,7 +607,7 @@ class CheckpointManager(Configurable):
             # `consolidate_safetensors_files_on_every_rank` is used later to manage
             # the multi-file merging process.
         else:
-            storage_writer = FsspecWriter(checkpoint_id)
+            storage_writer = FsspecWriter(checkpoint_id, timeout=CHECKPOINT_UPLOAD_TIMEOUT_SECONDS)
 
         # Execution Dispatch
         checkpoint_save_id = (
