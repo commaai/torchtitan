@@ -34,6 +34,7 @@ os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 DEFAULT_RECIPE_STATE_FILE = "_torchpackage_recipe_state.pt"
 DEFAULT_STRUCTURED_LOG_DIR = os.getenv("TORCHTITAN_STRUCTURED_LOG_DIR", "./outputs/torchpackage_checkpoint")
 DEFAULT_WORKER_MODULE = "torchtitan.components.torchpackage_checkpoint"
+TORCH_PACKAGE_UPLOAD_TIMEOUT_SECONDS = 600.0
 
 
 class TorchPackageRecipe(Protocol):
@@ -154,7 +155,7 @@ def export_torch_package(
 
     package_bytes = len(package)
     with sl.log_trace_span("torch_package_write"):
-        with fs.open_file(output_path, "wb") as handle:
+        with fs.open_file(output_path, "wb", timeout=TORCH_PACKAGE_UPLOAD_TIMEOUT_SECONDS) as handle:
             handle.write(package)
     del package
     gc.collect()
