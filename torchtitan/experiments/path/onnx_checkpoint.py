@@ -16,10 +16,9 @@ import torch
 import torch.nn as nn
 
 from torchtitan.components import fs
-from torchtitan.components.onnx_checkpoint import _ONNX_DTYPE_MAP, OnnxCheckpointManager, OnnxInputDType
+from torchtitan.components.onnx_checkpoint import _ONNX_DTYPE_MAP, OnnxCheckpointManager
 
 from .model import PathModel
-
 
 class _VisionOnnxModel(nn.Module):
     def __init__(self, model: PathModel) -> None:
@@ -29,7 +28,8 @@ class _VisionOnnxModel(nn.Module):
 
     def forward(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         features = self.vision(inputs)
-        return self.point_policy(features) | {"vision_features": features}
+        outputs = self.point_policy(features) | {"vision_features": features}
+        return {name: value.float() for name, value in outputs.items()}
 
 
 class _TemporalPolicyOnnxModel(nn.Module):
@@ -44,7 +44,7 @@ class _TemporalPolicyOnnxModel(nn.Module):
             inputs[ModelInputs.TRAFFIC],
             inputs[ModelInputs.ACTION_T],
         )
-        return {name: value[:, -1] if value.ndim == 3 else value for name, value in outputs.items()}
+        return {name: (value[:, -1] if value.ndim == 3 else value).float() for name, value in outputs.items()}
 
 
 class PathOnnxCheckpointManager(OnnxCheckpointManager):
@@ -52,7 +52,8 @@ class PathOnnxCheckpointManager(OnnxCheckpointManager):
     class Config(OnnxCheckpointManager.Config):
         checkpoint_base_folder: str = ""
         onnx_file: str = ""
-        onnx_model_dtype: OnnxInputDType = "float32"
+        vision_onnx_compute_dtype: str = "float32"
+        temporal_policy_onnx_compute_dtype: str = "float32"
         vision_input_names: list[str] = field(default_factory=list)
         temporal_policy_input_names: list[str] = field(default_factory=list)
 
@@ -60,13 +61,16 @@ class PathOnnxCheckpointManager(OnnxCheckpointManager):
         if config.checkpoint_base_folder:
             kwargs["base_folder"] = config.checkpoint_base_folder
         super().__init__(config, **kwargs)
-        self.onnx_model_dtype = _ONNX_DTYPE_MAP[config.onnx_model_dtype]
+        self.vision_onnx_compute_dtype = _ONNX_DTYPE_MAP[config.vision_onnx_compute_dtype]
+        self.temporal_policy_onnx_compute_dtype = _ONNX_DTYPE_MAP[config.temporal_policy_onnx_compute_dtype]
         self.vision_input_names = config.vision_input_names
         self.temporal_policy_input_names = config.temporal_policy_input_names
 
     def _export_onnx(self, model: nn.Module, path: str) -> None:
         assert isinstance(model, PathModel)
-        model = model.to(dtype=self.onnx_model_dtype)
+        model.vision.to(dtype=self.vision_onnx_compute_dtype)
+        model.point_policy.to(dtype=self.vision_onnx_compute_dtype)
+        model.temporal_policy.to(dtype=self.temporal_policy_onnx_compute_dtype)
         self._export_one(
             _VisionOnnxModel(model).eval(),
             self._input_dict(self.vision_input_names),
@@ -89,7 +93,7 @@ class PathOnnxCheckpointManager(OnnxCheckpointManager):
         add_onnx_metadata(
             onnx_model,
             exporter_name="comma_torchtitan",
-            exporter_version="0.1",
+            exporter_version="0.2",
         )
         return onnx_model.SerializeToString()
 
