@@ -20,6 +20,7 @@ from torchtitan.components.onnx_checkpoint import _ONNX_DTYPE_MAP, OnnxCheckpoin
 
 from .model import PathModel
 
+
 class _VisionOnnxModel(nn.Module):
     def __init__(self, model: PathModel) -> None:
         super().__init__()
