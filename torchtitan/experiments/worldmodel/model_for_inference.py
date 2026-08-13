@@ -289,15 +289,12 @@ class WorldModelForInference(WorldModel):
             block.compile(mode="max-autotune-no-cudagraphs")
 
     def quantize_for_inference(self) -> None:
-        from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig
-        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, Float8MMConfig, quantize_
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            Float8MMConfig,
+            quantize_,
+        )
         from torchao.quantization.granularity import PerTensor
-
-        def is_attention_linear(module: nn.Module, fqn: str) -> bool:
-            return isinstance(module, nn.Linear) and ".attn." in f".{fqn}."
-
-        def is_mlp_linear(module: nn.Module, fqn: str) -> bool:
-            return isinstance(module, nn.Linear) and ".mlp." in f".{fqn}."
 
         quantize_(
             self.blocks,
@@ -305,16 +302,6 @@ class WorldModelForInference(WorldModel):
                 granularity=PerTensor(),
                 mm_config=Float8MMConfig(),
             ),
-            filter_fn=is_attention_linear,
-        )
-        self.to(device="cuda")
-        quantize_(
-            self.blocks,
-            NVFP4DynamicActivationNVFP4WeightConfig(
-                use_dynamic_per_tensor_scale=True,
-                use_triton_kernel=False,
-            ),
-            filter_fn=is_mlp_linear,
         )
 
     @torch.no_grad()
