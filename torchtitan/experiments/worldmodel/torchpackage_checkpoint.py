@@ -136,29 +136,16 @@ def load_model_config(path: str) -> WorldModel.Config:
     return validate_model_config(load_recipe_state(path))
 
 
-def convert_state_dict_to_fp8(
+def convert_state_dict_for_inference(
     model_config: WorldModel.Config,
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    from torchao.quantization import (
-        Float8DynamicActivationFloat8WeightConfig,
-        Float8MMConfig,
-        quantize_,
-    )
-    from torchao.quantization.granularity import PerTensor
-
     with torch.device("cpu"):
         model = WorldModelForInference(model_config).to(dtype=torch.bfloat16).eval()
     model.load_state_dict(state_dict, strict=True, assign=True)
     state_dict.clear()
     del state_dict
-    quantize_(
-        model.blocks,
-        Float8DynamicActivationFloat8WeightConfig(
-            granularity=PerTensor(),
-            mm_config=Float8MMConfig(),
-        ),
-    )
+    model.quantize_for_inference()
     converted = {key: value.detach().cpu() for key, value in model.state_dict().items()}
     del model
     gc.collect()
@@ -170,11 +157,10 @@ def build_package(
     model_config: WorldModel.Config,
     state_dict: dict[str, torch.Tensor],
     step: int,
-    provenance: dict[str, Any] | None = None,
 ) -> bytes:
 
-    with sl.log_trace_span("worldmodel_package_convert_fp8"):
-        state_dict = convert_state_dict_to_fp8(model_config, state_dict)
+    with sl.log_trace_span("worldmodel_package_quantize_hybrid_nvfp4_fp8"):
+        state_dict = convert_state_dict_for_inference(model_config, state_dict)
 
     with sl.log_trace_span("worldmodel_package_model_io"):
         io_model_config = copy.deepcopy(model_config)
@@ -224,10 +210,9 @@ def build_package(
             )
             exporter.save_pickle("model", "model.pkl", model)
             del model
-            meta = {"model_io": model_io, "step": step}
-            if provenance is not None:
-                meta["conversion"] = provenance
-            exporter.save_pickle("meta", "meta.pkl", meta)
+            exporter.save_pickle(
+                "meta", "meta.pkl", {"model_io": model_io, "step": step}
+            )
             del model_io
 
             state_dict_buffer = io.BytesIO()
@@ -276,7 +261,7 @@ class WorldModelTorchPackageRecipe:
 def export_torch_package(checkpoint_path: str) -> None:
     recipe_state_path = fs.join_path(checkpoint_path, MODEL_CONFIG_FILE)
     output_path = fs.join_path(checkpoint_path, PACKAGE_NAME)
-    step = fs.basename(checkpoint_path).removeprefix("step-")
+    step = fs.basename(checkpoint_path)
     assert (
         step.isdigit()
     ), f"checkpoint path {checkpoint_path} does not end with a step number."

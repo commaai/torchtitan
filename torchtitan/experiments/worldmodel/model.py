@@ -860,14 +860,11 @@ class WorldModel(BaseModel):
             current_blocks = getattr(self, "blocks", [])
             current_final = getattr(self, "final_layer", None)
             current_plan = getattr(self, "plan_head_linears", None)
-            current_x = getattr(getattr(self, "x_embedder", None), "linear", None)
-
             self.x_embedder = PatchEmbedderLinearsConfig(
                 linear=linear_config(
                     self.in_channels * math.prod(self.patch_size),
                     hidden,
-                    bias=current_x.bias if current_x else False,
-                    current=current_x,
+                    current=getattr(getattr(self, "x_embedder", None), "linear", None),
                 )
             )
             self.augments_pos_ref_augment_embedder = (
