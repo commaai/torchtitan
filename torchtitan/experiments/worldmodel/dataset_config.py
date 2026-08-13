@@ -1,6 +1,12 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
-from xx.datasets.constants import BASE_DIR_GT_10M, DEFAULT_10M_TRAIN_LIST
+from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TRAIN_LIST
 
 from .dataset import WorldModelDataLoader
 from .model_config import COMPRESSOR_MODEL, LATENT_CHANNELS, LATENT_SIZE
@@ -11,14 +17,14 @@ IMAGE_SIZE = (128, 256)
 def _dataloader_config(
     *,
     split: str,
-    dataset: str = DEFAULT_10M_TRAIN_LIST,
+    dataset: str = DEFAULT_TRAIN_LIST,
     dataset_path: str | None = None,
     shuffle_size: int = 50_000,
     min_mixing: float = 0.5,
     num_writers: int = 2,
     num_readers: int = 4,
     fill_once: bool = False,
-    base_dir: str = BASE_DIR_GT_10M,
+    base_dir: str = BASE_DIR_GT,
     feature_dir: str | None = None,
     compressor_model: str = COMPRESSOR_MODEL,
     in_channels: int = LATENT_CHANNELS,

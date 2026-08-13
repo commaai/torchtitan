@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import os
 from functools import partial
-from xx.datasets.constants import BASE_DIR_GT, BASE_DIR_GT_10M, DEFAULT_BIG_TRAIN_LIST, DEFAULT_TEST_5K_LIST_TAGGED
+from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TEST_5K_LIST_TAGGED, DEFAULT_TRAIN_LIST
 from xx.ml_tools.constants.model import (
     frame_constants_from_fps,
     FRAME_TYPE,
@@ -102,11 +102,12 @@ def _path(flavor: str) -> PathTrainer.Config:
         model_spec=model_registry(flavor),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=_dataloader_config(
-            dataset=DEFAULT_BIG_TRAIN_LIST,
+            dataset=DEFAULT_TRAIN_LIST,
             split="train",
             fps=fps,
             plan_only=plan_only,
-            limit=None,
+            limit=2_500_000,
+            deterministic_fidxs=False,
             pipeline_dir=BASE_DIR_GT,
             skip=1,
             val_skip=1,
@@ -157,7 +158,8 @@ def _path(flavor: str) -> PathTrainer.Config:
                 plan_only=True,
                 dataset=DEFAULT_TEST_5K_LIST_TAGGED,
                 limit=6_000,
-                pipeline_dir=BASE_DIR_GT_10M,
+                deterministic_fidxs=True,
+                pipeline_dir=BASE_DIR_GT,
                 skip=1,
                 val_skip=6,
             ),
@@ -176,7 +178,9 @@ def _model_config(flavor: str) -> PathModel.Config:
     frame_constants = frame_constants_from_fps(n_frames=n_frames_input, frame_type=input_frame_type)
     in_channels = sum(frame_constants["frame_shapes"][name][0] for name in input_frame_names)
     block_size = len(frame_constants["history_idxs"])
-    temporal_len = frame_constants["temporal_len"]
+    desire_window_len = frame_constants["desire_window_len"]
+    history_idxs = tuple(int(x) for x in frame_constants["history_idxs"])
+    desire_window_starts = tuple(idx - history_idxs[0] for idx in history_idxs)
     dim = vision_features
 
     return PathModel.Config(
@@ -204,7 +208,9 @@ def _model_config(flavor: str) -> PathModel.Config:
             temporal_summarizer=TemporalSummarizer.Config(
                 mlp1=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
                 mlp2=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
-                desire_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.DESIRE][0] * temporal_len, dim),
+                desire_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.DESIRE][0] * desire_window_len, dim),
+                desire_window_len=desire_window_len,
+                desire_window_starts=desire_window_starts,
                 traffic_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0], dim),
                 action_t_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.ACTION_T][0], dim),
                 transformer=PathTransformer.Config(
@@ -224,7 +230,7 @@ def _model_config(flavor: str) -> PathModel.Config:
                 dense_training_outputs=True,
             ),
             temporal_hydra=_hydra(_heads(DRIVING_HEADS + TEMPORAL_META_HEADS), in_features=dim, mlp_mult=2),
-            history_idxs=tuple(int(x) for x in frame_constants["history_idxs"]),
+            history_idxs=history_idxs,
         ),
     )
 
@@ -236,6 +242,7 @@ def _dataloader_config(
     fps: int,
     plan_only: bool,
     limit: int | None,
+    deterministic_fidxs: bool,
     pipeline_dir: str,
     skip: int,
     val_skip: int,
@@ -252,6 +259,7 @@ def _dataloader_config(
         dataset=dataset,
         split=split,
         shuffle_size=_si_int(base.shuffle_size),
+        deterministic_fidxs=deterministic_fidxs,
         min_mixing=base.min_mixing,
         num_writers=base.num_writers,
         num_readers=base.num_readers,
@@ -299,9 +307,9 @@ def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnx
         interval=interval,
         input_names=input_names,
         input_shapes=input_shapes,
-        # WIP: activations sometimes overflow, should be addressed by tinygrad runner
-        input_dtypes=["float16"] * len(input_names),
-        onnx_model_dtype="float16",
+        input_dtypes=["float32"] * len(input_names),
+        vision_onnx_compute_dtype="bfloat16",
+        temporal_policy_onnx_compute_dtype="float32",
         vision_input_names=vision_input_names,
         temporal_policy_input_names=temporal_policy_input_names,
     )

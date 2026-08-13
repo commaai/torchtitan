@@ -15,10 +15,7 @@ from typing import Any, cast, Literal
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.checkpoint.state_dict import (
-    get_model_state_dict,
-    StateDictOptions,
-)
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 
 from torchtitan.components import fs
 from torchtitan.components.checkpoint import CheckpointManager, MODEL
@@ -113,9 +110,7 @@ class OnnxCheckpointManager(CheckpointManager):
         if dist.get_world_size() == 1:
             return
 
-        barrier_group = cast(
-            dist.ProcessGroup, dist.new_group(timeout=_ARTIFACT_BARRIER_TIMEOUT)
-        )
+        barrier_group = cast(dist.ProcessGroup, dist.new_group(timeout=_ARTIFACT_BARRIER_TIMEOUT))
         try:
             dist.barrier(
                 group=barrier_group,
@@ -154,10 +149,7 @@ class OnnxCheckpointManager(CheckpointManager):
         # plain CPU model from the gathered state dict instead.
         model_config = getattr(source_model, "config", None)
         if model_config is None or not hasattr(model_config, "build"):
-            raise ValueError(
-                "ONNX export requires the model to expose a TorchTitan config "
-                "with a build() method."
-            )
+            raise ValueError("ONNX export requires the model to expose a TorchTitan config " "with a build() method.")
         with torch.device("cpu"):
             model = model_config.build()
         model.load_state_dict(state_dict)
@@ -186,6 +178,7 @@ class OnnxCheckpointManager(CheckpointManager):
         dynamic_shapes: Any | None = None,
         dynamo: bool = True,
         optimize: bool = True,
+        opset_version: int = 22,
         external_data: bool = False,
         export_params: bool = True,
         keep_initializers_as_inputs: bool = False,
@@ -194,9 +187,7 @@ class OnnxCheckpointManager(CheckpointManager):
         if isinstance(inputs, dict):
             input_names = input_names or list(inputs.keys())
             output_names = output_names or self._output_names(model, (inputs,))
-            dynamic_shapes = dynamic_shapes or (
-                {name: {0: "b"} for name in input_names},
-            )
+            dynamic_shapes = dynamic_shapes or ({name: {0: "b"} for name in input_names},)
             # Keep dict inputs as one positional model argument.
             export_inputs = (inputs, {})
         else:
@@ -214,6 +205,7 @@ class OnnxCheckpointManager(CheckpointManager):
                 dynamic_shapes=dynamic_shapes,
                 dynamo=dynamo,
                 optimize=optimize,
+                opset_version=opset_version,
                 external_data=False,
                 export_params=export_params,
                 keep_initializers_as_inputs=keep_initializers_as_inputs,
@@ -265,9 +257,7 @@ class OnnxCheckpointManager(CheckpointManager):
             with open(local_path, "rb") as src, fs.open_file(path, "wb") as dst:
                 shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
             if os.path.exists(local_data_path):
-                with open(local_data_path, "rb") as src, fs.open_file(
-                    f"{path}.data", "wb"
-                ) as dst:
+                with open(local_data_path, "rb") as src, fs.open_file(f"{path}.data", "wb") as dst:
                     shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
 
     def _dynamic_axes(self) -> dict[str, dict[int, str]] | None:
