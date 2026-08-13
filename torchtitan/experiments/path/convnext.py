@@ -32,6 +32,7 @@ from timm.models._manipulate import checkpoint_seq, named_apply
 __all__ = [
     "CONVNEXT_FLAVORS",
     "ConvNeXt",
+    "FP32GlobalAvgPool",
     "convnext_base",
     "convnext_small",
     "convnext_tiny",
@@ -88,6 +89,11 @@ CONVNEXT_FLAVORS = {
         "pretrained": "convnext_xxlarge.clip_laion2b_soup",
     },
 }
+
+
+class FP32GlobalAvgPool(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value.float().mean((-2, -1), keepdim=True).to(value.dtype)
 
 
 class Downsample(nn.Module):
@@ -239,7 +245,7 @@ class ConvNeXt(nn.Module):
         self,
         in_chans: int = 3,
         num_classes: int = 1000,
-        global_pool: str = "avg",
+        global_pool: str = "fp32_avg",
         output_stride: int = 32,
         depths: tuple[int, ...] = (3, 4, 30, 3),
         dims: tuple[int, ...] = (384, 768, 1536, 3072),
@@ -302,15 +308,18 @@ class ConvNeXt(nn.Module):
         self.stages = nn.Sequential(*stages)
         self.num_features = self.head_hidden_size = prev_chs
         self.norm_pre = nn.Identity()
+        head_pool = "fast" if global_pool == "fp32_avg" else global_pool
         self.head = NormMlpClassifierHead(
             self.num_features,
             num_classes,
-            pool_type=global_pool,
+            pool_type=head_pool,
             drop_rate=drop_rate,
             norm_layer=partial(LayerNorm2d, eps=norm_eps),
             act_layer="gelu",
             **dd,
         )
+        if global_pool == "fp32_avg":
+            self.head.global_pool.pool = FP32GlobalAvgPool()
         named_apply(partial(_init_weights, head_init_scale=head_init_scale), self)
 
     def set_grad_checkpointing(self, enable: bool = True) -> None:
@@ -347,7 +356,9 @@ class ConvNeXt(nn.Module):
 
     def reset_classifier(self, num_classes: int, global_pool: str | None = None) -> None:
         self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool)
+        self.head.reset(num_classes, "fast" if global_pool == "fp32_avg" else global_pool)
+        if global_pool == "fp32_avg":
+            self.head.global_pool.pool = FP32GlobalAvgPool()
 
     def init_path_weights(self) -> None:
         named_apply(partial(_init_weights, head_init_scale=self.head_init_scale), self)
