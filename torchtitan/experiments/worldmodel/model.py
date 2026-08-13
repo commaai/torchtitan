@@ -26,20 +26,9 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.config.configurable import Configurable
-from torchtitan.models.common.attention import (
-    create_attention_mask,
-    FlexAttention,
-    ScaledDotProductAttention,
-)
+from torchtitan.models.common.attention import create_attention_mask, FlexAttention, ScaledDotProductAttention
 from torchtitan.models.common.embedding import Embedding
-from torchtitan.models.common.nn_modules import (
-    GELU,
-    Identity,
-    LayerNorm,
-    Linear,
-    RMSNorm,
-    SiLU,
-)
+from torchtitan.models.common.nn_modules import GELU, Identity, LayerNorm, Linear, RMSNorm, SiLU
 from torchtitan.protocols.model import BaseModel
 from torchtitan.tools.logging import logger
 
@@ -216,9 +205,7 @@ def dit_block_linears_config(
     current: DiTBlockLinearsConfig | None = None,
 ) -> DiTBlockLinearsConfig:
     return DiTBlockLinearsConfig(
-        attn=self_attention_linears_config(
-            config, None if current is None else current.attn
-        ),
+        attn=self_attention_linears_config(config, None if current is None else current.attn),
         mlp=ffn_linears_config(config, None if current is None else current.mlp),
     )
 
@@ -230,9 +217,7 @@ def plan_head_linears_config(
     current_blocks = [] if current is None else current.blocks
     return PlanHeadLinearsConfig(
         blocks=[
-            ffn_linears_config(
-                config, current_blocks[i] if i < len(current_blocks) else None
-            )
+            ffn_linears_config(config, current_blocks[i] if i < len(current_blocks) else None)
             for i in range(config.n_layer)
         ],
         head=linear_config(
@@ -244,17 +229,11 @@ def plan_head_linears_config(
     )
 
 
-def make_norm(
-    name: str, normalized_shape: int, *, elementwise_affine: bool = True
-) -> nn.Module:
+def make_norm(name: str, normalized_shape: int, *, elementwise_affine: bool = True) -> nn.Module:
     if name == "LayerNorm":
-        return LayerNorm.Config(
-            normalized_shape=normalized_shape, elementwise_affine=elementwise_affine
-        ).build()
+        return LayerNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine).build()
     if name == "RMSNorm":
-        return RMSNorm.Config(
-            normalized_shape=normalized_shape, elementwise_affine=elementwise_affine
-        ).build()
+        return RMSNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine).build()
     raise ValueError(f"unknown norm {name}")
 
 
@@ -273,14 +252,7 @@ def mlp_hidden_dim(n_embd: int, mlp_mult: float, mlp_multiple_of: int) -> int:
 
 def attn_flops(config: TransformerConfig) -> int:
     head_dim = config.n_embd // config.n_head
-    return (
-        12
-        * config.n_layer
-        * config.n_head
-        * head_dim
-        * config.block_size
-        * config.block_size
-    )
+    return 12 * config.n_layer * config.n_head * head_dim * config.block_size * config.block_size
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -395,18 +367,14 @@ def _mask_fn(config: TransformerConfig) -> Callable | None:
         return None
     if config.attention_mask == "BLOCKWISE_LOWER_TRIANGLE":
         if config.attention_mask_mini_block_size is None:
-            raise ValueError(
-                "BLOCKWISE_LOWER_TRIANGLE requires attention_mask_mini_block_size"
-            )
+            raise ValueError("BLOCKWISE_LOWER_TRIANGLE requires attention_mask_mini_block_size")
         return partial(
             _blockwise_lower_triangular_causal_mask,
             config.attention_mask_mini_block_size,
         )
     if config.attention_mask == "LAST_FRAME_CAUSAL":
         if config.attention_mask_mini_block_size is None:
-            raise ValueError(
-                "LAST_FRAME_CAUSAL requires attention_mask_mini_block_size"
-            )
+            raise ValueError("LAST_FRAME_CAUSAL requires attention_mask_mini_block_size")
         return partial(
             _last_frame_causal_mask,
             config.block_size,
@@ -415,18 +383,14 @@ def _mask_fn(config: TransformerConfig) -> Callable | None:
     raise ValueError(f"unknown attention_mask {config.attention_mask}")
 
 
-def build_attention_mask(
-    config: TransformerConfig, device: torch.device
-) -> TensorOrMask | None:
+def build_attention_mask(config: TransformerConfig, device: torch.device) -> TensorOrMask | None:
     mask_fn = _mask_fn(config)
     if mask_fn is None:
         return None
     if config.attention_impl == "FLEX":
         if config.attn_pdrop > 0.0:
             raise NotImplementedError("FLEX attention does not support dropout")
-        create_mask = (
-            create_block_mask if device.type == "meta" else create_attention_mask
-        )
+        create_mask = create_block_mask if device.type == "meta" else create_attention_mask
         mask = create_mask(
             mask_fn,
             B=None,
@@ -438,9 +402,9 @@ def build_attention_mask(
         mask.device = device
         return mask
     if config.attention_impl == "SDPA":
-        return _dense_mask(mask_fn, config.block_size, config.block_size)[
-            None, None
-        ].to(device=device, dtype=torch.bool)
+        return _dense_mask(mask_fn, config.block_size, config.block_size)[None, None].to(
+            device=device, dtype=torch.bool
+        )
     raise ValueError(f"unknown attention_impl {config.attention_impl}")
 
 
@@ -470,9 +434,7 @@ class PatchEmbedder(nn.Sequential):
 class ContinuousEmbedder(nn.Module):
     def __init__(self, linears: ConditioningEmbedderLinearsConfig):
         super().__init__()
-        self.mlp = nn.Sequential(
-            linears.mlp_in.build(), SiLU.Config().build(), linears.mlp_out.build()
-        )
+        self.mlp = nn.Sequential(linears.mlp_in.build(), SiLU.Config().build(), linears.mlp_out.build())
         self.to_t6 = nn.Sequential(SiLU.Config().build(), linears.to_t6.build())
         self.to_t2 = nn.Sequential(SiLU.Config().build(), linears.to_t2.build())
         self.init_weights()
@@ -496,9 +458,7 @@ class DiscreteEmbedder(nn.Module):
     ):
         super().__init__()
         self.mlp = nn.Sequential(
-            Embedding.Config(
-                num_embeddings=input_size, embedding_dim=hidden_size
-            ).build(),
+            Embedding.Config(num_embeddings=input_size, embedding_dim=hidden_size).build(),
             SiLU.Config().build(),
             linears.mlp_out.build(),
         )
@@ -528,9 +488,7 @@ class TimestepEmbedder(nn.Module):
         super().__init__()
         if frequency_embedding_size % 2 != 0:
             raise ValueError("frequency_embedding_size must be even")
-        self.mlp = nn.Sequential(
-            linears.mlp_in.build(), SiLU.Config().build(), linears.mlp_out.build()
-        )
+        self.mlp = nn.Sequential(linears.mlp_in.build(), SiLU.Config().build(), linears.mlp_out.build())
         self.to_t6 = nn.Sequential(SiLU.Config().build(), linears.to_t6.build())
         self.to_t2 = nn.Sequential(SiLU.Config().build(), linears.to_t2.build())
         self.frequency_embedding_size = frequency_embedding_size
@@ -541,9 +499,7 @@ class TimestepEmbedder(nn.Module):
     def timestep_embedding(self, t: torch.Tensor) -> torch.Tensor:
         half = self.frequency_embedding_size // 2
         freqs = torch.exp(
-            -math.log(self.max_period)
-            * torch.arange(start=0, end=half, device=t.device, dtype=torch.float32)
-            / half
+            -math.log(self.max_period) * torch.arange(start=0, end=half, device=t.device, dtype=torch.float32) / half
         )
         args = self.time_factor * t.float()[..., None] * freqs[None]
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
@@ -581,45 +537,21 @@ class SelfAttention(nn.Module):
             raise ValueError("n_embd must be divisible by n_head")
         self.config = config
         self.head_dim = config.n_embd // config.n_head
-        self.layer_norm = (
-            make_norm(config.norm, config.n_embd)
-            if config.prenorm
-            else Identity.Config().build()
-        )
-        self.q_norm = (
-            make_norm(config.norm, self.head_dim)
-            if config.qk_norm
-            else Identity.Config().build()
-        )
-        self.k_norm = (
-            make_norm(config.norm, self.head_dim)
-            if config.qk_norm
-            else Identity.Config().build()
-        )
+        self.layer_norm = make_norm(config.norm, config.n_embd) if config.prenorm else Identity.Config().build()
+        self.q_norm = make_norm(config.norm, self.head_dim) if config.qk_norm else Identity.Config().build()
+        self.k_norm = make_norm(config.norm, self.head_dim) if config.qk_norm else Identity.Config().build()
         self.c_attn = linears.c_attn.build()
         self.c_proj = linears.c_proj.build()
         self.dropout = nn.Dropout(config.resid_pdrop)
-        self.flex_attention = (
-            FlexAttention.Config().build() if config.attention_impl == "FLEX" else None
-        )
-        self.sdpa = (
-            ScaledDotProductAttention.Config().build()
-            if config.attention_impl == "SDPA"
-            else None
-        )
+        self.flex_attention = FlexAttention.Config().build() if config.attention_impl == "FLEX" else None
+        self.sdpa = ScaledDotProductAttention.Config().build() if config.attention_impl == "SDPA" else None
         self.kv_cache: Any | None = None
 
-    def forward(
-        self, x: torch.Tensor, input_mask: TensorOrMask | None = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, input_mask: TensorOrMask | None = None) -> torch.Tensor:
         batch, seq_len, emb_dim = x.shape
-        qkv = self.c_attn(self.layer_norm(x)).view(
-            batch, seq_len, 3, self.config.n_head, self.head_dim
-        )
+        qkv = self.c_attn(self.layer_norm(x)).view(batch, seq_len, 3, self.config.n_head, self.head_dim)
         q, k, v = qkv.unbind(2)
-        q, k = _cast_if_autocast_enabled(self.q_norm(q)), _cast_if_autocast_enabled(
-            self.k_norm(k)
-        )
+        q, k = _cast_if_autocast_enabled(self.q_norm(q)), _cast_if_autocast_enabled(self.k_norm(k))
 
         if self.config.attention_impl == "FLEX":
             assert self.flex_attention is not None
@@ -632,9 +564,7 @@ class SelfAttention(nn.Module):
             )
         elif self.config.attention_impl == "SDPA" and input_mask is None:
             assert self.sdpa is not None
-            y = self.sdpa(
-                q, k, v, scale=1.0 / math.sqrt(self.head_dim), is_causal=False
-            )
+            y = self.sdpa(q, k, v, scale=1.0 / math.sqrt(self.head_dim), is_causal=False)
         elif self.config.attention_impl == "SDPA":
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             y = F.scaled_dot_product_attention(
@@ -654,9 +584,7 @@ def build_ffn(config: TransformerConfig, linears: FFNLinearsConfig) -> nn.Sequen
     return nn.Sequential(
         OrderedDict(
             {
-                "layer_norm": make_norm(config.norm, config.n_embd)
-                if config.prenorm
-                else Identity.Config().build(),
+                "layer_norm": make_norm(config.norm, config.n_embd) if config.prenorm else Identity.Config().build(),
                 "c_fc": linears.c_fc.build(),
                 "act": make_activation(config.act),
                 "c_proj": linears.c_proj.build(),
@@ -671,9 +599,7 @@ class ResidualSequential(nn.Sequential):
         return super().forward(input) + input
 
 
-def residual_ffn(
-    config: TransformerConfig, linears: FFNLinearsConfig
-) -> ResidualSequential:
+def residual_ffn(config: TransformerConfig, linears: FFNLinearsConfig) -> ResidualSequential:
     return ResidualSequential(OrderedDict(build_ffn(config, linears).named_children()))
 
 
@@ -681,8 +607,7 @@ class PlanHead(nn.Module):
     def __init__(self, config: "WorldModel.Config", linears: PlanHeadLinearsConfig):
         super().__init__()
         self.mlps = nn.ModuleList(
-            residual_ffn(config.plan_head, linears.blocks[i])
-            for i in range(config.plan_head.n_layer)
+            residual_ffn(config.plan_head, linears.blocks[i]) for i in range(config.plan_head.n_layer)
         )
         self.head = linears.head.build()
         self.scale_layer = ScaleLayer(PLAN_SIZE)
@@ -706,47 +631,39 @@ class PlanHead(nn.Module):
 class DiTBlock(nn.Module):
     def __init__(self, config: "WorldModel.Config", linears: DiTBlockLinearsConfig):
         super().__init__()
-        self.norm1 = make_norm(
-            config.transformer.norm, config.transformer.n_embd, elementwise_affine=False
-        )
+        self.norm1 = make_norm(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False)
         self.attn = SelfAttention(config.transformer, linears.attn)
-        self.norm2 = make_norm(
-            config.transformer.norm, config.transformer.n_embd, elementwise_affine=False
-        )
+        self.norm2 = make_norm(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False)
         self.mlp = build_ffn(config.transformer, linears.mlp)
-        self.scale_shift_table = nn.Parameter(
-            torch.empty(1, config.num_temporal_patches, 6, config.transformer.n_embd)
-        )
+        self.scale_shift_table = nn.Parameter(torch.empty(1, config.num_temporal_patches, 6, config.transformer.n_embd))
         self.init_weights()
 
     def forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
-        input_pos: torch.Tensor | None = None,
         input_pos_t: torch.Tensor | None = None,
         input_mask: TensorOrMask | None = None,
+        cache_pos: torch.Tensor | None = None,
+        cache_seq_length: int | None = None,
     ) -> torch.Tensor:
         batch = x.shape[0]
-        scale_shift_table = (
-            self.scale_shift_table
-            if input_pos_t is None
-            else self.scale_shift_table[:, input_pos_t]
-        )
+        scale_shift_table = self.scale_shift_table if input_pos_t is None else self.scale_shift_table[:, input_pos_t]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             scale_shift_table + t.reshape(batch, scale_shift_table.shape[1], 6, -1)
         ).chunk(6, dim=2)
         attn_input = modulate(self.norm1(x), shift_msa, scale_msa)
-        if input_pos is None:
+        if cache_pos is None:
             attn_output = self.attn(attn_input, input_mask=input_mask)
         else:
             attn_output = self.attn(
-                attn_input, input_pos=input_pos, input_mask=input_mask
+                attn_input,
+                cache_pos=cache_pos,
+                cache_seq_length=cache_seq_length,
+                input_mask=input_mask,
             )
         x = x + gate(attn_output, gate_msa)
-        return x + gate(
-            self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)), gate_mlp
-        )
+        return x + gate(self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)), gate_mlp)
 
     def reset_parameters(self) -> None:
         _init_normal_(
@@ -765,13 +682,9 @@ class DiTBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, config: "WorldModel.Config", linears: FinalLayerLinearsConfig):
         super().__init__()
-        self.norm_final = make_norm(
-            config.transformer.norm, config.transformer.n_embd, elementwise_affine=False
-        )
+        self.norm_final = make_norm(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False)
         self.linear = linears.linear.build()
-        self.scale_shift_table = nn.Parameter(
-            torch.empty(1, config.num_temporal_patches, 2, config.transformer.n_embd)
-        )
+        self.scale_shift_table = nn.Parameter(torch.empty(1, config.num_temporal_patches, 2, config.transformer.n_embd))
         self.init_weights()
 
     def forward(
@@ -781,14 +694,8 @@ class FinalLayer(nn.Module):
         input_pos_t: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch = x.shape[0]
-        scale_shift_table = (
-            self.scale_shift_table
-            if input_pos_t is None
-            else self.scale_shift_table[:, input_pos_t]
-        )
-        shift, scale = (
-            scale_shift_table + t.reshape(batch, scale_shift_table.shape[1], 2, -1)
-        ).chunk(2, dim=2)
+        scale_shift_table = self.scale_shift_table if input_pos_t is None else self.scale_shift_table[:, input_pos_t]
+        shift, scale = (scale_shift_table + t.reshape(batch, scale_shift_table.shape[1], 2, -1)).chunk(2, dim=2)
         return self.linear(modulate(self.norm_final(x), shift, scale))
 
     def reset_parameters(self) -> None:
@@ -819,12 +726,8 @@ class WorldModel(BaseModel):
         plan_head: TransformerConfig
         experimental_pose_only_xy: bool
         x_embedder: PatchEmbedderLinearsConfig = field(init=False)
-        augments_pos_ref_augment_embedder: ConditioningEmbedderLinearsConfig = field(
-            init=False
-        )
-        ref_augment_from_augments_euler_embedder: ConditioningEmbedderLinearsConfig = (
-            field(init=False)
-        )
+        augments_pos_ref_augment_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
+        ref_augment_from_augments_euler_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         pose_mask_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         t_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         fidx_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
@@ -856,7 +759,6 @@ class WorldModel(BaseModel):
             current_blocks = getattr(self, "blocks", [])
             current_final = getattr(self, "final_layer", None)
             current_plan = getattr(self, "plan_head_linears", None)
-
             self.x_embedder = PatchEmbedderLinearsConfig(
                 linear=linear_config(
                     self.in_channels * math.prod(self.patch_size),
@@ -864,29 +766,21 @@ class WorldModel(BaseModel):
                     current=getattr(getattr(self, "x_embedder", None), "linear", None),
                 )
             )
-            self.augments_pos_ref_augment_embedder = (
-                conditioning_embedder_linears_config(
-                    pose_half,
-                    hidden,
-                    getattr(self, "augments_pos_ref_augment_embedder", None),
-                )
+            self.augments_pos_ref_augment_embedder = conditioning_embedder_linears_config(
+                pose_half,
+                hidden,
+                getattr(self, "augments_pos_ref_augment_embedder", None),
             )
-            self.ref_augment_from_augments_euler_embedder = (
-                conditioning_embedder_linears_config(
-                    pose_half,
-                    hidden,
-                    getattr(self, "ref_augment_from_augments_euler_embedder", None),
-                )
+            self.ref_augment_from_augments_euler_embedder = conditioning_embedder_linears_config(
+                pose_half,
+                hidden,
+                getattr(self, "ref_augment_from_augments_euler_embedder", None),
             )
             self.pose_mask_embedder = conditioning_embedder_linears_config(
                 2, hidden, getattr(self, "pose_mask_embedder", None)
             )
-            self.t_embedder = conditioning_embedder_linears_config(
-                256, hidden, getattr(self, "t_embedder", None)
-            )
-            self.fidx_embedder = conditioning_embedder_linears_config(
-                50, hidden, getattr(self, "fidx_embedder", None)
-            )
+            self.t_embedder = conditioning_embedder_linears_config(256, hidden, getattr(self, "t_embedder", None))
+            self.fidx_embedder = conditioning_embedder_linears_config(50, hidden, getattr(self, "fidx_embedder", None))
             self.blocks = [
                 dit_block_linears_config(
                     self.transformer,
@@ -907,9 +801,7 @@ class WorldModel(BaseModel):
                 else None
             )
             self.plan_head_linears = (
-                plan_head_linears_config(self.plan_head, current_plan)
-                if self.plan_head.n_layer >= 0
-                else None
+                plan_head_linears_config(self.plan_head, current_plan) if self.plan_head.n_layer >= 0 else None
             )
 
         def build(self, **kwargs: Any) -> "WorldModel":
@@ -936,57 +828,30 @@ class WorldModel(BaseModel):
             self._sync_derived_fields()
             config.training.seq_len = self.num_patches
 
-        def get_nparams_and_flops(
-            self, model: nn.Module, seq_len: int
-        ) -> tuple[int, int]:
+        def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
             del seq_len
             nparams = sum(p.numel() for p in model.parameters())
-            return nparams, 6 * nparams + attn_flops(self.transformer) // max(
-                1, self.num_patches
-            )
+            return nparams, 6 * nparams + attn_flops(self.transformer) // max(1, self.num_patches)
 
     def __init__(self, config: Config):
         super().__init__()
         config._sync_derived_fields()
         self.config = config
-        self.x_embedder = PatchEmbedder(
-            config.patch_size, config.x_embedder, config.transformer.norm
-        )
+        self.x_embedder = PatchEmbedder(config.patch_size, config.x_embedder, config.transformer.norm)
         pose_half = config.pose_size // 2
         self.position_scale = ScaleLayer(pose_half)
         self.euler_scale = ScaleLayer(pose_half)
-        self.augments_pos_ref_augment_embedder = ContinuousEmbedder(
-            config.augments_pos_ref_augment_embedder
-        )
+        self.augments_pos_ref_augment_embedder = ContinuousEmbedder(config.augments_pos_ref_augment_embedder)
         self.ref_augment_from_augments_euler_embedder = ContinuousEmbedder(
             config.ref_augment_from_augments_euler_embedder
         )
-        self.pose_mask_embedder = DiscreteEmbedder(
-            2, config.transformer.n_embd, config.pose_mask_embedder
-        )
-        self.t_embedder = TimestepEmbedder(
-            config.t_embedder, time_factor=config.time_factor
-        )
-        self.fidx_embedder = DiscreteEmbedder(
-            50, config.transformer.n_embd, config.fidx_embedder
-        )
-        self.blocks = nn.ModuleList(
-            DiTBlock(config, config.blocks[i])
-            for i in range(config.transformer.n_layer)
-        )
-        self.final_layer = (
-            FinalLayer(config, config.final_layer)
-            if config.final_layer is not None
-            else None
-        )
-        self.plan_head = (
-            PlanHead(config, config.plan_head_linears)
-            if config.plan_head_linears is not None
-            else None
-        )
-        self.register_buffer(
-            "pos_embed", torch.empty(1, config.num_patches, config.transformer.n_embd)
-        )
+        self.pose_mask_embedder = DiscreteEmbedder(2, config.transformer.n_embd, config.pose_mask_embedder)
+        self.t_embedder = TimestepEmbedder(config.t_embedder, time_factor=config.time_factor)
+        self.fidx_embedder = DiscreteEmbedder(50, config.transformer.n_embd, config.fidx_embedder)
+        self.blocks = nn.ModuleList(DiTBlock(config, config.blocks[i]) for i in range(config.transformer.n_layer))
+        self.final_layer = FinalLayer(config, config.final_layer) if config.final_layer is not None else None
+        self.plan_head = PlanHead(config, config.plan_head_linears) if config.plan_head_linears is not None else None
+        self.register_buffer("pos_embed", torch.empty(1, config.num_patches, config.transformer.n_embd))
         self.mask: TensorOrMask | None = None
         self.init_states(buffer_device=self.pos_embed.device)
 
@@ -1007,26 +872,12 @@ class WorldModel(BaseModel):
             self.config.input_size[1] // self.config.patch_size[1],
             self.config.input_size[2] // self.config.patch_size[2],
         )
-        spatial = torch.from_numpy(
-            get_2d_sincos_pos_embed(self.pos_embed.shape[-1], spatial_grid)
-        )
-        spatial = spatial.to(
-            dtype=self.pos_embed.dtype, device=self.pos_embed.device
-        ).unsqueeze(0)
-        spatial = einops.repeat(
-            spatial, "() n d -> () (t n) d", t=self.config.num_temporal_patches
-        )
-        temporal = torch.from_numpy(
-            get_1d_sincos_pos_embed(
-                self.pos_embed.shape[-1], self.config.num_temporal_patches
-            )
-        )
-        temporal = temporal.to(
-            dtype=self.pos_embed.dtype, device=self.pos_embed.device
-        ).unsqueeze(0)
-        temporal = einops.repeat(
-            temporal, "() t d -> () (t n) d", n=self.config.num_spatial_patches
-        )
+        spatial = torch.from_numpy(get_2d_sincos_pos_embed(self.pos_embed.shape[-1], spatial_grid))
+        spatial = spatial.to(dtype=self.pos_embed.dtype, device=self.pos_embed.device).unsqueeze(0)
+        spatial = einops.repeat(spatial, "() n d -> () (t n) d", t=self.config.num_temporal_patches)
+        temporal = torch.from_numpy(get_1d_sincos_pos_embed(self.pos_embed.shape[-1], self.config.num_temporal_patches))
+        temporal = temporal.to(dtype=self.pos_embed.dtype, device=self.pos_embed.device).unsqueeze(0)
+        temporal = einops.repeat(temporal, "() t d -> () (t n) d", n=self.config.num_spatial_patches)
         self.pos_embed[:] = spatial + temporal
 
     def init_states(self, *, buffer_device: torch.device | None = None) -> None:
@@ -1083,49 +934,38 @@ class WorldModel(BaseModel):
         pose_mask: torch.Tensor,
         fidx: torch.Tensor,
         return_plan: bool = True,
-        input_pos_mask_pair: Any | None = None,
+        input_pos: torch.Tensor | None = None,
+        cache_pos: torch.Tensor | None = None,
+        cache_seq_length: int | None = None,
+        input_mask: TensorOrMask | None = None,
     ) -> dict[str, torch.Tensor]:
-        if input_pos_mask_pair is None:
-            input_pos, input_mask = None, self.mask
-        else:
-            input_pos, input_mask = (
-                input_pos_mask_pair.input_pos,
-                input_pos_mask_pair.input_mask,
-            )
+        if input_pos is None:
+            input_mask = self.mask
 
         if self.config.experimental_pose_only_xy:
-            augments_pos_ref_augment = augments_pos_ref_augment * (
-                augments_pos_ref_augment.new_tensor((1.0, 1.0, 0.0))
-            )
+            augments_pos_ref_augment = augments_pos_ref_augment * (augments_pos_ref_augment.new_tensor((1.0, 1.0, 0.0)))
             ref_augment_from_augments_euler = ref_augment_from_augments_euler * (
                 ref_augment_from_augments_euler.new_tensor((0.0, 0.0, 1.0))
             )
-        pos_embed = (
-            self.pos_embed[:, input_pos] if input_pos is not None else self.pos_embed
-        )
+        pos_embed = self.pos_embed[:, input_pos] if input_pos is not None else self.pos_embed
         input_pos_t = (
-            input_pos[:: self.config.num_spatial_patches]
-            // self.config.num_spatial_patches
+            input_pos[:: self.config.num_spatial_patches] // self.config.num_spatial_patches
             if input_pos is not None
             else None
         )
 
         x = self.x_embedder(x) + pos_embed
         augments_pos_ref_augment = self.position_scale(augments_pos_ref_augment)
-        ref_augment_from_augments_euler = self.euler_scale(
-            ref_augment_from_augments_euler
-        )
+        ref_augment_from_augments_euler = self.euler_scale(ref_augment_from_augments_euler)
         t6, t2 = self.t_embedder(t)
         pos6, pos2 = self.augments_pos_ref_augment_embedder(augments_pos_ref_augment)
-        euler6, euler2 = self.ref_augment_from_augments_euler_embedder(
-            ref_augment_from_augments_euler
-        )
+        euler6, euler2 = self.ref_augment_from_augments_euler_embedder(ref_augment_from_augments_euler)
         pose_mask6, pose_mask2 = self.pose_mask_embedder(pose_mask)
         fidx6, fidx2 = self.fidx_embedder(fidx)
         t6 = t6 + pos6 + euler6 + pose_mask6 + fidx6
         t2 = t2 + pos2 + euler2 + pose_mask2 + fidx2
         for block in self.blocks:
-            x = block(x, t6, input_pos, input_pos_t, input_mask)
+            x = block(x, t6, input_pos_t, input_mask, cache_pos, cache_seq_length)
         outputs = {}
         if return_plan and self.plan_head is not None:
             outputs["plan"] = self.plan_head(x[:, -1, :])
@@ -1146,12 +986,7 @@ def parallelize_worldmodel(
 ) -> WorldModel:
     if parallelism.spmd_backend == "full_dtensor":
         raise ValueError("worldmodel does not support full DTensor")
-    if (
-        parallel_dims.tp_enabled
-        or parallel_dims.pp_enabled
-        or parallel_dims.cp_enabled
-        or parallel_dims.ep_enabled
-    ):
+    if parallel_dims.tp_enabled or parallel_dims.pp_enabled or parallel_dims.cp_enabled or parallel_dims.ep_enabled:
         raise ValueError("worldmodel supports FSDP/HSDP only")
 
     if ac_config is not None:
@@ -1173,9 +1008,7 @@ def parallelize_worldmodel(
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
     logger.info(
-        "Applied HSDP to the worldmodel"
-        if parallel_dims.dp_replicate_enabled
-        else "Applied FSDP to the worldmodel"
+        "Applied HSDP to the worldmodel" if parallel_dims.dp_replicate_enabled else "Applied FSDP to the worldmodel"
     )
     return model
 
@@ -1191,9 +1024,7 @@ def _apply_activation_checkpointing(
     assert ac_config is not None
     ac_policy = ac_config.build(dump_folder=dump_folder)
     if isinstance(ac_policy, MemoryBudgetAC):
-        raise ValueError(
-            "worldmodel does not support memory-budget activation checkpointing"
-        )
+        raise ValueError("worldmodel does not support memory-budget activation checkpointing")
 
     def wrap(module: nn.Module, fqn: str) -> nn.Module:
         return ac_policy._wrap_block(module, base_fqn=fqn)
@@ -1248,16 +1079,9 @@ def _apply_fsdp(
     reshard_after_forward_policy: str,
     enable_symm_mem: bool,
 ) -> None:
-    from torch.distributed.fsdp import (
-        CPUOffloadPolicy,
-        fully_shard,
-        MixedPrecisionPolicy,
-    )
+    from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 
-    from torchtitan.distributed.fsdp import (
-        enable_fsdp_symm_mem,
-        get_fsdp_reshard_after_forward_policy,
-    )
+    from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
 
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
@@ -1288,12 +1112,8 @@ def _apply_fsdp(
         fully_shard(block, **fsdp_config, reshard_after_forward=reshard_after_forward)
     if model.plan_head is not None:
         for block in model.plan_head.mlps:
-            fully_shard(
-                block, **fsdp_config, reshard_after_forward=reshard_after_forward
-            )
-        fully_shard(
-            model.plan_head, **fsdp_config, reshard_after_forward=reshard_after_forward
-        )
+            fully_shard(block, **fsdp_config, reshard_after_forward=reshard_after_forward)
+        fully_shard(model.plan_head, **fsdp_config, reshard_after_forward=reshard_after_forward)
     if model.final_layer is not None:
         fully_shard(
             model.final_layer,
