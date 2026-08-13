@@ -32,9 +32,7 @@ from torchtitan.tools.logging import init_logger, logger
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 
 DEFAULT_RECIPE_STATE_FILE = "_torchpackage_recipe_state.pt"
-DEFAULT_STRUCTURED_LOG_DIR = os.getenv(
-    "TORCHTITAN_STRUCTURED_LOG_DIR", "./outputs/torchpackage_checkpoint"
-)
+DEFAULT_STRUCTURED_LOG_DIR = os.getenv("TORCHTITAN_STRUCTURED_LOG_DIR", "./outputs/torchpackage_checkpoint")
 DEFAULT_WORKER_MODULE = "torchtitan.components.torchpackage_checkpoint"
 
 
@@ -61,15 +59,13 @@ def load_torch_package_recipe(recipe_path: str) -> TorchPackageRecipe:
 
     if ":" not in recipe_path:
         raise ValueError(
-            "torch package recipe must be a module path in the form "
-            f"'module:qualname', got {recipe_path!r}."
+            "torch package recipe must be a module path in the form " f"'module:qualname', got {recipe_path!r}."
         )
 
     module_name, qualname = recipe_path.split(":", 1)
     if not module_name or not qualname:
         raise ValueError(
-            "torch package recipe must be a module path in the form "
-            f"'module:qualname', got {recipe_path!r}."
+            "torch package recipe must be a module path in the form " f"'module:qualname', got {recipe_path!r}."
         )
 
     obj: Any = importlib.import_module(module_name)
@@ -162,9 +158,7 @@ def export_torch_package(
             handle.write(package)
     del package
     gc.collect()
-    logger.info(
-        "Saved %.2f GiB torch package to %s", package_bytes / (1024**3), output_path
-    )
+    logger.info("Saved %.2f GiB torch package to %s", package_bytes / (1024**3), output_path)
 
 
 class TorchPackageCheckpointManager(CheckpointManager):
@@ -246,9 +240,7 @@ class TorchPackageCheckpointManager(CheckpointManager):
 
         checkpoint_path = self._create_checkpoint_id(curr_step)
         output_path = fs.join_path(checkpoint_path, self.torch_package_file)
-        recipe_state_path = fs.join_path(
-            checkpoint_path, self.torch_package_recipe_state_file
-        )
+        recipe_state_path = fs.join_path(checkpoint_path, self.torch_package_recipe_state_file)
 
         with sl.log_trace_span("torch_package_save_recipe_state"):
             recipe_state = self._get_torch_package_state()
@@ -285,10 +277,7 @@ class TorchPackageCheckpointManager(CheckpointManager):
             return copy.deepcopy(model.package_config)
         if hasattr(model, "config"):
             return copy.deepcopy(model.config)
-        raise AttributeError(
-            "Torch package export requires the model to expose package_config "
-            "or config."
-        )
+        raise AttributeError("Torch package export requires the model to expose package_config " "or config.")
 
     def _start_torch_package_after_dcp(
         self,
@@ -352,8 +341,7 @@ class TorchPackageCheckpointManager(CheckpointManager):
             active_processes = len(self._torch_package_processes)
         if active_processes >= self.torch_package_max_concurrent:
             logger.warning(
-                "Skipping torch package export for %s because %s package worker(s) "
-                "are already running.",
+                "Skipping torch package export for %s because %s package worker(s) " "are already running.",
                 output_path,
                 active_processes,
             )
@@ -381,9 +369,7 @@ class TorchPackageCheckpointManager(CheckpointManager):
         process = subprocess.Popen(cmd, env=env, start_new_session=True)
         with self._torch_package_lock:
             self._torch_package_processes.append(process)
-        logger.info(
-            "Started torch package export pid=%s for %s", process.pid, output_path
-        )
+        logger.info("Started torch package export pid=%s for %s", process.pid, output_path)
 
     def _wait_for_torch_package_wait_threads(self) -> None:
         while True:
@@ -396,9 +382,7 @@ class TorchPackageCheckpointManager(CheckpointManager):
     def _reap_torch_package_wait_threads(self) -> None:
         with self._torch_package_lock:
             self._torch_package_wait_threads = [
-                thread
-                for thread in self._torch_package_wait_threads
-                if thread.is_alive()
+                thread for thread in self._torch_package_wait_threads if thread.is_alive()
             ]
 
     def _wait_for_torch_package_processes(self) -> None:
@@ -422,9 +406,7 @@ class TorchPackageCheckpointManager(CheckpointManager):
             self._torch_package_processes = active
 
     @staticmethod
-    def _log_torch_package_process_return(
-        process: subprocess.Popen, return_code: int
-    ) -> None:
+    def _log_torch_package_process_return(process: subprocess.Popen, return_code: int) -> None:
         if return_code == 0:
             logger.info("Torch package export pid=%s completed.", process.pid)
         else:
@@ -436,9 +418,7 @@ class TorchPackageCheckpointManager(CheckpointManager):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Package a DCP checkpoint with a recipe-defined torch package."
-    )
+    parser = argparse.ArgumentParser(description="Package a DCP checkpoint with a recipe-defined torch package.")
     parser.add_argument("--recipe", required=True)
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--output-path", required=True)
