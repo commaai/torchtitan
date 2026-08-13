@@ -40,8 +40,7 @@ STRUCTURED_LOG_DIR = os.getenv(
     "/tmp/torchtitan_train/worldmodel_torchpackage_checkpoint",
 )
 WORLD_MODEL_TORCH_PACKAGE_RECIPE = (
-    "torchtitan.experiments.worldmodel.torchpackage_checkpoint:"
-    "WorldModelTorchPackageRecipe"
+    "torchtitan.experiments.worldmodel.torchpackage_checkpoint:" "WorldModelTorchPackageRecipe"
 )
 
 TORCH_EXPORT_INTERN_MODULES = [
@@ -116,19 +115,14 @@ __all__ = [
 """.lstrip()
 
 
-def build_meta_model(
-    model_config: WorldModel.Config, *, dtype: torch.dtype = torch.bfloat16
-) -> WorldModelForInference:
+def build_meta_model(model_config: WorldModel.Config, *, dtype: torch.dtype = torch.bfloat16) -> WorldModelForInference:
     with torch.device("meta"):
         return WorldModelForInference(model_config).to(dtype=dtype).eval()
 
 
 def validate_model_config(state: Any) -> WorldModel.Config:
     if not isinstance(state, WorldModel.Config):
-        raise TypeError(
-            f"Worldmodel torch package state must be WorldModel.Config, "
-            f"got {type(state).__name__}."
-        )
+        raise TypeError(f"Worldmodel torch package state must be WorldModel.Config, " f"got {type(state).__name__}.")
     return state
 
 
@@ -198,21 +192,15 @@ def build_package(
                 source = Path(spec.origin).read_text()
                 source = source.replace("from __future__ import annotations\n\n", "")
                 if module_name == "torchtitan.distributed.parallel_dims":
-                    source = source.replace(
-                        ") -> ParallelDims:\n", ') -> "ParallelDims":\n'
-                    )
+                    source = source.replace(") -> ParallelDims:\n", ') -> "ParallelDims":\n')
                 exporter.save_source_string(module_name, source)
             exporter.mock(
                 TORCH_EXPORT_MOCK_MODULES,
-                exclude=TORCH_EXPORT_INTERN_MODULES
-                + TORCH_EXPORT_EXTERN_MODULES
-                + TORCH_EXPORT_DENY_MODULES,
+                exclude=TORCH_EXPORT_INTERN_MODULES + TORCH_EXPORT_EXTERN_MODULES + TORCH_EXPORT_DENY_MODULES,
             )
             exporter.save_pickle("model", "model.pkl", model)
             del model
-            exporter.save_pickle(
-                "meta", "meta.pkl", {"model_io": model_io, "step": step}
-            )
+            exporter.save_pickle("meta", "meta.pkl", {"model_io": model_io, "step": step})
             del model_io
 
             state_dict_buffer = io.BytesIO()
@@ -262,9 +250,7 @@ def export_torch_package(checkpoint_path: str) -> None:
     recipe_state_path = fs.join_path(checkpoint_path, MODEL_CONFIG_FILE)
     output_path = fs.join_path(checkpoint_path, PACKAGE_NAME)
     step = fs.basename(checkpoint_path)
-    assert (
-        step.isdigit()
-    ), f"checkpoint path {checkpoint_path} does not end with a step number."
+    assert step.isdigit(), f"checkpoint path {checkpoint_path} does not end with a step number."
     model_config = load_model_config(recipe_state_path)
     try:
         export_recipe_torch_package(
@@ -292,9 +278,7 @@ class WorldModelTorchPackageCheckpointManager(TorchPackageCheckpointManager):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Package a worldmodel DCP checkpoint for inference."
-    )
+    parser = argparse.ArgumentParser(description="Package a worldmodel DCP checkpoint for inference.")
     parser.add_argument("checkpoint_path")
     args = parser.parse_args()
 
