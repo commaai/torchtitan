@@ -6,7 +6,7 @@
 
 import os
 import posixpath
-from typing import cast, IO
+from typing import Any, cast, IO
 
 from fsspec.core import url_to_fs
 
@@ -23,8 +23,8 @@ def basename(path: str) -> str:
     return posixpath.basename(path.rstrip("/"))
 
 
-def open_file(path: str, mode: str) -> IO[bytes]:
-    fs, fs_path = url_to_fs(path)
+def open_file(path: str, mode: str, **storage_options: Any) -> IO[bytes]:
+    fs, fs_path = url_to_fs(path, **storage_options)
     if any(flag in mode for flag in ("w", "a", "x", "+")):
         parent = posixpath.dirname(fs_path)
         if parent:

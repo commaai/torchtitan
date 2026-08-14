@@ -26,7 +26,14 @@ from torchtitan.components.torchpackage_checkpoint import (
     TorchPackageCheckpointManager,
 )
 from torchtitan.experiments.worldmodel.model import WorldModel
-from torchtitan.experiments.worldmodel.model_for_inference import WorldModelForInference
+from torchtitan.experiments.worldmodel.model_for_inference import (
+    BF16_KV_CACHE_DTYPE,
+    FP8_KV_CACHE_DTYPE,
+    KVCacheDType,
+    WEIGHT_FORMATS,
+    WeightFormat,
+    WorldModelForInference,
+)
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import init_logger
 
@@ -34,6 +41,8 @@ from torchtitan.tools.logging import init_logger
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 
 PACKAGE_NAME = "model.torchpackage"
+FORMAT_PACKAGE_NAME = "model.{weight_format}.torchpackage"
+DEFAULT_WEIGHT_FORMAT: WeightFormat = "fp8_nvfp4"
 MODEL_CONFIG_FILE = "_torchpackage_model_config.pt"
 STRUCTURED_LOG_DIR = os.getenv(
     "TORCHTITAN_STRUCTURED_LOG_DIR",
@@ -41,6 +50,9 @@ STRUCTURED_LOG_DIR = os.getenv(
 )
 WORLD_MODEL_TORCH_PACKAGE_RECIPE = (
     "torchtitan.experiments.worldmodel.torchpackage_checkpoint:" "WorldModelTorchPackageRecipe"
+)
+WORLD_MODEL_TRAINING_TORCH_PACKAGE_RECIPE = (
+    "torchtitan.experiments.worldmodel.torchpackage_checkpoint:" "WorldModelTrainingTorchPackageRecipe"
 )
 
 TORCH_EXPORT_INTERN_MODULES = [
@@ -115,9 +127,34 @@ __all__ = [
 """.lstrip()
 
 
-def build_meta_model(model_config: WorldModel.Config, *, dtype: torch.dtype = torch.bfloat16) -> WorldModelForInference:
+@dataclass(frozen=True, slots=True)
+class WeightFormatSpec:
+    kv_cache_dtype: KVCacheDType
+    minimum_compute_capability: tuple[int, int] | None
+
+
+WEIGHT_FORMAT_SPECS: dict[WeightFormat, WeightFormatSpec] = {
+    "bf16": WeightFormatSpec(BF16_KV_CACHE_DTYPE, None),
+    "fp8": WeightFormatSpec(FP8_KV_CACHE_DTYPE, (8, 9)),
+    "fp8_nvfp4": WeightFormatSpec(FP8_KV_CACHE_DTYPE, (10, 0)),
+}
+
+
+def build_meta_model(
+    model_config: WorldModel.Config,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    default_kv_cache_dtype: KVCacheDType = FP8_KV_CACHE_DTYPE,
+) -> WorldModelForInference:
     with torch.device("meta"):
-        return WorldModelForInference(model_config).to(dtype=dtype).eval()
+        return (
+            WorldModelForInference(
+                model_config,
+                default_kv_cache_dtype=default_kv_cache_dtype,
+            )
+            .to(dtype=dtype)
+            .eval()
+        )
 
 
 def validate_model_config(state: Any) -> WorldModel.Config:
@@ -133,13 +170,15 @@ def load_model_config(path: str) -> WorldModel.Config:
 def convert_state_dict_for_inference(
     model_config: WorldModel.Config,
     state_dict: dict[str, torch.Tensor],
+    *,
+    weight_format: WeightFormat = DEFAULT_WEIGHT_FORMAT,
 ) -> dict[str, torch.Tensor]:
     with torch.device("cpu"):
         model = WorldModelForInference(model_config).to(dtype=torch.bfloat16).eval()
     model.load_state_dict(state_dict, strict=True, assign=True)
     state_dict.clear()
     del state_dict
-    model.quantize_for_inference()
+    model.quantize_for_inference(weight_format)
     converted = {key: value.detach().cpu() for key, value in model.state_dict().items()}
     del model
     gc.collect()
@@ -151,10 +190,16 @@ def build_package(
     model_config: WorldModel.Config,
     state_dict: dict[str, torch.Tensor],
     step: int,
+    weight_format: WeightFormat = DEFAULT_WEIGHT_FORMAT,
 ) -> bytes:
+    format_spec = WEIGHT_FORMAT_SPECS[weight_format]
 
-    with sl.log_trace_span("worldmodel_package_quantize_hybrid_nvfp4_fp8"):
-        state_dict = convert_state_dict_for_inference(model_config, state_dict)
+    with sl.log_trace_span(f"worldmodel_package_convert_{weight_format}"):
+        state_dict = convert_state_dict_for_inference(
+            model_config,
+            state_dict,
+            weight_format=weight_format,
+        )
 
     with sl.log_trace_span("worldmodel_package_model_io"):
         io_model_config = copy.deepcopy(model_config)
@@ -172,7 +217,10 @@ def build_package(
             cfg=2.0,
         )
         del io_model, io_model_config
-        model = build_meta_model(model_config)
+        model = build_meta_model(
+            model_config,
+            default_kv_cache_dtype=format_spec.kv_cache_dtype,
+        )
 
     with sl.log_trace_span("worldmodel_package_build"):
         package_buffer = io.BytesIO()
@@ -189,18 +237,25 @@ def build_package(
                 spec = importlib.util.find_spec(module_name)
                 if spec is None or spec.origin is None:
                     raise ModuleNotFoundError(module_name)
-                source = Path(spec.origin).read_text()
-                source = source.replace("from __future__ import annotations\n\n", "")
+                module_source = Path(spec.origin).read_text()
+                module_source = module_source.replace("from __future__ import annotations\n\n", "")
                 if module_name == "torchtitan.distributed.parallel_dims":
-                    source = source.replace(") -> ParallelDims:\n", ') -> "ParallelDims":\n')
-                exporter.save_source_string(module_name, source)
+                    module_source = module_source.replace(") -> ParallelDims:\n", ') -> "ParallelDims":\n')
+                exporter.save_source_string(module_name, module_source)
             exporter.mock(
                 TORCH_EXPORT_MOCK_MODULES,
                 exclude=TORCH_EXPORT_INTERN_MODULES + TORCH_EXPORT_EXTERN_MODULES + TORCH_EXPORT_DENY_MODULES,
             )
             exporter.save_pickle("model", "model.pkl", model)
             del model
-            exporter.save_pickle("meta", "meta.pkl", {"model_io": model_io, "step": step})
+            metadata = {
+                "model_io": model_io,
+                "step": step,
+                "weight_format": weight_format,
+                "kv_cache_dtype": format_spec.kv_cache_dtype,
+                "minimum_compute_capability": format_spec.minimum_compute_capability,
+            }
+            exporter.save_pickle("meta", "meta.pkl", metadata)
             del model_io
 
             state_dict_buffer = io.BytesIO()
@@ -218,7 +273,10 @@ def build_package(
     return package
 
 
+@dataclass(slots=True)
 class WorldModelTorchPackageRecipe:
+    weight_format: WeightFormat = DEFAULT_WEIGHT_FORMAT
+
     def build_empty_state_dict(self, state: Any) -> dict[str, torch.Tensor]:
         model_config = validate_model_config(state)
         model = build_meta_model(model_config)
@@ -237,29 +295,62 @@ class WorldModelTorchPackageRecipe:
         state: Any,
         state_dict: dict[str, torch.Tensor],
         step: int,
-    ) -> bytes:
+    ) -> dict[str, bytes]:
         model_config = validate_model_config(state)
-        return build_package(
-            model_config=model_config,
-            state_dict=state_dict,
-            step=step,
-        )
+        return {
+            PACKAGE_NAME: build_package(
+                model_config=model_config,
+                state_dict=state_dict,
+                step=step,
+                weight_format=self.weight_format,
+            )
+        }
 
 
-def export_torch_package(checkpoint_path: str) -> None:
+class WorldModelTrainingTorchPackageRecipe(WorldModelTorchPackageRecipe):
+    weight_formats = WEIGHT_FORMATS
+
+    def build_package(
+        self,
+        *,
+        state: Any,
+        state_dict: dict[str, torch.Tensor],
+        step: int,
+    ) -> dict[str, bytes]:
+        model_config = validate_model_config(state)
+        return {
+            FORMAT_PACKAGE_NAME.format(weight_format=weight_format): build_package(
+                model_config=model_config,
+                state_dict=state_dict.copy(),
+                step=step,
+                weight_format=weight_format,
+            )
+            for weight_format in self.weight_formats
+        }
+
+
+def export_torch_package(
+    checkpoint_path: str,
+    *,
+    weight_format: WeightFormat = DEFAULT_WEIGHT_FORMAT,
+    model_flavor: str | None = None,
+) -> None:
     recipe_state_path = fs.join_path(checkpoint_path, MODEL_CONFIG_FILE)
-    output_path = fs.join_path(checkpoint_path, PACKAGE_NAME)
     step = fs.basename(checkpoint_path)
     assert step.isdigit(), f"checkpoint path {checkpoint_path} does not end with a step number."
-    model_config = load_model_config(recipe_state_path)
+    if model_flavor is None:
+        model_config = load_model_config(recipe_state_path)
+    else:
+        from torchtitan.experiments.worldmodel.model_config import model_registry
+
+        model_config = model_registry(model_flavor).model
     try:
         export_recipe_torch_package(
-            recipe=WorldModelTorchPackageRecipe(),
+            recipe=WorldModelTorchPackageRecipe(weight_format=weight_format),
             checkpoint_path=checkpoint_path,
-            output_path=output_path,
             recipe_state=model_config,
             step=int(step),
-            recipe_state_path=recipe_state_path,
+            recipe_state_path=(recipe_state_path if model_flavor is None else None),
         )
     finally:
         del model_config
@@ -271,8 +362,7 @@ class WorldModelTorchPackageCheckpointManager(TorchPackageCheckpointManager):
 
     @dataclass(kw_only=True, slots=True)
     class Config(TorchPackageCheckpointManager.Config):
-        torch_package_recipe: str = WORLD_MODEL_TORCH_PACKAGE_RECIPE
-        torch_package_file: str = PACKAGE_NAME
+        torch_package_recipe: str = WORLD_MODEL_TRAINING_TORCH_PACKAGE_RECIPE
         torch_package_recipe_state_file: str = MODEL_CONFIG_FILE
         torch_package_structured_log_dir: str = STRUCTURED_LOG_DIR
 
@@ -280,6 +370,12 @@ class WorldModelTorchPackageCheckpointManager(TorchPackageCheckpointManager):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Package a worldmodel DCP checkpoint for inference.")
     parser.add_argument("checkpoint_path")
+    parser.add_argument(
+        "--weight-format",
+        choices=WEIGHT_FORMATS,
+        default=DEFAULT_WEIGHT_FORMAT,
+    )
+    parser.add_argument("--model-flavor")
     args = parser.parse_args()
 
     init_logger()
@@ -288,7 +384,11 @@ def main() -> None:
         output_dir=STRUCTURED_LOG_DIR,
     )
     with sl.log_trace_span("worldmodel_package_total"):
-        export_torch_package(args.checkpoint_path)
+        export_torch_package(
+            args.checkpoint_path,
+            weight_format=args.weight_format,
+            model_flavor=args.model_flavor,
+        )
 
 
 if __name__ == "__main__":
