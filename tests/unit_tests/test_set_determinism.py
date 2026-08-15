@@ -155,14 +155,11 @@ class TestSetDeterminismWithFakeMesh(unittest.TestCase):
         # Verify that coordinates with same PP but different DP have same seed
         for pp_rank in range(mesh_sizes[1]):
             # All DP ranks should have same seed for this PP rank
-            seeds_for_this_pp = [
-                seeds_by_coord[(dp_rank, pp_rank)] for dp_rank in range(mesh_sizes[0])
-            ]
+            seeds_for_this_pp = [seeds_by_coord[(dp_rank, pp_rank)] for dp_rank in range(mesh_sizes[0])]
             self.assertEqual(
                 len(set(seeds_for_this_pp)),
                 1,
-                f"Different DP ranks at pp={pp_rank} should have same seed, "
-                f"got {seeds_for_this_pp}",
+                f"Different DP ranks at pp={pp_rank} should have same seed, " f"got {seeds_for_this_pp}",
             )
 
         # Verify that different PP ranks have different seeds
@@ -194,17 +191,13 @@ class TestSetDeterminismWithFakeMesh(unittest.TestCase):
             for dp_replicate_rank in range(mesh_sizes[1]):
                 for tp_rank in range(mesh_sizes[2]):
                     global_rank = (
-                        dp_shard_rank * (mesh_sizes[1] * mesh_sizes[2])
-                        + dp_replicate_rank * mesh_sizes[2]
-                        + tp_rank
+                        dp_shard_rank * (mesh_sizes[1] * mesh_sizes[2]) + dp_replicate_rank * mesh_sizes[2] + tp_rank
                     )
                     mock_get_rank.return_value = global_rank
 
                     # Create fake mesh for this rank
                     rank_coords = (dp_shard_rank, dp_replicate_rank, tp_rank)
-                    fake_mesh = FakeParallelDims(
-                        mesh_dim_names, mesh_sizes, rank_coords
-                    )
+                    fake_mesh = FakeParallelDims(mesh_dim_names, mesh_sizes, rank_coords)
 
                     # Call set_determinism with distinct seeds on dp_shard and dp_replicate only
                     debug_config = DebugConfig(seed=base_seed, deterministic=False)
@@ -228,8 +221,7 @@ class TestSetDeterminismWithFakeMesh(unittest.TestCase):
             for dp_replicate_rank in range(mesh_sizes[1]):
                 # All TP ranks should have same seed for this (dp_shard, dp_replicate)
                 seeds_for_this_dp = [
-                    seeds_by_coord[(dp_shard_rank, dp_replicate_rank, tp_rank)]
-                    for tp_rank in range(mesh_sizes[2])
+                    seeds_by_coord[(dp_shard_rank, dp_replicate_rank, tp_rank)] for tp_rank in range(mesh_sizes[2])
                 ]
                 self.assertEqual(
                     len(set(seeds_for_this_dp)),
@@ -242,9 +234,7 @@ class TestSetDeterminismWithFakeMesh(unittest.TestCase):
         unique_dp_seeds = set()
         for dp_shard_rank in range(mesh_sizes[0]):
             for dp_replicate_rank in range(mesh_sizes[1]):
-                seed = seeds_by_coord[
-                    (dp_shard_rank, dp_replicate_rank, 0)
-                ]  # Just check first TP rank
+                seed = seeds_by_coord[(dp_shard_rank, dp_replicate_rank, 0)]  # Just check first TP rank
                 self.assertNotIn(
                     seed,
                     unique_dp_seeds,
@@ -281,9 +271,7 @@ class TestSetDeterminismWithFakeMesh(unittest.TestCase):
             trainer.config = config
             trainer.parallel_dims = FakeParallelDims(["batch"], [2], (batch_rank,))
             trainer.device = self.device
-            trainer.checkpointer = SimpleNamespace(
-                load=lambda **_: torch.manual_seed(base_seed + 999)
-            )
+            trainer.checkpointer = SimpleNamespace(load=lambda **_: torch.manual_seed(base_seed + 999))
             trainer.step = 0
             trainer.dataloader = ()
 
@@ -339,9 +327,7 @@ class TestSetDeterminismWithFakeMesh(unittest.TestCase):
 
     @patch("torch.distributed.distributed_c10d.get_world_size")
     @patch("torch.distributed.distributed_c10d.get_rank")
-    def test_detect_anomaly_disabled_by_default(
-        self, mock_get_rank, mock_get_world_size
-    ):
+    def test_detect_anomaly_disabled_by_default(self, mock_get_rank, mock_get_world_size):
         """detect_anomaly defaults to False and does not call set_detect_anomaly."""
         mock_get_world_size.return_value = 1
         mock_get_rank.return_value = 0
