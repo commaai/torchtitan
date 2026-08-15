@@ -151,6 +151,55 @@ def dist_mean(
     )
 
 
+def resolve_seed(
+    parallel_dims: ParallelDims,
+    device: torch.device,
+    seed: int | None,
+    distinct_seed_mesh_dims: list[str],
+) -> int | None:
+    """Resolve a seed for this rank without changing any RNG state.
+
+    All ranks start from one base seed. Coordinates along
+    ``distinct_seed_mesh_dims`` are then folded into that seed using a
+    mixed-radix offset, while coordinates along all other mesh dimensions
+    continue to share it.
+    """
+    if parallel_dims.world_size == 1:
+        if seed is not None:
+            logger.debug(f"Single-process job using seed: {seed}")
+        return seed
+
+    # To control which ranks share a seed, all ranks agree on a starting seed.
+    # If the user did not provide one, rank 0's main generator supplies it.
+    if seed is None:
+        seed_tensor = torch.get_rng_state()[:8].to(device)
+        torch.distributed.broadcast(seed_tensor, src=0)
+        seed = int(seed_tensor.to("cpu").view(torch.uint64).item())
+    assert isinstance(seed, int)
+
+    distinct_seed_meshes = [
+        parallel_dims.get_optional_mesh(dim) for dim in distinct_seed_mesh_dims
+    ]
+    distinct_seed_meshes = [mesh for mesh in distinct_seed_meshes if mesh is not None]
+
+    if distinct_seed_meshes:
+        seed_offset = 0
+        cumulative_size = 1
+        for distinct_mesh in distinct_seed_meshes:
+            seed_offset += distinct_mesh.get_local_rank() * cumulative_size
+            cumulative_size *= distinct_mesh.size()
+
+        seed = (seed + seed_offset) % 2**64
+        logger.debug(
+            f"Distinct dims {distinct_seed_mesh_dims}, "
+            f"Global rank {c10d.get_rank()} using seed: {seed}"
+        )
+    else:
+        logger.debug(f"Global Rank {c10d.get_rank()} using seed: {seed}")
+
+    return seed
+
+
 def set_determinism(
     parallel_dims: ParallelDims,
     device: torch.device,
@@ -158,17 +207,14 @@ def set_determinism(
     distinct_seed_mesh_dims: list[str],
 ) -> None:
     """
-    Set the same DTensor manual seed for all dimensions in world mesh, but only different seeds
-    across dimensions denoted by `distinct_seed_mesh_dims`. An example use case is pipeline parallelism,
-    where we want to have the same seed across SPMD groups, but different seeds across PP groups.
-
-    Currently, does not set seeds for the CUDA RNG since TorchTitan always uses DTensor for SPMD parallelisms,
-    and DTensor manages its own RNG tracker, but we could extend to support both if needed.
+    Set the same seed for all dimensions in the world mesh, except dimensions
+    denoted by ``distinct_seed_mesh_dims``. An example use case is pipeline
+    parallelism, where SPMD groups share a seed while PP stages differ.
 
     Set Determinism flags for increased reproducibility with loss of performance.
 
     Args:
-        world_mesh: Device mesh for distributed training
+        parallel_dims: Parallel dimensions and meshes for distributed training.
         device: Device to use
         debug_config: Debug config to use
         distinct_seed_mesh_dims: List of mesh dimension names to have distinct seeds across.
@@ -215,61 +261,21 @@ def set_determinism(
         # Stack trace recording (the useful part) is still enabled.
         torch.autograd.set_detect_anomaly(True, check_nan=False)
 
-    seed = debug_config.seed
-    if parallel_dims.world_size == 1:
-        if seed is not None:
-            torch.manual_seed(seed)
-            os.environ["PYTHONHASHSEED"] = str(seed % 2**32)
-            logger.debug(f"Single-process job using seed: {seed}")
+    seed = resolve_seed(
+        parallel_dims,
+        device,
+        debug_config.seed,
+        distinct_seed_mesh_dims,
+    )
+    if seed is None:
         return
 
-    # to ensure we can control which ranks have same or different seeds, all ranks agree on a starting seed.
-    # if user provides one, we use this. Otherwise rank 0 rolls the dice and everyone else uses that.
-    if seed is None:
-        # Extract the seed for torch's main generator on rank 0 and standardizes on using that to build
-        # seeds for unique SPMD groups
-        seed_tensor = torch.get_rng_state()[:8].to(device)
-        torch.distributed.broadcast(seed_tensor, src=0)
-        seed = seed_tensor.to("cpu").view(torch.uint64).item()
-    assert isinstance(seed, int)
-
-    # Set distinct seed for each rank in mesh dimensions, with dimension names provided by `distinct_seed_mesh_dims`
-    # For PP + SPMD cases, we want to separate the world into the SPMD mesh and the PP mesh,
-    # and choose a unique seed for each rank on the PP mesh.
-    # We support multiple distinct dimensions by adding each distinct dimension's local rank to the seed.
-    distinct_seed_meshes = [
-        parallel_dims.get_optional_mesh(dim) for dim in distinct_seed_mesh_dims
-    ]
-    distinct_seed_meshes = [mesh for mesh in distinct_seed_meshes if mesh is not None]
-    assert all(mesh is not None for mesh in distinct_seed_meshes)
-
-    if distinct_seed_meshes:
-        # Each dimension contributes: local_rank * (product of all previous dimension sizes)
-        # This guarantees uniqueness like multi-dimensional array indexing
-        seed_offset = 0
-        cumulative_size = 1
-
-        for distinct_mesh in distinct_seed_meshes:
-            local_rank = distinct_mesh.get_local_rank()
-            # Add contribution from this dimension
-            seed_offset += local_rank * cumulative_size
-            # Update cumulative size for next dimension
-            cumulative_size *= distinct_mesh.size()
-
-        seed += seed_offset
-        seed %= 2**64
-
-        logger.debug(
-            f"Distinct dims {distinct_seed_mesh_dims}, Global rank {c10d.get_rank()} using seed: {seed}"
-        )
-
-    else:
-        logger.debug(f"Global Rank {c10d.get_rank()} using seed: {seed}")
-
-    # The native RNGs and python RNG may not be important, except for the 1-D PP case, but we seed them for consistency.
+    # torch.manual_seed covers the native generator on every device.
     torch.manual_seed(seed)
     # PYTHONHASHSEED can be a decimal number in the range [0, 2**32 - 1]
     os.environ["PYTHONHASHSEED"] = str(seed % 2**32)
+    if parallel_dims.world_size == 1:
+        return
 
     # As long as we are not in the 1-D (PP-only) case, we will have a seed to use for
     # all ranks of the SPMD mesh. If PP is also used, this seed is unique per PP rank.
@@ -279,6 +285,27 @@ def set_determinism(
         # We just need to pass the world_mesh as the device_id is the only information
         # this API uses.
         torch.distributed.tensor._random.manual_seed(seed, parallel_dims.world_mesh)
+
+
+def set_runtime_seed(
+    parallel_dims: ParallelDims,
+    device: torch.device,
+    seed: int | None,
+    distinct_seed_mesh_dims: list[str],
+) -> None:
+    """Seed native runtime RNG without initializing the DTensor RNG tracker.
+
+    The native generator also backs current DTensor randomness, so callers must
+    restrict this helper to runtime paths that operate on local tensors.
+    """
+    seed = resolve_seed(
+        parallel_dims,
+        device,
+        seed,
+        distinct_seed_mesh_dims,
+    )
+    if seed is not None:
+        torch.manual_seed(seed)
 
 
 _batch_invariant_enabled: bool = False

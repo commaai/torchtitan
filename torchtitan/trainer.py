@@ -864,6 +864,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             extra_metrics=extra_metrics,
         )
 
+    def set_runtime_seed(self) -> None:
+        """Set per-data-worker native RNG for supported local-tensor topologies."""
+        config = self.config
+        local_runtime_rng = (
+            config.parallelism.spmd_backend != "full_dtensor"
+            and not self.parallel_dims.tp_enabled
+            and not self.parallel_dims.cp_enabled
+            and not self.parallel_dims.ep_enabled
+        )
+        if local_runtime_rng:
+            dist_utils.set_runtime_seed(
+                self.parallel_dims,
+                self.device,
+                config.debug.seed,
+                distinct_seed_mesh_dims=["batch", "pp"],
+            )
+
     @record
     def train(self):
         config = self.config
@@ -871,6 +888,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         sl.log_trace_instant("training_start")
 
         self.checkpointer.load(step=config.checkpoint.load_step)
+
+        self.set_runtime_seed()
 
         # Capture loaded step for relative_step calculation.
         # After checkpoint load: self.step = restored step (e.g. 100), or 0 if fresh.

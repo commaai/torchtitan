@@ -55,16 +55,6 @@ class FluxTrainer(Trainer):
 
         super().__init__(config)
 
-        # Set random seed, and maybe enable deterministic mode
-        # (mainly for debugging, expect perf loss).
-        # For Flux model, we need distinct seed across FSDP ranks to ensure we randomly dropout prompts info in dataloader
-        dist_utils.set_determinism(
-            self.parallel_dims,
-            self.device,
-            config.debug,
-            distinct_seed_mesh_dims=["fsdp", "dp_replicate"],
-        )
-
         # NOTE: self._dtype is the data type used for encoders (image encoder, T5 text encoder, CLIP text encoder).
         # We cast the encoders and it's input/output to this dtype.  If FSDP with mixed precision training is not used,
         # the dtype for encoders is torch.float32 (default dtype for Flux Model).

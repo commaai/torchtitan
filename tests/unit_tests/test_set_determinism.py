@@ -6,11 +6,14 @@
 
 import os
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 from torchtitan.config import DebugConfig
 from torchtitan.distributed.utils import set_determinism
+from torchtitan.trainer import Trainer
 
 
 class FakeParallelDims:
@@ -38,6 +41,9 @@ class FakeParallelDims:
         self.dp_replicate = self.mesh_sizes.get("dp_replicate", 1)
         self.dp_shard = self.mesh_sizes.get("dp_shard", 1)
         self.ep = self.mesh_sizes.get("ep", 1)
+        self.tp_enabled = self.tp > 1
+        self.cp_enabled = self.cp > 1
+        self.ep_enabled = self.ep > 1
 
         # For backward compatibility with 'dp' dimension name
         if "dp" in self.mesh_sizes:
@@ -251,6 +257,41 @@ class TestSetDeterminismWithFakeMesh(unittest.TestCase):
             mesh_sizes[0] * mesh_sizes[1],
             f"Expected {mesh_sizes[0] * mesh_sizes[1]} unique seeds for (dp_shard, dp_replicate) combinations",
         )
+
+    @patch("torch.distributed.tensor._random.manual_seed")
+    @patch("torch.distributed.get_rank", return_value=1)
+    @patch("torch.distributed.distributed_c10d.get_rank", return_value=1)
+    def test_trainer_reseeds_runtime_rng_after_load_across_batch_workers(
+        self, _mock_c10d_rank, _mock_dist_rank, mock_dtensor_manual_seed
+    ):
+        """Batch workers aligned at initialization must diverge after loading."""
+        base_seed = 1234
+        config = SimpleNamespace(
+            dump_folder="/tmp",
+            checkpoint=SimpleNamespace(load_step=None),
+            parallelism=SimpleNamespace(spmd_backend="default"),
+            debug=DebugConfig(seed=base_seed),
+            profiler=SimpleNamespace(build=lambda **_: nullcontext()),
+            training=SimpleNamespace(steps=0),
+        )
+        draws = []
+
+        for batch_rank in range(2):
+            trainer = Trainer.__new__(Trainer)
+            trainer.config = config
+            trainer.parallel_dims = FakeParallelDims(["batch"], [2], (batch_rank,))
+            trainer.device = self.device
+            trainer.checkpointer = SimpleNamespace(
+                load=lambda **_: torch.manual_seed(base_seed + 999)
+            )
+            trainer.step = 0
+            trainer.dataloader = ()
+
+            trainer.train()
+            draws.append(torch.rand(4))
+
+        mock_dtensor_manual_seed.assert_not_called()
+        self.assertFalse(torch.equal(*draws))
 
     @patch("torch.distributed.distributed_c10d.get_world_size")
     @patch("torch.distributed.distributed_c10d.get_rank")
