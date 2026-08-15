@@ -6,17 +6,15 @@
 
 from __future__ import annotations
 
-import json
-import os
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import cache
-from typing import Annotated, Any, cast, Literal
+from typing import Annotated, cast, Literal
 
-from xx.common.supercombo_helpers import get_model_args
 from xx.ml_tools.constants.model import TEMPORAL_INPUTS
+from xx.training.lib.checkpoint import Checkpoint
 from xx.training.rldriving.dataloader import RolloutContext
 
 import torch
@@ -55,12 +53,7 @@ PreparedBatch = tuple[
 ]
 
 
-@cache
-def _get_path_hparams(checkpoint: str) -> dict[str, Any]:
-    if os.path.isdir(checkpoint):
-        with open(os.path.join(checkpoint, "hparams.json"), encoding="utf-8") as file:
-            return json.load(file)
-    return get_model_args(checkpoint)
+_get_path_checkpoint = cache(Checkpoint)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -76,7 +69,6 @@ class RLDrivingLRSchedulersConfig(LRSchedulersContainer.Config):
 
     # pyrefly: ignore [bad-override]
     def build(self, *, optimizers, training_steps):
-        del training_steps
         return RLDrivingLRSchedulers(self, optimizers=optimizers)
 
 
@@ -92,29 +84,28 @@ class RLDrivingLRSchedulers(LRSchedulersContainer):
         self.config = config
         self.optimizer_container = optimizers
         self.optimizer = next(iter(optimizers))
-        self._base_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
         self.schedulers = [
             LambdaLR(
                 self.optimizer,
-                [self._lr_lambda(i) for i in range(len(self.optimizer.param_groups))],
+                [self._lr_lambda(group) for group in self.optimizer.param_groups],
             )
         ]
 
-    def _lr_lambda(self, group_idx: int):
-        phase = self.optimizer.param_groups[group_idx]["param_names"][0].split(".", 1)[0]
-        base_lr = self._base_lrs[group_idx]
+    def _lr_lambda(self, group):
+        phase = group["param_names"][0].split(".", 1)[0]
+        base_lr = float(group["lr"])
 
         def lr_lambda(current_step: int) -> float:
             config = self.config
             epoch = current_step / config.steps_per_epoch
-            max_epoch = max(1.0, config.num_epochs - 1.0)
+            max_epoch = config.num_epochs - 1.0
+            cooldown_start = max_epoch * (1.0 - config.cooldown_fraction)
             if phase == "actor":
                 if epoch < config.actor_delay_epochs:
                     return 0.0
                 warmup_end = config.actor_delay_epochs + max_epoch * config.actor_warmup_fraction
                 if epoch < warmup_end:
                     return (epoch - config.actor_delay_epochs) / (max_epoch * config.actor_warmup_fraction)
-                cooldown_start = max_epoch * (1.0 - config.cooldown_fraction)
                 if epoch < cooldown_start:
                     return 1.0
                 progress = min(1.0, (epoch - cooldown_start) / (max_epoch - cooldown_start))
@@ -123,7 +114,6 @@ class RLDrivingLRSchedulers(LRSchedulersContainer):
             if epoch < config.critic_switch_epoch:
                 return 1.0
             lr = config.critic_second_lr
-            cooldown_start = max_epoch * (1.0 - config.cooldown_fraction)
             if epoch >= cooldown_start:
                 progress = min(1.0, (epoch - cooldown_start) / (max_epoch - cooldown_start))
                 lr *= 1.0 + progress * (config.min_lr_factor - 1.0)
@@ -136,10 +126,8 @@ class RLDrivingLRSchedulers(LRSchedulersContainer):
         self.optimizer.param_groups = [
             group for group in all_param_groups if group["param_names"][0].startswith(f"{phase}.")
         ]
-        try:
-            self.optimizer_container.step()
-        finally:
-            self.optimizer.param_groups = all_param_groups
+        self.optimizer_container.step()
+        self.optimizer.param_groups = all_param_groups
 
 
 class RLDrivingTrainer(Trainer):
@@ -155,14 +143,13 @@ class RLDrivingTrainer(Trainer):
         fps: Annotated[int, tyro.conf.Suppress] = 0
 
         def __post_init__(self) -> None:
-            path_hparams = _get_path_hparams(self.warm_start_checkpoint)
+            path_hparams = _get_path_checkpoint(self.warm_start_checkpoint).metadata["training_args"]
             model_hparams = path_hparams.get("torchtitan", path_hparams)["model"]
             from .config_registry import model_registry
 
             self.model_spec = model_registry(model_hparams["temporal_policy"])
             self.fps = int(path_hparams["fps"])
-            self.dataloader.fps = self.fps
-            self.loss.fps = self.fps
+            self.dataloader.fps = self.loss.fps = self.fps
             model_config = cast(RLDrivingModel.Config, self.model_spec.model)
             input_shapes = RLDrivingModel.input_shapes(model_config)
             self.checkpoint.input_names = list(input_shapes)
@@ -177,25 +164,20 @@ class RLDrivingTrainer(Trainer):
             if self.ema_tau < 1.0:
                 raise ValueError("ema_tau must be at least 1")
 
+    config: Config  # pyrefly: ignore [bad-override]
+    loss_fn: RLDrivingLoss  # pyrefly: ignore [bad-override]
+    dataloader: RLDrivingDataLoader  # pyrefly: ignore [bad-override]
+    lr_schedulers: RLDrivingLRSchedulers  # pyrefly: ignore [bad-override]
+
     def __init__(self, config: Config):
         super().__init__(config)
         if self.gradient_accumulation_steps != 1:
             raise ValueError("rldriving does not support gradient accumulation")
-        self.rl_loss_fn = cast(RLDrivingLoss, self.loss_fn).to(self.device)
-        self.rl_dataloader = cast(RLDrivingDataLoader, self.dataloader)
-        self.rl_lr_schedulers = cast(RLDrivingLRSchedulers, self.lr_schedulers)
+        self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
-        self.steps_per_epoch = config.steps_per_epoch
-        self.ema_tau = config.ema_tau
-        checkpoint_path = config.warm_start_checkpoint
-        if not os.path.isdir(checkpoint_path):
-            reporterv2_host = (os.getenv("REPORTERV2_HOST") or "mkv://data-gen.comma.life:3080/reporterv2").rstrip("/")
-            checkpoint_path = f"{reporterv2_host}/checkpoint/{checkpoint_path}"
-        storage_reader = FsspecReader(checkpoint_path)
         dcp.load(
             {"temporal_policy": self.model.actor},
-            storage_reader=storage_reader,
-            planner=dcp.DefaultLoadPlanner(allow_partial_load=False),
+            storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
         )
         self.model.warm_start_critics_from_actor()
 
@@ -224,33 +206,23 @@ class RLDrivingTrainer(Trainer):
         }
         return current_inputs, next_inputs, targets, metadata
 
-    def run_actor(
-        self,
-        inputs: dict[str, torch.Tensor],
-        *,
-        target: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        return self.model.target_forward(inputs) if target else self.model(inputs)
-
     # pyrefly: ignore [bad-override]
     def train_step(self, data_iterator: Iterator[Batch]) -> None:
-        completed_step = max(self.step - 1, 0)
-        rollout_epoch = (completed_step // self.steps_per_epoch) * self.steps_per_epoch + 1
-        self.rl_dataloader.attach_training_context(RolloutContext(epoch=rollout_epoch))
+        steps_per_epoch = self.config.steps_per_epoch
+        rollout_epoch = ((self.step - 1) // steps_per_epoch) * steps_per_epoch + 1
+        self.dataloader.attach_training_context(RolloutContext(epoch=rollout_epoch))
         current_inputs, next_inputs, targets, metadata = self.prepare_batch(next(data_iterator))
         batch_size = next(iter(current_inputs.values())).shape[0]
         self.ntokens_seen += batch_size
-        batch_mesh = self.parallel_dims.get_optional_mesh("batch")
         local_samples = torch.tensor(batch_size, dtype=torch.float32, device=self.device)
-        global_samples = float(dist_utils.dist_sum(local_samples, batch_mesh) if batch_mesh is not None else batch_size)
 
         lr_metrics = self.lr_schedulers.get_metrics()
         metric_sums: dict[str, torch.Tensor] = {}
         self.optimizers.zero_grad()
         with self.train_context():
-            actor_outputs = self.run_actor(current_inputs)
-            next_actor_outputs = self.run_actor(next_inputs)
-            actor_loss_B, actor_metrics = self.rl_loss_fn.actor_loss(
+            actor_outputs = self.model(current_inputs)
+            next_actor_outputs = self.model(next_inputs)
+            actor_loss_B, actor_metrics = self.loss_fn.actor_loss(
                 actor_outputs=actor_outputs,
                 next_actor_outputs=next_actor_outputs,
                 online_critic=self.model.critic,
@@ -264,13 +236,13 @@ class RLDrivingTrainer(Trainer):
         del actor_outputs, next_actor_outputs, actor_loss_B, actor_metrics
         actor_grad_norm = self._clip_phase_grad_norm(self.model.actor)
         self.checkpointer.maybe_wait_for_staging()
-        self.rl_lr_schedulers.step_phase("actor")
+        self.lr_schedulers.step_phase("actor")
 
         self.optimizers.zero_grad()
         with self.train_context():
             with torch.no_grad():
-                next_actor_outputs = self.run_actor(next_inputs, target=True)
-            critic_loss_B, critic_metrics = self.rl_loss_fn.critic_loss(
+                next_actor_outputs = self.model.target_forward(next_inputs)
+            critic_loss_B, critic_metrics = self.loss_fn.critic_loss(
                 next_actor_outputs=next_actor_outputs,
                 targets=targets,
                 online_critic=self.model.critic,
@@ -284,18 +256,18 @@ class RLDrivingTrainer(Trainer):
         self._accumulate_metrics(metric_sums, critic_metrics)
         del next_actor_outputs, critic_loss_B, critic_metrics
         critic_grad_norm = self._clip_phase_grad_norm(self.model.critic)
-        self.rl_lr_schedulers.step_phase("critic")
+        self.lr_schedulers.step_phase("critic")
         self.optimizers.zero_grad()
 
         with torch.no_grad():
-            decay = 1.0 - 1.0 / self.ema_tau
+            decay = 1.0 - 1.0 / self.config.ema_tau
             for online, target in (
                 (self.model.actor, self.model.target_actor),
                 (self.model.critic, self.model.target_critic),
             ):
-                for online_param, target_param in zip(online.parameters(), target.parameters(), strict=True):
+                for online_param, target_param in zip(online.parameters(), target.parameters()):
                     target_param.mul_(decay).add_(online_param, alpha=1.0 - decay)
-                for online_buffer, target_buffer in zip(online.buffers(), target.buffers(), strict=True):
+                for online_buffer, target_buffer in zip(online.buffers(), target.buffers()):
                     target_buffer.copy_(online_buffer)
         self.lr_schedulers.step()
 
@@ -305,6 +277,7 @@ class RLDrivingTrainer(Trainer):
         loss = actor_loss + critic_loss
         loss_mesh = self.parallel_dims.get_optional_mesh("loss")
         if loss_mesh is not None:
+            global_samples = float(dist_utils.dist_sum(local_samples, loss_mesh))
             global_avg_loss = dist_utils.dist_sum(loss * local_samples, loss_mesh) / global_samples
             global_max_loss = dist_utils.dist_max(loss, loss_mesh)
             global_samples_seen = dist_utils.dist_sum(
@@ -317,7 +290,7 @@ class RLDrivingTrainer(Trainer):
         else:
             global_avg_loss = global_max_loss = float(loss.item())
             global_samples_seen = self.ntokens_seen
-            metric_averages = {name: float(value.item()) / global_samples for name, value in metric_sums.items()}
+            metric_averages = {name: float(value.item()) / batch_size for name, value in metric_sums.items()}
 
         metadata_averages = {}
         for name, value in metadata.items():
@@ -350,11 +323,9 @@ class RLDrivingTrainer(Trainer):
 
     def _clip_phase_grad_norm(self, module: nn.Module) -> torch.Tensor:
         return dist_utils.clip_grad_norm_(
-            list(module.parameters()),
+            module.parameters(),
             self.config.training.max_norm,
             foreach=True,
-            pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=self.parallel_dims.ep_enabled,
         )
 
     @staticmethod
@@ -375,9 +346,7 @@ class RLDrivingTrainer(Trainer):
                 for optimizer in self.optimizers:
                     init_optim_state(optimizer)
                     for state in optimizer.state.values():
-                        step = state.get("step")
-                        if isinstance(step, torch.Tensor):
-                            step.zero_()
+                        state["step"].zero_()
             self.checkpointer.save(0)
         loaded_step = self.step
         logger.info(f"Training starts at step {self.step + 1}")
@@ -386,7 +355,7 @@ class RLDrivingTrainer(Trainer):
             global_step=self.step,
             base_folder=config.dump_folder,
         ) as profiler:
-            data_iterator = self.batch_generator(self.rl_dataloader)
+            data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1
                 sl.set_step(self.step, relative_step=self.step - loaded_step)
@@ -414,5 +383,5 @@ class RLDrivingTrainer(Trainer):
         logger.info("Training completed")
 
     def close(self) -> None:
-        self.rl_dataloader.close()
+        self.dataloader.close()
         super().close()

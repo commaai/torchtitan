@@ -9,10 +9,11 @@ from __future__ import annotations
 import copy
 import math
 import os
-from typing import Any
+from typing import Any, cast
 from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TRAIN_LIST
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import ConfigDict
+from pydantic.dataclasses import dataclass as _pydantic_dataclass
 
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
@@ -29,14 +30,15 @@ from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
 from .trainer import RLDrivingLRSchedulersConfig, RLDrivingTrainer
 
 
-class _PathTemporalPolicyConfig(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    temporal_policy: TemporalPolicy.Config
+_PathTemporalPolicyConfig = _pydantic_dataclass(
+    TemporalPolicy.Config,
+    config=ConfigDict(arbitrary_types_allowed=True),
+    slots=True,
+)
 
 
 def model_registry(temporal_policy_hparams: dict[str, Any]) -> ModelSpec:
-    actor = _PathTemporalPolicyConfig.model_validate({"temporal_policy": temporal_policy_hparams}).temporal_policy
+    actor = cast(TemporalPolicy.Config, _PathTemporalPolicyConfig(**temporal_policy_hparams))
     actor.temporal_summarizer.dense_training_outputs = False
     for layer in actor.temporal_summarizer.transformer.layers:
         layer.attention.dropout = 0.0
@@ -84,23 +86,20 @@ def model_registry(temporal_policy_hparams: dict[str, Any]) -> ModelSpec:
     )
 
 
-def _rldriving() -> RLDrivingTrainer.Config:
+def rldriving() -> RLDrivingTrainer.Config:
     num_epochs = 201
     steps_per_epoch = 64
-    gamma = 0.95
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     world_size = int(os.environ.get("WORLD_SIZE", str(local_world_size)))
     num_nodes = int(os.environ.get("GROUP_WORLD_SIZE", str(world_size // local_world_size)))
     reporterv2_host = os.getenv("REPORTERV2_HOST")
     reporterv2_training_id = os.getenv("REPORTERV2_TRAINING_ID")
-    checkpoint_base_folder = f"{reporterv2_host.rstrip('/')}/checkpoint" if reporterv2_host else ""
-
     actor_optim = {"lr": 4e-5, "betas": (0.9, 0.999), "eps": 1e-8}
     critic_optim = {"lr": 2e-4, "betas": (0.9, 0.999), "eps": 1e-8}
     return RLDrivingTrainer.Config(
         loss=RLDrivingLoss.Config(
             action_noise=(0.25, 0.25),
-            gamma=gamma,
+            gamma=0.95,
             fps=0.0,
             smooth_lat_cost=0.1,
             smooth_long_cost=0.1,
@@ -117,7 +116,6 @@ def _rldriving() -> RLDrivingTrainer.Config:
             pipeline_dir=BASE_DIR_GT,
             epochs=num_epochs,
             steps_per_epoch=steps_per_epoch,
-            gamma=gamma,
         ),
         optimizer=OptimizersContainer.Config(
             implementation="fused",
@@ -170,7 +168,7 @@ def _rldriving() -> RLDrivingTrainer.Config:
         checkpoint=RLDrivingOnnxCheckpointManager.Config(
             keep_latest_k=0,
             enable=True,
-            checkpoint_base_folder=checkpoint_base_folder,
+            checkpoint_base_folder=f"{reporterv2_host.rstrip('/')}/checkpoint" if reporterv2_host else "",
             export_onnx=True,
             folder=reporterv2_training_id or "checkpoint",
             interval=steps_per_epoch,
@@ -186,11 +184,3 @@ def _rldriving() -> RLDrivingTrainer.Config:
         ),
         debug=DebugConfig(seed=0),
     )
-
-
-def rldriving() -> RLDrivingTrainer.Config:
-    return _rldriving()
-
-
-def convnext_xxlarge() -> RLDrivingTrainer.Config:
-    return _rldriving()

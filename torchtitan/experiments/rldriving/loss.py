@@ -24,7 +24,6 @@ ActorOutputs = dict[str, torch.Tensor]
 ModelInputs = dict[str, torch.Tensor]
 Targets = dict[str, torch.Tensor]
 LossResult = tuple[torch.Tensor, dict[str, torch.Tensor]]
-PhaseLossFunction = Callable[..., LossResult]
 
 ACTION_OUTPUT = "action"
 
@@ -34,7 +33,7 @@ def _sample_fixed_noise_policy(
     action_noise_A: torch.Tensor,
 ) -> torch.Tensor:
     action_mean_BA = action_pred_BA[:, :2]
-    return action_mean_BA + torch.randn_like(action_mean_BA) * action_noise_A[None, :]
+    return action_mean_BA + torch.randn_like(action_mean_BA) * action_noise_A
 
 
 def _critic_loss(
@@ -174,8 +173,8 @@ class RLDrivingLoss(BaseLoss):
         self.action_bound = config.action_bound
         self.action_bound_loss_weight = config.action_bound_loss_weight
 
-        self.critic_fn: PhaseLossFunction = _critic_loss
-        self.actor_fn: PhaseLossFunction = _actor_loss
+        self.critic_fn = _critic_loss
+        self.actor_fn = _actor_loss
         if compile_config is not None and compile_config.enable and "loss" in compile_config.components:
             logger.info("Compiling the rldriving loss functions with torch.compile")
             self.critic_fn = torch.compile(
@@ -187,8 +186,6 @@ class RLDrivingLoss(BaseLoss):
                 backend=compile_config.backend,
             )
 
-        # RLDrivingTrainer calls the phase-specific methods below. Keep fn set for
-        # the BaseLoss protocol without defining an ambiguous combined loss call.
         self.fn = cast(Callable[..., torch.Tensor], self.actor_fn)
 
     def to(self, device: torch.device) -> RLDrivingLoss:

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, cast
 
-from xx.ml_tools.constants.model import ModelInputs, TEMPORAL_INPUTS
+from xx.ml_tools.constants.model import ModelInputs
 
 import torch
 import torch.nn as nn
@@ -64,12 +64,8 @@ class Critic(Module):
         self.post_action_mlp2 = config.post_action_mlp2.build()
         self.q_hydra = config.q_hydra.build()
 
-        if Q_HEAD_NAME not in self.q_hydra.final_layer:
-            raise ValueError(f"Critic hydra must define a {Q_HEAD_NAME!r} head")
-
     def forward(self, inputs: TemporalInputs, action: torch.Tensor) -> torch.Tensor:
         features_BTD = inputs[ModelInputs.FEATURES]
-        action_BA = action
         dtype = features_BTD.dtype
         critic_features_BD = self.temporal_summarizer(
             features_BTD[:, self.history_idxs],
@@ -78,7 +74,7 @@ class Critic(Module):
             inputs[ModelInputs.ACTION_T][:, -1].to(dtype),
         )
         critic_features_BD = critic_features_BD + self.post_action_mlp1(critic_features_BD)
-        critic_features_BD = critic_features_BD + self.action_encoder(action_BA.to(dtype))
+        critic_features_BD = critic_features_BD + self.action_encoder(action.to(dtype))
         critic_features_BD = critic_features_BD + self.post_action_mlp2(critic_features_BD)
         q_B1 = self.q_hydra(critic_features_BD)[Q_HEAD_NAME]
         return q_B1.squeeze(-1).clone()
@@ -99,8 +95,7 @@ class TwinCritic(Module):
         inputs: TemporalInputs,
         action: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        action_BA = action
-        return self.critic1(inputs, action_BA), self.critic2(inputs, action_BA)
+        return self.critic1(inputs, action), self.critic2(inputs, action)
 
 
 class RLDrivingModel(BaseModel):
@@ -129,7 +124,10 @@ class RLDrivingModel(BaseModel):
             rldriving_model = cast(RLDrivingModel, model)
             nparams = sum(parameter.numel() for parameter in rldriving_model.parameters())
             device = next(rldriving_model.parameters()).device
-            inputs = RLDrivingModel.example_inputs(self, device=device)
+            inputs = {
+                name: torch.zeros(shape, dtype=torch.float32, device=device)
+                for name, shape in RLDrivingModel.input_shapes(self).items()
+            }
             action_dim = self.critic.critic.action_encoder.in_layer.in_features
             action_BA = torch.zeros((1, action_dim), dtype=torch.float32, device=device)
             with torch.no_grad(), FlopCounterMode(display=False) as counter:
@@ -146,8 +144,6 @@ class RLDrivingModel(BaseModel):
         self.target_actor = config.actor.build()
         self.target_critic = config.critic.build()
 
-        if ACTION_HEAD_NAME not in self.actor.temporal_hydra.final_layer:
-            raise ValueError(f"Actor hydra must define an {ACTION_HEAD_NAME!r} head")
         self.target_actor.requires_grad_(False).eval()
         self.target_critic.requires_grad_(False).eval()
 
@@ -178,24 +174,6 @@ class RLDrivingModel(BaseModel):
             ),
         }
 
-    @staticmethod
-    def input_dtypes(config: RLDrivingModel.Config) -> dict[str, torch.dtype]:
-        return dict.fromkeys(TEMPORAL_INPUTS, torch.float32)
-
-    @classmethod
-    def example_inputs(
-        cls,
-        config: RLDrivingModel.Config,
-        *,
-        batch_size: int = 1,
-        device: torch.device | str = "meta",
-    ) -> TemporalInputs:
-        dtypes = cls.input_dtypes(config)
-        return {
-            name: torch.zeros(shape, dtype=dtypes[name], device=device)
-            for name, shape in cls.input_shapes(config, batch_size).items()
-        }
-
     def verify_module_protocol(self) -> None:
         # Path modules contain parameterless torch.nn activations and dropout.
         pass
@@ -206,8 +184,8 @@ class RLDrivingModel(BaseModel):
 
     @torch.no_grad()
     def sync_targets(self) -> None:
-        _strict_copy_model_state(self.actor, self.target_actor)
-        _strict_copy_model_state(self.critic, self.target_critic)
+        _copy_model_state(self.actor, self.target_actor)
+        _copy_model_state(self.critic, self.target_critic)
 
     @torch.no_grad()
     def warm_start_critics_from_actor(self) -> None:
@@ -215,7 +193,7 @@ class RLDrivingModel(BaseModel):
             self.critic.critic1.temporal_summarizer,
             self.critic.critic2.temporal_summarizer,
         ):
-            _strict_copy_model_state(self.actor.temporal_summarizer, destination)
+            _copy_model_state(self.actor.temporal_summarizer, destination)
         self.sync_targets()
 
     def train(self, mode: bool = True) -> RLDrivingModel:
@@ -231,16 +209,10 @@ class RLDrivingModel(BaseModel):
         return _policy_forward(self.target_actor, inputs)
 
 
-def _strict_copy_model_state(source: nn.Module, destination: nn.Module) -> None:
-    source_state = get_model_state_dict(
-        source,
-        options=StateDictOptions(full_state_dict=True),
-    )
-    set_model_state_dict(
-        destination,
-        source_state,
-        options=StateDictOptions(full_state_dict=True, strict=True),
-    )
+def _copy_model_state(source: nn.Module, destination: nn.Module) -> None:
+    options = StateDictOptions(full_state_dict=True)
+    source_state = get_model_state_dict(source, options=options)
+    set_model_state_dict(destination, source_state, options=options)
 
 
 def parallelize_rldriving(
@@ -253,13 +225,6 @@ def parallelize_rldriving(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> RLDrivingModel:
-    if parallelism.spmd_backend == "full_dtensor":
-        raise ValueError("rldriving does not support full DTensor")
-    if parallel_dims.tp_enabled or parallel_dims.cp_enabled or parallel_dims.pp_enabled or parallel_dims.ep_enabled:
-        raise ValueError("rldriving supports data parallelism only")
-    if ac_config is not None:
-        raise ValueError("rldriving does not support activation checkpointing")
-
     if compile_config.enable and "model" in compile_config.components:
         torch._dynamo.config.capture_scalar_outputs = True
         model.actor.compile(backend=compile_config.backend)

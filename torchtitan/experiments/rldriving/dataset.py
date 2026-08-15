@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 from xx.common.basedir import XX_BASEDIR
 from xx.datasets.constants import BASE_DIR_GT
+from xx.training.lib.dataloader import DataLoader
 from xx.training.rldriving.config import DatasetConfig
 from xx.training.rldriving.dataloader import get_dataset, RolloutContext
 
@@ -26,7 +27,6 @@ class RLDrivingDataLoader(BaseDataLoader):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
         dataset: str
-        split: Literal["train"] = "train"
         training_id: str = ""
         shuffle_size: int = 50_000
         min_mixing: float = 0.9
@@ -54,11 +54,6 @@ class RLDrivingDataLoader(BaseDataLoader):
         max_simulation_seconds: int = 7
         worldmodel_future_size_seconds: int = 1
         worldmodel_context_size_seconds: int = 2
-        gamma: float = 0.95
-
-        def __post_init__(self) -> None:
-            if self.split != "train":
-                raise ValueError(f"RL driving only supports the train split, got {self.split!r}")
 
     def __init__(
         self,
@@ -74,14 +69,11 @@ class RLDrivingDataLoader(BaseDataLoader):
         **kwargs: Any,
     ) -> None:
         del tokenizer, seq_len, snapshot_every_n_steps, validation_steps, kwargs
-        from xx.training.lib.dataloader import DataLoader
-
         from gigashuffle import DataloaderConfig
 
         local_rank = int(os.environ.get("LOCAL_RANK", dp_rank))
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", dp_world_size))
         node_rank = int(os.environ.get("GROUP_RANK", dp_rank // local_world_size))
-        run_id = config.training_id or "rldriving"
 
         xx_config = DatasetConfig(
             dataset=config.dataset_path or config.dataset,
@@ -113,9 +105,8 @@ class RLDrivingDataLoader(BaseDataLoader):
             max_simulation_seconds=config.max_simulation_seconds,
             worldmodel_future_size_seconds=config.worldmodel_future_size_seconds,
             worldmodel_context_size_seconds=config.worldmodel_context_size_seconds,
-            gamma=config.gamma,
         )
-        self.dataset = get_dataset(xx_config.dataset, xx_config, local_rank=local_rank)
+        self.dataset = get_dataset(xx_config, local_rank=local_rank)
         self._loader_config = DataloaderConfig(
             bs=local_batch_size,
             shuffle_size=config.shuffle_size,
@@ -127,9 +118,8 @@ class RLDrivingDataLoader(BaseDataLoader):
             global_rank=dp_rank,
             local_world_size=local_world_size,
             global_world_size=dp_world_size,
-            queue_name=f"{run_id}-{config.split}-node{node_rank}",
+            queue_name=f"{config.training_id or 'rldriving'}-train-node{node_rank}",
         )
-        self._loader_factory = DataLoader
         self.loader: Any | None = None
         self._iterator: Any | None = None
 
@@ -138,7 +128,7 @@ class RLDrivingDataLoader(BaseDataLoader):
         self,
     ) -> Iterator[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]]:
         if self.loader is None:
-            self.loader = self._loader_factory(self.dataset, self._loader_config)
+            self.loader = DataLoader(self.dataset, self._loader_config)
         iterator: Any = iter(self.loader)
         self._iterator = iterator
         try:

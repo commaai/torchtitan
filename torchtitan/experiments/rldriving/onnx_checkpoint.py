@@ -38,9 +38,7 @@ class RLDrivingOnnxCheckpointManager(OnnxCheckpointManager):
 
     def _export_onnx(self, model: nn.Module, path: str) -> None:
         model = cast(RLDrivingModel, model)
-        if not self.input_names:
-            raise ValueError("checkpoint.input_names must be set for ONNX export")
-        inputs = dict(zip(self.input_names, self._build_onnx_inputs(), strict=True))
+        inputs = dict(zip(self.input_names, self._build_onnx_inputs()))
         self._export_one(
             _TargetActorOnnxModel(model).eval(),
             inputs,
