@@ -33,8 +33,8 @@ class FluxTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
         # Overwrite parent class tokenizer
-        tokenizer: FluxTokenizerContainer.Config = (  # pyrefly: ignore [bad-override]
-            field(default_factory=FluxTokenizerContainer.Config)
+        tokenizer: FluxTokenizerContainer.Config = field(  # pyrefly: ignore [bad-override]
+            default_factory=FluxTokenizerContainer.Config
         )
         encoder: FluxEncoderConfig = field(default_factory=FluxEncoderConfig)
         """Configuration for Flux encoders (T5 text encoder, CLIP text encoder, and autoencoder)."""
@@ -54,16 +54,6 @@ class FluxTrainer(Trainer):
         config.training.seq_len = seq_len_img + seq_len_txt
 
         super().__init__(config)
-
-        # Set random seed, and maybe enable deterministic mode
-        # (mainly for debugging, expect perf loss).
-        # For Flux model, we need distinct seed across FSDP ranks to ensure we randomly dropout prompts info in dataloader
-        dist_utils.set_determinism(
-            self.parallel_dims,
-            self.device,
-            config.debug,
-            distinct_seed_mesh_dims=["fsdp", "dp_replicate"],
-        )
 
         # NOTE: self._dtype is the data type used for encoders (image encoder, T5 text encoder, CLIP text encoder).
         # We cast the encoders and it's input/output to this dtype.  If FSDP with mixed precision training is not used,
@@ -148,9 +138,7 @@ class FluxTrainer(Trainer):
             bsz = labels.shape[0]
             ntokens_batch = bsz * self.config.training.seq_len
             self.metrics_processor.ntokens_since_last_log += ntokens_batch
-            self.metrics_processor.data_loading_times.append(
-                time.perf_counter() - data_load_start
-            )
+            self.metrics_processor.data_loading_times.append(time.perf_counter() - data_load_start)
             yield input_dict, labels
 
     def forward_backward_step(
@@ -174,9 +162,7 @@ class FluxTrainer(Trainer):
             torch.Tensor: The computed loss value for this training step
         """
 
-        assert (
-            global_valid_tokens is None
-        ), "FLUX model don't need to rescale loss by number of global valid tokens"
+        assert global_valid_tokens is None, "FLUX model don't need to rescale loss by number of global valid tokens"
 
         # generate t5 and clip embeddings
         input_dict["image"] = labels
@@ -191,9 +177,7 @@ class FluxTrainer(Trainer):
         labels = input_dict["img_encodings"]
 
         # rewrite the global_valid_tokens because the `labels` are reset after image encoder.
-        local_valid_tokens = torch.tensor(
-            labels.numel(), dtype=torch.float32, device=self.device
-        )
+        local_valid_tokens = torch.tensor(labels.numel(), dtype=torch.float32, device=self.device)
 
         if self.parallel_dims.dp_enabled:
             batch_mesh = self.parallel_dims.get_mesh("batch")
@@ -223,9 +207,7 @@ class FluxTrainer(Trainer):
         POSITION_DIM = 3  # constant for Flux flow model
         with torch.no_grad(), torch.device(self.device):
             # Create positional encodings
-            latent_pos_enc = create_position_encoding_for_latents(
-                bsz, latent_height, latent_width, POSITION_DIM
-            )
+            latent_pos_enc = create_position_encoding_for_latents(bsz, latent_height, latent_width, POSITION_DIM)
             text_pos_enc = torch.zeros(bsz, t5_encodings.shape[1], POSITION_DIM)
 
             # Patchify: Convert latent into a sequence of patches
@@ -236,13 +218,7 @@ class FluxTrainer(Trainer):
         if self.parallel_dims.cp_enabled:
             from torchtitan.distributed.context_parallel import cp_shard
 
-            (
-                latents,
-                latent_pos_enc,
-                t5_encodings,
-                text_pos_enc,
-                target,
-            ), _ = cp_shard(
+            (latents, latent_pos_enc, t5_encodings, text_pos_enc, target,), _ = cp_shard(
                 self.parallel_dims.get_mesh("cp"),
                 (latents, latent_pos_enc, t5_encodings, text_pos_enc, target),
                 None,  # No attention masks for Flux
@@ -273,9 +249,7 @@ class FluxTrainer(Trainer):
 
         return loss
 
-    def train_step(
-        self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
-    ):
+    def train_step(self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]):
         self.optimizers.zero_grad()
         # Save the current step learning rate for logging
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
@@ -316,9 +290,7 @@ class FluxTrainer(Trainer):
                 dist_utils.dist_sum(loss, loss_mesh),
                 dist_utils.dist_max(loss, loss_mesh),
                 dist_utils.dist_sum(
-                    torch.tensor(
-                        self.ntokens_seen, dtype=torch.int64, device=self.device
-                    ),
+                    torch.tensor(self.ntokens_seen, dtype=torch.int64, device=self.device),
                     loss_mesh,
                 ),
             )

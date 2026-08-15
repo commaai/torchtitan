@@ -61,12 +61,8 @@ def check_dtensor_placements_match(
         return dim + ndim if dim < 0 else dim
 
     for actual_placement, expected_placement in zip(actual, expected, strict=True):
-        if isinstance(actual_placement, Shard) and isinstance(
-            expected_placement, Shard
-        ):
-            if normalize_dim(actual_placement.dim, tensor_ndim) != normalize_dim(
-                expected_placement.dim, tensor_ndim
-            ):
+        if isinstance(actual_placement, Shard) and isinstance(expected_placement, Shard):
+            if normalize_dim(actual_placement.dim, tensor_ndim) != normalize_dim(expected_placement.dim, tensor_ndim):
                 return False
             continue
 
@@ -126,9 +122,7 @@ def dist_max(
     mesh: DeviceMesh | None = None,
     extra_pg: dist.ProcessGroup | None = None,
 ) -> float:
-    return _dist_reduce(
-        x, reduceOp=c10d.ReduceOp.MAX.name, mesh=mesh, extra_pg=extra_pg
-    )
+    return _dist_reduce(x, reduceOp=c10d.ReduceOp.MAX.name, mesh=mesh, extra_pg=extra_pg)
 
 
 def dist_sum(
@@ -136,9 +130,7 @@ def dist_sum(
     mesh: DeviceMesh | None = None,
     extra_pg: dist.ProcessGroup | None = None,
 ) -> float:
-    return _dist_reduce(
-        x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
-    )
+    return _dist_reduce(x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg)
 
 
 def dist_mean(
@@ -146,9 +138,51 @@ def dist_mean(
     mesh: DeviceMesh | None = None,
     extra_pg: dist.ProcessGroup | None = None,
 ) -> float:
-    return _dist_reduce(
-        x, reduceOp=c10d.ReduceOp.AVG.name, mesh=mesh, extra_pg=extra_pg
-    )
+    return _dist_reduce(x, reduceOp=c10d.ReduceOp.AVG.name, mesh=mesh, extra_pg=extra_pg)
+
+
+def resolve_seed(
+    parallel_dims: ParallelDims,
+    device: torch.device,
+    seed: int | None,
+    distinct_seed_mesh_dims: list[str],
+) -> int | None:
+    """Resolve a seed for this rank without changing any RNG state.
+
+    All ranks start from one base seed. Coordinates along
+    ``distinct_seed_mesh_dims`` are then folded into that seed using a
+    mixed-radix offset, while coordinates along all other mesh dimensions
+    continue to share it.
+    """
+    if parallel_dims.world_size == 1:
+        if seed is not None:
+            logger.debug(f"Single-process job using seed: {seed}")
+        return seed
+
+    # To control which ranks share a seed, all ranks agree on a starting seed.
+    # If the user did not provide one, rank 0's main generator supplies it.
+    if seed is None:
+        seed_tensor = torch.get_rng_state()[:8].to(device)
+        torch.distributed.broadcast(seed_tensor, src=0)
+        seed = int(seed_tensor.to("cpu").view(torch.uint64).item())
+    assert isinstance(seed, int)
+
+    distinct_seed_meshes = [parallel_dims.get_optional_mesh(dim) for dim in distinct_seed_mesh_dims]
+    distinct_seed_meshes = [mesh for mesh in distinct_seed_meshes if mesh is not None]
+
+    if distinct_seed_meshes:
+        seed_offset = 0
+        cumulative_size = 1
+        for distinct_mesh in distinct_seed_meshes:
+            seed_offset += distinct_mesh.get_local_rank() * cumulative_size
+            cumulative_size *= distinct_mesh.size()
+
+        seed = (seed + seed_offset) % 2**64
+        logger.debug(f"Distinct dims {distinct_seed_mesh_dims}, " f"Global rank {c10d.get_rank()} using seed: {seed}")
+    else:
+        logger.debug(f"Global Rank {c10d.get_rank()} using seed: {seed}")
+
+    return seed
 
 
 def set_determinism(
@@ -158,26 +192,21 @@ def set_determinism(
     distinct_seed_mesh_dims: list[str],
 ) -> None:
     """
-    Set the same DTensor manual seed for all dimensions in world mesh, but only different seeds
-    across dimensions denoted by `distinct_seed_mesh_dims`. An example use case is pipeline parallelism,
-    where we want to have the same seed across SPMD groups, but different seeds across PP groups.
-
-    Currently, does not set seeds for the CUDA RNG since TorchTitan always uses DTensor for SPMD parallelisms,
-    and DTensor manages its own RNG tracker, but we could extend to support both if needed.
+    Set the same seed for all dimensions in the world mesh, except dimensions
+    denoted by ``distinct_seed_mesh_dims``. An example use case is pipeline
+    parallelism, where SPMD groups share a seed while PP stages differ.
 
     Set Determinism flags for increased reproducibility with loss of performance.
 
     Args:
-        world_mesh: Device mesh for distributed training
+        parallel_dims: Parallel dimensions and meshes for distributed training.
         device: Device to use
         debug_config: Debug config to use
         distinct_seed_mesh_dims: List of mesh dimension names to have distinct seeds across.
     """
     if debug_config.deterministic:
         logger.info("Deterministic algorithm enabled (expect perf degradation).")
-        torch.use_deterministic_algorithms(
-            True, warn_only=debug_config.deterministic_warn_only
-        )
+        torch.use_deterministic_algorithms(True, warn_only=debug_config.deterministic_warn_only)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         # use_deterministic_algorithms(True) enables fill_uninitialized_memory,
@@ -201,75 +230,30 @@ def set_determinism(
         FlexAttention.inductor_configs["max_autotune"] = False
         FlexAttention.inductor_configs["coordinate_descent_tuning"] = False
         # pyrefly: ignore [no-matching-overload]
-        FlexAttention._compiled_flex_attn = torch.compile(
-            flex_attention, options=FlexAttention.inductor_configs
-        )
+        FlexAttention._compiled_flex_attn = torch.compile(flex_attention, options=FlexAttention.inductor_configs)
 
     if debug_config.detect_anomaly:
-        logger.warning(
-            "Anomaly detection enabled. This incurs significant overhead "
-            "and is for debugging only."
-        )
+        logger.warning("Anomaly detection enabled. This incurs significant overhead " "and is for debugging only.")
         # check_nan=False disables the NaN/Inf gradient check that internally calls
         # aten._is_any_true, which has no DTensor sharding strategy and would crash.
         # Stack trace recording (the useful part) is still enabled.
         torch.autograd.set_detect_anomaly(True, check_nan=False)
 
-    seed = debug_config.seed
-    if parallel_dims.world_size == 1:
-        if seed is not None:
-            torch.manual_seed(seed)
-            os.environ["PYTHONHASHSEED"] = str(seed % 2**32)
-            logger.debug(f"Single-process job using seed: {seed}")
+    seed = resolve_seed(
+        parallel_dims,
+        device,
+        debug_config.seed,
+        distinct_seed_mesh_dims,
+    )
+    if seed is None:
         return
 
-    # to ensure we can control which ranks have same or different seeds, all ranks agree on a starting seed.
-    # if user provides one, we use this. Otherwise rank 0 rolls the dice and everyone else uses that.
-    if seed is None:
-        # Extract the seed for torch's main generator on rank 0 and standardizes on using that to build
-        # seeds for unique SPMD groups
-        seed_tensor = torch.get_rng_state()[:8].to(device)
-        torch.distributed.broadcast(seed_tensor, src=0)
-        seed = seed_tensor.to("cpu").view(torch.uint64).item()
-    assert isinstance(seed, int)
-
-    # Set distinct seed for each rank in mesh dimensions, with dimension names provided by `distinct_seed_mesh_dims`
-    # For PP + SPMD cases, we want to separate the world into the SPMD mesh and the PP mesh,
-    # and choose a unique seed for each rank on the PP mesh.
-    # We support multiple distinct dimensions by adding each distinct dimension's local rank to the seed.
-    distinct_seed_meshes = [
-        parallel_dims.get_optional_mesh(dim) for dim in distinct_seed_mesh_dims
-    ]
-    distinct_seed_meshes = [mesh for mesh in distinct_seed_meshes if mesh is not None]
-    assert all(mesh is not None for mesh in distinct_seed_meshes)
-
-    if distinct_seed_meshes:
-        # Each dimension contributes: local_rank * (product of all previous dimension sizes)
-        # This guarantees uniqueness like multi-dimensional array indexing
-        seed_offset = 0
-        cumulative_size = 1
-
-        for distinct_mesh in distinct_seed_meshes:
-            local_rank = distinct_mesh.get_local_rank()
-            # Add contribution from this dimension
-            seed_offset += local_rank * cumulative_size
-            # Update cumulative size for next dimension
-            cumulative_size *= distinct_mesh.size()
-
-        seed += seed_offset
-        seed %= 2**64
-
-        logger.debug(
-            f"Distinct dims {distinct_seed_mesh_dims}, Global rank {c10d.get_rank()} using seed: {seed}"
-        )
-
-    else:
-        logger.debug(f"Global Rank {c10d.get_rank()} using seed: {seed}")
-
-    # The native RNGs and python RNG may not be important, except for the 1-D PP case, but we seed them for consistency.
+    # torch.manual_seed covers the native generator on every device.
     torch.manual_seed(seed)
     # PYTHONHASHSEED can be a decimal number in the range [0, 2**32 - 1]
     os.environ["PYTHONHASHSEED"] = str(seed % 2**32)
+    if parallel_dims.world_size == 1:
+        return
 
     # As long as we are not in the 1-D (PP-only) case, we will have a seed to use for
     # all ranks of the SPMD mesh. If PP is also used, this seed is unique per PP rank.
@@ -279,6 +263,27 @@ def set_determinism(
         # We just need to pass the world_mesh as the device_id is the only information
         # this API uses.
         torch.distributed.tensor._random.manual_seed(seed, parallel_dims.world_mesh)
+
+
+def set_runtime_seed(
+    parallel_dims: ParallelDims,
+    device: torch.device,
+    seed: int | None,
+    distinct_seed_mesh_dims: list[str],
+) -> None:
+    """Seed native runtime RNG without initializing the DTensor RNG tracker.
+
+    The native generator also backs current DTensor randomness, so callers must
+    restrict this helper to runtime paths that operate on local tensors.
+    """
+    seed = resolve_seed(
+        parallel_dims,
+        device,
+        seed,
+        distinct_seed_mesh_dims,
+    )
+    if seed is not None:
+        torch.manual_seed(seed)
 
 
 _batch_invariant_enabled: bool = False
@@ -318,31 +323,15 @@ def set_batch_invariance(enable: bool) -> None:
     # Must be set BEFORE dist.init_process_group.
     # Reference: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/batch_invariant.py
     os.environ["NCCL_LAUNCH_MODE"] = "GROUP"  # Fixed kernel launch ordering
-    os.environ[
-        "NCCL_COLLNET_ENABLE"
-    ] = "0"  # Disable SHARP (non-deterministic IB HW reduce)
-    os.environ[
-        "NCCL_NVLS_ENABLE"
-    ] = "0"  # Disable NVLink SHARP (non-deterministic NVSwitch HW reduce)
-    os.environ[
-        "NCCL_P2P_NET_DISABLE"
-    ] = "1"  # Disable P2P to avoid transport-dependent accumulation order
-    os.environ[
-        "NCCL_MIN_NCHANNELS"
-    ] = "1"  # Single channel to prevent split-interleave reordering
-    os.environ[
-        "NCCL_MAX_NCHANNELS"
-    ] = "1"  # Single channel to prevent split-interleave reordering
+    os.environ["NCCL_COLLNET_ENABLE"] = "0"  # Disable SHARP (non-deterministic IB HW reduce)
+    os.environ["NCCL_NVLS_ENABLE"] = "0"  # Disable NVLink SHARP (non-deterministic NVSwitch HW reduce)
+    os.environ["NCCL_P2P_NET_DISABLE"] = "1"  # Disable P2P to avoid transport-dependent accumulation order
+    os.environ["NCCL_MIN_NCHANNELS"] = "1"  # Single channel to prevent split-interleave reordering
+    os.environ["NCCL_MAX_NCHANNELS"] = "1"  # Single channel to prevent split-interleave reordering
     os.environ["NCCL_PROTO"] = "Simple"  # LL/LL128 protocols may reorder reductions
-    os.environ[
-        "NCCL_ALGO"
-    ] = "allreduce:tree"  # Deterministic reduction order across ranks
-    os.environ[
-        "NCCL_NTHREADS"
-    ] = "1"  # Single thread to eliminate scheduling non-determinism
-    os.environ[
-        "NCCL_SOCKET_NTHREADS"
-    ] = "1"  # Single socket thread to eliminate scheduling non-determinism
+    os.environ["NCCL_ALGO"] = "allreduce:tree"  # Deterministic reduction order across ranks
+    os.environ["NCCL_NTHREADS"] = "1"  # Single thread to eliminate scheduling non-determinism
+    os.environ["NCCL_SOCKET_NTHREADS"] = "1"  # Single socket thread to eliminate scheduling non-determinism
 
     # Disable reduced-precision reductions: these allow cuBLAS to use
     # lower-precision accumulation that can round differently depending
@@ -382,11 +371,7 @@ def get_train_context(
                     parallel_dims.build_mesh()
                 from torchtitan.distributed.spmd_types import set_current_spmd_mesh
 
-                stack.enter_context(
-                    set_current_spmd_mesh(
-                        parallel_dims._global_meshes["spmd_dense_for_fwdbwd"]
-                    )
-                )
+                stack.enter_context(set_current_spmd_mesh(parallel_dims._global_meshes["spmd_dense_for_fwdbwd"]))
             if spmd_typechecking:
                 stack.enter_context(spmd_typecheck(local=False))
 
@@ -436,23 +421,17 @@ def init_distributed(
     if comm_config.mode in ("fake_backend", "local_tensor"):
         ngpu_str = os.environ.get("NGPU")
         if ngpu_str is None:
-            raise ValueError(
-                f"NGPU environment variable must be set when using comm_mode={comm_config.mode}"
-            )
+            raise ValueError(f"NGPU environment variable must be set when using comm_mode={comm_config.mode}")
         try:
             world_size = int(ngpu_str)
         except ValueError as e:
-            raise ValueError(
-                f"NGPU environment variable must be a valid integer, got: {ngpu_str}"
-            ) from e
+            raise ValueError(f"NGPU environment variable must be a valid integer, got: {ngpu_str}") from e
         init_fake_mode(world_size, comm_config.mode)
         return world_size
 
     def _warn_overwrite_env(env, val):
         if env in os.environ:
-            logger.warning(
-                f"ENV[{env}] = {os.environ[env]} will be overridden to {val} based on job config"
-            )
+            logger.warning(f"ENV[{env}] = {os.environ[env]} will be overridden to {val} based on job config")
         os.environ[env] = val
 
     if "GLOO_SOCKET_IFNAME" not in os.environ:
@@ -475,9 +454,7 @@ def init_distributed(
     def _get_distributed_backend(enable_cpu_backend):
         backend = "nccl"
         if device_type in torch.distributed.Backend.default_device_backend_map:
-            backend = torch.distributed.Backend.default_device_backend_map.get(
-                device_type
-            )
+            backend = torch.distributed.Backend.default_device_backend_map.get(device_type)
         if enable_cpu_backend:
             backend = f"{device_type}:{backend},cpu:gloo"
         return backend
@@ -515,9 +492,7 @@ def init_distributed(
             # pyrefly: ignore[missing-import]
             import torchcomms  # noqa: F401
         except ImportError as err:
-            raise ImportError(
-                "torchcomms package is required for --comm.mode=torchcomms."
-            ) from err
+            raise ImportError("torchcomms package is required for --comm.mode=torchcomms.") from err
         import torch.distributed.config as dist_config
 
         dist_config.use_torchcomms = True
@@ -545,9 +520,7 @@ def set_pg_timeouts(
     yet due to slow operations permitted under the old timeout value, but other faster ranks may
     start issuing collectives under the new shorter timeout and then immediately timeout.
     """
-    logger.info(
-        f"Synchronizing and adjusting timeout for all ProcessGroups to {timeout}"
-    )
+    logger.info(f"Synchronizing and adjusting timeout for all ProcessGroups to {timeout}")
     # Ensure that all the ranks have reached the point of setting the new timeout-
     # otherwise, some ranks may issue collectives with the new/shorter timeout and
     # those may time out, before other ranks have finished with initialization done
@@ -557,8 +530,7 @@ def set_pg_timeouts(
 
     # None represents the 'default' PG, not part of the mesh
     groups: list[torch.distributed.ProcessGroup | None] = [
-        mesh.get_group()
-        for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
+        mesh.get_group() for mesh in parallel_dims.get_all_one_dimensional_meshes().values()
     ] + [None]
     for group in groups:
         torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
@@ -618,9 +590,7 @@ def clip_grad_norm_(
         # prevent generators from being exhausted
         parameters = list(parameters)
     grads = [p.grad for p in parameters if p.grad is not None]
-    total_norm = torch.nn.utils.get_total_norm(
-        grads, norm_type, error_if_nonfinite, foreach
-    )
+    total_norm = torch.nn.utils.get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
 
     # If total_norm is a DTensor, the placements must be `torch.distributed._tensor.ops.math_ops._NormPartial`.
     # We can simply reduce the DTensor to get the total norm in this tensor's process group
@@ -677,16 +647,12 @@ def _clip_grad_norm_with_ep(
     # - In autoparallel, all params may live on a single sparse mesh with "ep" dimension,
     #   so non_ep_grads would be empty
     # - In PP + EP setups, certain PP ranks may only own EP or non-EP layers
-    ep_grads_total_norm = torch.nn.utils.get_total_norm(
-        ep_grads, norm_type, error_if_nonfinite, foreach
-    )
+    ep_grads_total_norm = torch.nn.utils.get_total_norm(ep_grads, norm_type, error_if_nonfinite, foreach)
     # get_total_norm returns tensor(0.) for empty list, which is a non-DTensor
     if isinstance(ep_grads_total_norm, DTensor):
         ep_grads_total_norm = ep_grads_total_norm.full_tensor()
 
-    non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
-        non_ep_grads, norm_type, error_if_nonfinite, foreach
-    )
+    non_ep_grads_total_norm = torch.nn.utils.get_total_norm(non_ep_grads, norm_type, error_if_nonfinite, foreach)
     # get_total_norm returns tensor(0.) for empty list, which is a non-DTensor
     if isinstance(non_ep_grads_total_norm, DTensor):
         non_ep_grads_total_norm = non_ep_grads_total_norm.full_tensor()
@@ -694,9 +660,7 @@ def _clip_grad_norm_with_ep(
     if math.isinf(norm_type):
         total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
     else:
-        total_norm = (
-            ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
-        )
+        total_norm = ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
         total_norm **= 1.0 / norm_type
 
     if pp_mesh is not None:
