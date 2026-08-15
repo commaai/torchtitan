@@ -348,6 +348,7 @@ class RLDrivingTrainer(Trainer):
                     for state in optimizer.state.values():
                         state["step"].zero_()
             self.checkpointer.save(0)
+        self.set_runtime_seed()
         loaded_step = self.step
         logger.info(f"Training starts at step {self.step + 1}")
 

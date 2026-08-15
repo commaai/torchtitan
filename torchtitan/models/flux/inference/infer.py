@@ -36,6 +36,7 @@ def inference(config: FluxTrainer.Config):
     prompts = original_prompts[global_rank::world_size]
 
     trainer.checkpointer.load(step=config.checkpoint.load_step)
+    trainer.set_runtime_seed()
 
     # Build tokenizers from the config
     tokenizer = config.tokenizer.build()

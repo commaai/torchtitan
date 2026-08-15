@@ -16,22 +16,18 @@ from dataclasses import dataclass, field
 from typing import Any, cast, Literal
 from urllib.parse import urlparse
 
-from fsspec.core import split_protocol
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 
+from fsspec.core import split_protocol
+
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
-from torch.distributed.checkpoint._consolidate_hf_safetensors import (
-    consolidate_safetensors_files_on_every_rank,
-)
+from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files_on_every_rank
 from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader, FsspecWriter
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
-from torch.distributed.checkpoint.state_dict_saver import (
-    AsyncCheckpointerType,
-    AsyncSaveResponse,
-)
+from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.checkpoint.storage import StorageWriter
 from torch.distributed.tensor import DTensor
@@ -51,6 +47,7 @@ OPTIMIZER = "optimizer"
 LR_SCHEDULER = "lr_scheduler"
 DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
+CHECKPOINT_UPLOAD_TIMEOUT_SECONDS = 600.0
 
 
 class AsyncMode(str, enum.Enum):
@@ -115,11 +112,7 @@ class ModelWrapper(Stateful):
         # parameters, then merge into the cache without changing storage objects.
         for key, value in self._get_state_dict().items():
             cached = self.cached_state_dict.get(key)
-            if (
-                cached is None
-                or cached.shape != value.shape
-                or cached.dtype != value.dtype
-            ):
+            if cached is None or cached.shape != value.shape or cached.dtype != value.dtype:
                 self.cached_state_dict[key] = value
             elif not _shares_storage(cached, value):
                 cached.copy_(value)
@@ -405,23 +398,14 @@ class CheckpointManager(Configurable):
             if self.initial_load_path:
                 self.initial_load_path = self.initial_load_path.strip()
                 parsed_initial_load_path = urlparse(self.initial_load_path)
-                if not (
-                    self.initial_load_path.startswith("/")
-                    or parsed_initial_load_path.scheme
-                ):
+                if not (self.initial_load_path.startswith("/") or parsed_initial_load_path.scheme):
                     raise ValueError(
-                        "initial_load_path must be absolute or a valid fsspec URL: "
-                        f"{self.initial_load_path}"
+                        "initial_load_path must be absolute or a valid fsspec URL: " f"{self.initial_load_path}"
                     )
             if self.initial_load_in_hf and not self.initial_load_model_only:
                 raise ValueError("initial_load_in_hf requires initial_load_model_only.")
-            if self.initial_load_in_hf_quantized and not (
-                self.initial_load_in_hf and self.initial_load_path
-            ):
-                raise ValueError(
-                    "initial_load_in_hf_quantized requires initial_load_in_hf "
-                    "and initial_load_path."
-                )
+            if self.initial_load_in_hf_quantized and not (self.initial_load_in_hf and self.initial_load_path):
+                raise ValueError("initial_load_in_hf_quantized requires initial_load_in_hf " "and initial_load_path.")
             if self.last_save_in_hf and not self.last_save_model_only:
                 raise ValueError("last_save_in_hf requires last_save_model_only=True.")
 
@@ -432,15 +416,9 @@ class CheckpointManager(Configurable):
                 raise ValueError(f"Invalid async_mode: {async_lowered}")
 
             if self.load_only and self.enable_first_step_checkpoint:
-                logger.warning(
-                    "checkpoint.load_only is True; enable_first_step_checkpoint "
-                    "will be ignored."
-                )
+                logger.warning("checkpoint.load_only is True; enable_first_step_checkpoint " "will be ignored.")
             if self.initial_load_model_only and not self.initial_load_path:
-                logger.warning(
-                    "initial_load_model_only=True has no effect without "
-                    "an initial_load_path."
-                )
+                logger.warning("initial_load_model_only=True has no effect without " "an initial_load_path.")
 
     def __init__(
         self,
@@ -460,9 +438,7 @@ class CheckpointManager(Configurable):
             return
 
         self.folder = (
-            config.folder
-            if split_protocol(config.folder)[0] is not None
-            else fs.join_path(base_folder, config.folder)
+            config.folder if split_protocol(config.folder)[0] is not None else fs.join_path(base_folder, config.folder)
         )
         self.checkpoint_id_format = config.checkpoint_id_format
         self.interval = config.interval
@@ -493,17 +469,13 @@ class CheckpointManager(Configurable):
 
         self.sd_adapter = sd_adapter
         if self.last_save_in_hf and self.sd_adapter is None:
-            raise ValueError(
-                "checkpoint.last_save_in_hf is True, but sd_adapter is not provided."
-            )
+            raise ValueError("checkpoint.last_save_in_hf is True, but sd_adapter is not provided.")
 
         # Async & Distributed Infrastructure
         try:
             self.async_mode = AsyncMode(config.async_mode)
         except ValueError as e:
-            raise ValueError(
-                f"Unknown checkpoint async_mode {config.async_mode}"
-            ) from e
+            raise ValueError(f"Unknown checkpoint async_mode {config.async_mode}") from e
 
         self.pg: dist.ProcessGroup | None = None
         if self.async_mode in (AsyncMode.ASYNC, AsyncMode.ASYNC_WITH_PINNED_MEM):
@@ -518,26 +490,17 @@ class CheckpointManager(Configurable):
         self.purge_thread: threading.Thread | None = None
         if self.keep_latest_k > 0:
             self.purge_queue = queue.Queue()
-            self.purge_thread = threading.Thread(
-                target=purge_thread, args=(self.purge_queue,), daemon=True
-            )
+            self.purge_thread = threading.Thread(target=purge_thread, args=(self.purge_queue,), daemon=True)
             self.purge_thread.start()
 
-        logger.info(
-            "Checkpointing active. Checkpoints will be loaded from and saved "
-            f"to {self.folder}"
-        )
+        logger.info("Checkpointing active. Checkpoints will be loaded from and saved " f"to {self.folder}")
 
     def __del__(self):
         self.close()
 
     def close(self):
         if hasattr(self, "enable") and self.enable:
-            if (
-                hasattr(self, "purge_thread")
-                and self.purge_thread
-                and self.purge_thread.is_alive()
-            ):
+            if hasattr(self, "purge_thread") and self.purge_thread and self.purge_thread.is_alive():
                 self.purge_queue.put(Terminate())
                 self.purge_thread.join()
 
@@ -587,11 +550,7 @@ class CheckpointManager(Configurable):
             fqn_to_index_mapping = self.sd_adapter.fqn_to_index_mapping
 
             # If sharded, we save to a subdir then consolidate
-            save_path = (
-                fs.join_path(checkpoint_id, "sharded")
-                if fqn_to_index_mapping
-                else checkpoint_id
-            )
+            save_path = fs.join_path(checkpoint_id, "sharded") if fqn_to_index_mapping else checkpoint_id
             storage_writer = HuggingFaceStorageWriter(
                 path=save_path,
                 save_distributed=True,
@@ -606,12 +565,10 @@ class CheckpointManager(Configurable):
             # `consolidate_safetensors_files_on_every_rank` is used later to manage
             # the multi-file merging process.
         else:
-            storage_writer = FsspecWriter(checkpoint_id)
+            storage_writer = FsspecWriter(checkpoint_id, timeout=CHECKPOINT_UPLOAD_TIMEOUT_SECONDS)
 
         # Execution Dispatch
-        checkpoint_save_id = (
-            None if to_hf else checkpoint_id
-        )  # for HF the storage_writer handles the path
+        checkpoint_save_id = None if to_hf else checkpoint_id  # for HF the storage_writer handles the path
 
         if async_mode == AsyncMode.ASYNC:
             ret = dcp.async_save(
@@ -678,14 +635,11 @@ class CheckpointManager(Configurable):
 
         if from_hf:
             assert self.sd_adapter is not None, (
-                "trying to load checkpoint in HF safetensors format, "
-                "but sd_adapter is not provided."
+                "trying to load checkpoint in HF safetensors format, " "but sd_adapter is not provided."
             )
 
             hf_state_dict = self.sd_adapter.to_hf(state_dict)
-            hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
-                checkpoint_id, from_quantized
-            )
+            hf_storage_reader = self.sd_adapter.get_hf_storage_reader(checkpoint_id, from_quantized)
 
             dcp.load(hf_state_dict, storage_reader=hf_storage_reader)
 
@@ -696,9 +650,7 @@ class CheckpointManager(Configurable):
                 state_dict,
                 storage_reader=FsspecReader(checkpoint_id),
                 checkpoint_id=checkpoint_id,
-                planner=dcp.DefaultLoadPlanner(
-                    allow_partial_load=self.allow_partial_initial_load
-                ),
+                planner=dcp.DefaultLoadPlanner(allow_partial_load=self.allow_partial_initial_load),
             )
 
             # TODO: Since we flatten the model states in state_dict, we need to
@@ -735,16 +687,12 @@ class CheckpointManager(Configurable):
         self.maybe_wait_for_saving()
 
         begin = time.monotonic()
-        checkpoint_phase = (
-            "saving" if self.async_mode == AsyncMode.DISABLED else "staging"
-        )
+        checkpoint_phase = "saving" if self.async_mode == AsyncMode.DISABLED else "staging"
         logger.info(f"{checkpoint_phase.capitalize()} the checkpoint.")
 
         if last_step:
             self._save_last_step(curr_step)
-            logger.info(
-                f"Last step checkpoint completed in {time.monotonic() - begin:.2f}s"
-            )
+            logger.info(f"Last step checkpoint completed in {time.monotonic() - begin:.2f}s")
             return True
 
         checkpoint_id = self._create_checkpoint_id(curr_step)
@@ -795,10 +743,7 @@ class CheckpointManager(Configurable):
 
         self._purge_stale_checkpoints()
 
-        logger.info(
-            f"Finished {checkpoint_phase} the checkpoint in "
-            f"{time.monotonic() - begin:.2f} seconds."
-        )
+        logger.info(f"Finished {checkpoint_phase} the checkpoint in " f"{time.monotonic() - begin:.2f} seconds.")
         return True
 
     @sl.log_trace_span("checkpoint_load")
@@ -834,29 +779,20 @@ class CheckpointManager(Configurable):
             from_quantized = self.initial_load_in_hf_quantized
 
             if from_hf:
-                assert model_only, (
-                    "Only model can be loaded when loading from "
-                    "HF's safetensors checkpoint."
-                )
+                assert model_only, "Only model can be loaded when loading from " "HF's safetensors checkpoint."
             if from_quantized:
                 assert from_hf, "Quantized checkpoint can only be loaded from HF format"
 
             if self.initial_load_path:
                 checkpoint_id = self.initial_load_path
                 if not self._checkpoint_exists(checkpoint_id, from_hf=from_hf):
-                    raise ValueError(
-                        f"Checkpoint.initial_load_path is invalid: {checkpoint_id}"
-                    )
+                    raise ValueError(f"Checkpoint.initial_load_path is invalid: {checkpoint_id}")
                 if from_hf:
-                    logger.info(
-                        "Loading from HF safetensors from "
-                        f"--checkpoint.initial_load_path: {checkpoint_id}"
-                    )
+                    logger.info("Loading from HF safetensors from " f"--checkpoint.initial_load_path: {checkpoint_id}")
 
             elif from_hf:
                 assert (
-                    self.sd_adapter is not None
-                    and self.sd_adapter.hf_assets_path is not None
+                    self.sd_adapter is not None and self.sd_adapter.hf_assets_path is not None
                 ), "from_hf is True but sd_adapter or hf_assets_path is not provided."
                 checkpoint_id = self.sd_adapter.hf_assets_path
                 if not fs.isdir(checkpoint_id):
@@ -865,10 +801,7 @@ class CheckpointManager(Configurable):
                         "but the path is not valid. Either make sure hf_assets_path is "
                         "correct or provide a valid checkpoint.initial_load_path"
                     )
-                logger.info(
-                    "Loading HF safetensors from "
-                    f"--model.hf_assets_path: {checkpoint_id}"
-                )
+                logger.info("Loading HF safetensors from " f"--model.hf_assets_path: {checkpoint_id}")
 
             else:
                 return False
@@ -894,9 +827,7 @@ class CheckpointManager(Configurable):
             checkpoint_id = self._create_checkpoint_id(step)
 
             if not self._checkpoint_exists(checkpoint_id, from_hf=False):
-                raise FileNotFoundError(
-                    f"--checkpoint.load_step={step} not found at {checkpoint_id}"
-                )
+                raise FileNotFoundError(f"--checkpoint.load_step={step} not found at {checkpoint_id}")
 
         logger.info(f"Loading the checkpoint from {checkpoint_id}.")
         begin = time.monotonic()
@@ -910,10 +841,7 @@ class CheckpointManager(Configurable):
         )
 
         GarbageCollection.collect("GC collection for checkpoint loading.")
-        logger.info(
-            "Finished loading the checkpoint in "
-            f"{time.monotonic() - begin:.2f} seconds."
-        )
+        logger.info("Finished loading the checkpoint in " f"{time.monotonic() - begin:.2f} seconds.")
 
         return True
 
@@ -938,10 +866,7 @@ class CheckpointManager(Configurable):
             return
 
         if self.async_mode != AsyncMode.ASYNC_WITH_PINNED_MEM:
-            raise RuntimeError(
-                "self.staging_future is not None, "
-                "but self.async_mode isn't ASYNC_WITH_PINNED_MEM."
-            )
+            raise RuntimeError("self.staging_future is not None, " "but self.async_mode isn't ASYNC_WITH_PINNED_MEM.")
 
         self.staging_future.result()
         self.staging_future = None
@@ -962,9 +887,7 @@ class CheckpointManager(Configurable):
             return
 
         if self.async_mode == AsyncMode.DISABLED:
-            raise RuntimeError(
-                "self.save_future is not None, but self.async_mode is DISABLED."
-            )
+            raise RuntimeError("self.save_future is not None, but self.async_mode is DISABLED.")
 
         self.save_future.result()
         self.save_future = None
@@ -1004,13 +927,10 @@ class CheckpointManager(Configurable):
     def _checkpoint_exists(self, checkpoint_id: str, from_hf: bool) -> bool:
         metadata_names = ["model.safetensors.index.json"] if from_hf else [".metadata"]
         return fs.exists(checkpoint_id) or any(
-            fs.exists(fs.join_path(checkpoint_id, metadata_name))
-            for metadata_name in metadata_names
+            fs.exists(fs.join_path(checkpoint_id, metadata_name)) for metadata_name in metadata_names
         )
 
-    def _list_checkpoint_steps(
-        self, folder: str, *, require_metadata: bool
-    ) -> list[int]:
+    def _list_checkpoint_steps(self, folder: str, *, require_metadata: bool) -> list[int]:
         steps = []
         step_re = re.compile(rf"{re.escape(self.checkpoint_id_format)}(\d+)")
         for path in fs.ls(folder):
@@ -1034,9 +954,7 @@ class CheckpointManager(Configurable):
             for step in self._list_checkpoint_steps(folder, require_metadata=False)
         ]
 
-    def _flattened_model_states_sd(
-        self, state_dict: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    def _flattened_model_states_sd(self, state_dict: dict[str, Any] | None = None) -> dict[str, Any]:
         """Extract and flatten model parameters into a single state dictionary.
 
         This method merges the internal state of the model object into the top-level
@@ -1081,9 +999,7 @@ class CheckpointManager(Configurable):
             if exclude_key not in self.states:
                 raise ValueError(f"{exclude_key} not found in state_dict.")
 
-        states_to_load = {
-            k: v for k, v in self.states.items() if k not in self.exclude_from_loading
-        }
+        states_to_load = {k: v for k, v in self.states.items() if k not in self.exclude_from_loading}
 
         return self._flattened_model_states_sd(states_to_load)
 
@@ -1105,19 +1021,14 @@ class CheckpointManager(Configurable):
         # with dtype conversion if the current dtype isn't equal to the export dtype.
 
         if self.last_save_in_hf:
-            assert (
-                self.last_save_model_only
-            ), "Only model can be saved when saving in HF safetensors format."
+            assert self.last_save_model_only, "Only model can be saved when saving in HF safetensors format."
 
         if self.last_save_model_only:
             states = self.states[MODEL].state_dict()
 
             if self.export_dtype != torch.float32:
                 states = {k: v.to(self.export_dtype) for k, v in states.items()}
-            logger.info(
-                f"Saving a model only checkpoint in {self.export_dtype} "
-                f"at last step, step {curr_step}."
-            )
+            logger.info(f"Saving a model only checkpoint in {self.export_dtype} " f"at last step, step {curr_step}.")
         else:
             logger.info(f"Saving a full checkpoint at last step, step {curr_step}.")
             states = self._flattened_model_states_sd()
@@ -1155,11 +1066,7 @@ class CheckpointManager(Configurable):
         additional guards (like participating_rank) without duplicating
         the purge loop in _purge_stale_checkpoints.
         """
-        return (
-            self.keep_latest_k > 0
-            and dist.get_rank() == 0
-            and self._checkpoint_folder_exists()
-        )
+        return self.keep_latest_k > 0 and dist.get_rank() == 0 and self._checkpoint_folder_exists()
 
     def _purge_stale_checkpoints(self):
         """Remove older checkpoint directories from storage to maintain
