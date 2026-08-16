@@ -50,11 +50,7 @@ class PathDataLoader(BaseDataLoader):
         **kwargs: Any,
     ) -> None:
         del tokenizer, seq_len, snapshot_every_n_steps, kwargs
-        from xx.training.lib.dataloader import DataLoader
-        from xx.training.path.config import DatasetConfig as XXPathDatasetConfig
-        from xx.training.path.dataloader import get_dataset
-
-        from gigashuffle import DataloaderConfig
+        from gigashuffle import DataloaderConfig, MultiprocessShuffledDataloader
 
         self.config = config
         self.local_batch_size = local_batch_size
@@ -68,25 +64,35 @@ class PathDataLoader(BaseDataLoader):
         val_shuffle_size = local_batch_size * validation_steps * self.local_world_size
         shuffle_size = val_shuffle_size if val else config.shuffle_size
 
-        xx_config = XXPathDatasetConfig(
-            bs=local_batch_size,
-            shuffle_size=str(config.shuffle_size),
-            val_shuffle_size=str(val_shuffle_size),
-            min_mixing=config.min_mixing,
-            num_writers=config.num_writers,
-            num_readers=config.num_readers,
-            fps=config.fps,
-            pipeline_dir=config.pipeline_dir,
-            plan_only=config.plan_only,
-            limit=config.limit,
-            deterministic_fidxs=config.deterministic_fidxs,
-            n_frames=config.n_frames,
-            rgb=config.rgb,
-            unvision=config.unvision,
-            skip=config.skip,
-            val_skip=config.val_skip,
-        )
-        dataset = get_dataset(config.dataset, xx_config, val, self.local_rank, dp_rank, dp_world_size)
+        from .comma1m_dataset import COMMA1M_REPO_ID
+
+        if config.dataset == COMMA1M_REPO_ID:
+            from .comma1m_dataset import Comma1MDataset
+
+            dataset = Comma1MDataset(config, val, self.local_rank, dp_rank, dp_world_size)
+        else:
+            from xx.training.path.config import DatasetConfig as XXPathDatasetConfig
+            from xx.training.path.dataloader import get_dataset as get_xx_dataset
+
+            xx_config = XXPathDatasetConfig(
+                bs=local_batch_size,
+                shuffle_size=str(config.shuffle_size),
+                val_shuffle_size=str(val_shuffle_size),
+                min_mixing=config.min_mixing,
+                num_writers=config.num_writers,
+                num_readers=config.num_readers,
+                fps=config.fps,
+                pipeline_dir=config.pipeline_dir,
+                plan_only=config.plan_only,
+                limit=config.limit,
+                deterministic_fidxs=config.deterministic_fidxs,
+                n_frames=config.n_frames,
+                rgb=config.rgb,
+                unvision=config.unvision,
+                skip=config.skip,
+                val_skip=config.val_skip,
+            )
+            dataset = get_xx_dataset(config.dataset, xx_config, val, self.local_rank, dp_rank, dp_world_size)
         self.dataset = dataset
         loader_config = DataloaderConfig(
             bs=local_batch_size,
@@ -101,7 +107,7 @@ class PathDataLoader(BaseDataLoader):
             global_world_size=dp_world_size,
             queue_name=f"{run_id}-{config.split}-node{node_rank}",
         )
-        self.loader = DataLoader(dataset, loader_config)
+        self.loader = MultiprocessShuffledDataloader(dataset, loader_config)
         self._iterator: Any | None = None
 
     def __iter__(

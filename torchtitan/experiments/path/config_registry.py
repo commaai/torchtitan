@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import replace
 from functools import partial
 from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TEST_5K_LIST_TAGGED, DEFAULT_TRAIN_LIST
 from xx.ml_tools.constants.model import (
@@ -31,6 +32,7 @@ from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.models.common import Embedding, LayerNorm, Linear
 from torchtitan.models.common.attention import ScaledDotProductAttention
 from torchtitan.protocols.model_spec import ModelSpec
+from .comma1m_dataset import COMMA1M_REPO_ID
 
 from .dataset import PathDataLoader
 from .loss import PathLoss
@@ -168,6 +170,25 @@ def _path(flavor: str) -> PathTrainer.Config:
         ),
         debug=DebugConfig(seed=0),
     )
+
+
+def _comma1m_path(flavor: str) -> PathTrainer.Config:
+    config = _path(flavor)
+    dataloader = replace(
+        config.dataloader,
+        dataset=COMMA1M_REPO_ID,
+        plan_only=True,
+        limit=None,
+    )
+    validation_dataloader = replace(
+        config.validator.dataloader,
+        dataset=COMMA1M_REPO_ID,
+        plan_only=True,
+        limit=None,
+        deterministic_fidxs=False,
+    )
+    validator = replace(config.validator, dataloader=validation_dataloader, reports={})
+    return replace(config, dataloader=dataloader, validator=validator)
 
 
 def _model_config(flavor: str) -> PathModel.Config:
@@ -406,6 +427,7 @@ def _hydra(heads: tuple[PathHead, ...], *, in_features: int, mlp_mult: float) ->
 
 
 convnext_atto = partial(_path, "convnext_atto")
+convnext_atto_comma1m = partial(_comma1m_path, "convnext_atto")
 convnext_femto = partial(_path, "convnext_femto")
 convnext_pico = partial(_path, "convnext_pico")
 convnext_tiny = partial(_path, "convnext_tiny")
