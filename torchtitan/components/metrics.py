@@ -231,10 +231,6 @@ class ReporterV2Logger(BaseLogger):
             self.reporter.save_metrics()
 
     def write_report(self, data: Any, step: int, name: str, output_type: str) -> None:
-        if output_type == "scalar":
-            self.reporter.buffer_metrics(step=step, epoch=step, metrics={name: data})
-            self.reporter.save_metrics()
-            return
         self.reporter.write_report(data, step=step, name=name, output_type=output_type)
 
     def close(self) -> None:

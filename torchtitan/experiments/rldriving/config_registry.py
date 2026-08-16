@@ -28,6 +28,7 @@ from .loss import RLDrivingLoss
 from .model import ACTION_HEAD_NAME, Critic, parallelize_rldriving, Q_HEAD_NAME, RLDrivingModel, TwinCritic
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
 from .trainer import RLDrivingLRSchedulersConfig, RLDrivingTrainer
+from .validate import RLDrivingValidator
 
 
 _PathTemporalPolicyConfig = _pydantic_dataclass(
@@ -96,6 +97,24 @@ def rldriving() -> RLDrivingTrainer.Config:
     reporterv2_training_id = os.getenv("REPORTERV2_TRAINING_ID")
     actor_optim = {"lr": 4e-5, "betas": (0.9, 0.999), "eps": 1e-8}
     critic_optim = {"lr": 2e-4, "betas": (0.9, 0.999), "eps": 1e-8}
+    frequent_report_steps = [(epoch + 1) * steps_per_epoch for epoch in range(0, num_epochs, num_epochs // 10)]
+    sparse_report_steps = [(epoch + 1) * steps_per_epoch for epoch in range(0, num_epochs, num_epochs // 2)]
+    reports = dict.fromkeys(
+        (
+            "analyse_lat.no_noise",
+            "analyse_lat.realistic_noise",
+            "analyse_long",
+        ),
+        frequent_report_steps,
+    ) | dict.fromkeys(
+        (
+            "analyse_unintended_lead_following",
+            "analyse_speed_convergence",
+            "analyse_platform_oscillation",
+            "analyse_nurec",
+        ),
+        sparse_report_steps,
+    )
     return RLDrivingTrainer.Config(
         loss=RLDrivingLoss.Config(
             action_noise=(0.25, 0.25),
@@ -181,6 +200,13 @@ def rldriving() -> RLDrivingTrainer.Config:
             log_freq=16,
             enable_reporterv2=True,
             save_freq=steps_per_epoch,
+        ),
+        validator=RLDrivingValidator.Config(
+            enable=True,
+            freq=steps_per_epoch,
+            fps=0,
+            reports=reports,
+            miniray={"priority": 3},
         ),
         debug=DebugConfig(seed=0),
     )

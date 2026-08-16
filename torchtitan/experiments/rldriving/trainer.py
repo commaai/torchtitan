@@ -6,13 +6,15 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import cache
-from typing import Annotated, cast, Literal
+from typing import Annotated, Any, cast, Literal
 
+from xx.common.helpers import parse_info
 from xx.ml_tools.constants.model import TEMPORAL_INPUTS
 from xx.training.lib.checkpoint import Checkpoint
 from xx.training.rldriving.dataloader import RolloutContext
@@ -29,6 +31,7 @@ from torchtitan.components.checkpoint_utils import init_optim_state
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.unique_counter import StringUniqueCounter
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger
@@ -38,6 +41,7 @@ from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
 from .model import RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
+from .validate import RLDrivingValidator
 
 
 Batch = tuple[
@@ -137,6 +141,7 @@ class RLDrivingTrainer(Trainer):
         dataloader: RLDrivingDataLoader.Config  # pyrefly: ignore [bad-override]
         checkpoint: RLDrivingOnnxCheckpointManager.Config  # pyrefly: ignore [bad-override]
         lr_scheduler: RLDrivingLRSchedulers.Config  # pyrefly: ignore [bad-override]
+        validator: RLDrivingValidator.Config  # pyrefly: ignore [bad-override]
         warm_start_checkpoint: str
         steps_per_epoch: int
         ema_tau: float
@@ -150,6 +155,7 @@ class RLDrivingTrainer(Trainer):
             self.model_spec = model_registry(model_hparams["temporal_policy"])
             self.fps = int(path_hparams["fps"])
             self.dataloader.fps = self.loss.fps = self.fps
+            self.validator.fps = self.fps
             model_config = cast(RLDrivingModel.Config, self.model_spec.model)
             input_shapes = RLDrivingModel.input_shapes(model_config)
             self.checkpoint.input_names = list(input_shapes)
@@ -159,6 +165,7 @@ class RLDrivingTrainer(Trainer):
             Trainer.Config.__post_init__(self)
             if self.codedir:
                 self.dataloader.codedir = self.codedir
+                self.validator.miniray = {**self.validator.miniray, "codedir": self.codedir}
             if self.steps_per_epoch != self.dataloader.steps_per_epoch:
                 raise ValueError("trainer and dataloader steps_per_epoch must match")
             if self.ema_tau < 1.0:
@@ -168,11 +175,14 @@ class RLDrivingTrainer(Trainer):
     loss_fn: RLDrivingLoss  # pyrefly: ignore [bad-override]
     dataloader: RLDrivingDataLoader  # pyrefly: ignore [bad-override]
     lr_schedulers: RLDrivingLRSchedulers  # pyrefly: ignore [bad-override]
+    validator: RLDrivingValidator  # pyrefly: ignore [bad-override]
 
     def __init__(self, config: Config):
         super().__init__(config)
         if self.gradient_accumulation_steps != 1:
             raise ValueError("rldriving does not support gradient accumulation")
+        training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
+        self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:rldriving:train")
         self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
         dcp.load(
@@ -211,7 +221,11 @@ class RLDrivingTrainer(Trainer):
         steps_per_epoch = self.config.steps_per_epoch
         rollout_epoch = ((self.step - 1) // steps_per_epoch) * steps_per_epoch + 1
         self.dataloader.attach_training_context(RolloutContext(epoch=rollout_epoch))
-        current_inputs, next_inputs, targets, metadata = self.prepare_batch(next(data_iterator))
+        batch = next(data_iterator)
+        info = batch[0].get("info")
+        if info is not None:
+            self.unique_segment_counter.update(parse_info(value)["name"] for value in info.cpu().numpy())
+        current_inputs, next_inputs, targets, metadata = self.prepare_batch(batch)
         batch_size = next(iter(current_inputs.values())).shape[0]
         self.ntokens_seen += batch_size
         local_samples = torch.tensor(batch_size, dtype=torch.float32, device=self.device)
@@ -292,6 +306,13 @@ class RLDrivingTrainer(Trainer):
             global_samples_seen = self.ntokens_seen
             metric_averages = {name: float(value.item()) / batch_size for name, value in metric_sums.items()}
 
+        batch_mesh = self.parallel_dims.get_optional_mesh("batch")
+        unique_segments_seen = (
+            self.unique_segment_counter.global_count(batch_mesh.get_group())
+            if batch_mesh is not None
+            else self.unique_segment_counter.local_count()
+        )
+
         metadata_averages = {}
         for name, value in metadata.items():
             value = value.float()
@@ -315,6 +336,7 @@ class RLDrivingTrainer(Trainer):
                 "n_samples_seen": global_samples_seen,
                 "actor_grad_norm": float(actor_grad_norm.item()),
                 "critic_grad_norm": float(critic_grad_norm.item()),
+                "dataset/unique_segments_seen": unique_segments_seen,
                 **lr_metrics,
                 **{f"rldriving/{name}": value for name, value in metric_averages.items()},
                 **{f"sim/{name}": value for name, value in metadata_averages.items()},
@@ -371,6 +393,8 @@ class RLDrivingTrainer(Trainer):
                         self.step,
                         last_step=(self.step == config.training.steps),
                     )
+                    if config.validator.enable and self.validator.should_validate(self.step):
+                        self.validator.validate(self.model_parts, self.step)
                     profiler.step()
                     if self.step - loaded_step == 1:
                         dist_utils.set_pg_timeouts(
@@ -385,4 +409,17 @@ class RLDrivingTrainer(Trainer):
 
     def close(self) -> None:
         self.dataloader.close()
+        if self.config.validator.enable:
+            self.validator.close()
         super().close()
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            **super().state_dict(),
+            "unique_segment_counter": self.unique_segment_counter.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        super().load_state_dict(state_dict)
+        if "unique_segment_counter" in state_dict:
+            self.unique_segment_counter.load_state_dict(state_dict["unique_segment_counter"])
