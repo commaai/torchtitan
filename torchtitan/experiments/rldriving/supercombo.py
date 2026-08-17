@@ -4,11 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from types import MethodType
+
 import torch
 from xx.ml_tools.constants.model import ModelInputs
-
+from torchtitan.experiments.path.model import PathSelfAttention
 from torchtitan.experiments.path.model_config import model_config
-
 from .model import actor_config
 
 
@@ -20,6 +21,16 @@ ON_POLICY_OUTPUT_ORDER = ("action",)
 OUTPUT_ORDER = (*VISION_OUTPUT_ORDER, *OFF_POLICY_OUTPUT_ORDER, *ON_POLICY_OUTPUT_ORDER, "hidden_state")
 
 
+def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
+    b, t, _ = x.shape
+    qkv = self.c_attn(self.norm(x)).view(b, t, 3, self.n_head, self.head_dim)
+    q, k, v = (value.squeeze(0) for value in qkv.permute(2, 0, 3, 1, 4).split(1))
+    q, k = self.q_norm(q), self.k_norm(k)
+    scores = (q @ k.transpose(-2, -1)) * self.head_dim**-0.5
+    x = (scores.masked_fill(~self._supercombo_mask, float("-inf")).softmax(-1) @ v).transpose(1, 2)
+    return self.dropout(self.c_proj(x.reshape(b, t, self.n_head * self.head_dim)))
+
+
 class Supercombo(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -28,6 +39,14 @@ class Supercombo(torch.nn.Module):
         self.point_policy = config.point_policy.build()
         self.off_policy = config.temporal_policy.build()
         self.on_policy = actor_config().build()
+        for policy in (self.off_policy, self.on_policy):
+            for layer in policy.temporal_summarizer.transformer.layers:
+                attention = layer.attention
+                mask = torch.ones(
+                    1, 1, policy.temporal_summarizer.block_size, policy.temporal_summarizer.block_size, dtype=torch.bool
+                )
+                attention.register_buffer("_supercombo_mask", mask.tril(), persistent=False)
+                attention.forward = MethodType(_naive_attention, attention)
 
     def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
         current = self.vision(inputs)
