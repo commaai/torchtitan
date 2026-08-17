@@ -49,6 +49,16 @@ def _batch_size(inputs: dict[str, torch.Tensor]) -> int:
     return next(iter(inputs.values())).shape[0]
 
 
+def _copy_microbatch(
+    input_dict: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    return (
+        {name: value.clone() for name, value in input_dict.items()},
+        {name: value.clone() for name, value in targets.items()},
+    )
+
+
 def _tensor_dict_to_device(
     data: dict[str, torch.Tensor], device: torch.device
 ) -> dict[str, torch.Tensor]:
@@ -416,6 +426,9 @@ class WorldModelTrainer(Trainer):
             local_samples += _batch_size(input_dict)
             if "info" in input_dict:
                 step_segment_names.update(_segment_names_from_info(input_dict["info"]))
+            if self.gradient_accumulation_steps > 1:
+                # Gigashuffle reuses its shared reader buffer as soon as the iterator advances.
+                input_dict, targets = _copy_microbatch(input_dict, targets)
             microbatches.append((input_dict, targets))
         sl.log_trace_scalar({"local_samples": int(local_samples)})
 

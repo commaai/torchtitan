@@ -25,6 +25,16 @@ from .onnx_checkpoint import PathOnnxCheckpointManager
 from .validate import PathValidator, segment_names_and_fidxs_from_info
 
 
+def _copy_microbatch(
+    input_dict: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    return (
+        {name: value.clone() for name, value in input_dict.items()},
+        {name: value.clone() for name, value in targets.items()},
+    )
+
+
 class PathTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
@@ -110,6 +120,9 @@ class PathTrainer(Trainer):
                 info = input_dict.get("info")
                 if info is not None:
                     step_segment_names.update(name for name, _ in segment_names_and_fidxs_from_info(info))
+                if self.gradient_accumulation_steps > 1:
+                    # Gigashuffle reuses its shared reader buffer as soon as the iterator advances.
+                    input_dict, targets = _copy_microbatch(input_dict, targets)
                 microbatches.append((input_dict, targets))
         sl.log_trace_scalar({"local_samples": int(local_samples)})
 
