@@ -54,7 +54,7 @@ def _worldmodel_configs() -> dict[str, Callable[[], WorldModel.Config]]:
 
 def _debug_model_config() -> WorldModel.Config:
     return _model_config(
-        input_size=(15, 4, 4),
+        input_size=(10, 4, 4),
         patch_size=(1, 2, 2),
         hidden=128,
         heads=4,
@@ -67,7 +67,7 @@ def _debug_model_config() -> WorldModel.Config:
 
 def _model_config(
     *,
-    input_size: tuple[int, int, int] = (15, *LATENT_SIZE),
+    input_size: tuple[int, int, int] = (10, *LATENT_SIZE),
     patch_size: tuple[int, int, int] = (1, 2, 2),
     hidden: int = 2304,
     heads: int = 36,
@@ -75,9 +75,9 @@ def _model_config(
     plan_layers: int = 4,
     mlp_multiple_of: int = 256,
     attention_impl: str = "FLEX",
-    attention_mask: str = "LAST_FRAME_CAUSAL",
+    attention_mask: str = "BLOCKWISE_LOWER_TRIANGLE",
     norm: str = "RMSNorm",
-    experimental_pose_only_xy: bool = False,
+    experimental_pose_only_xy: bool = True,
 ) -> WorldModel.Config:
     stats = COMPRESSOR_STATS[COMPRESSOR_MODEL]
     return WorldModel.Config(

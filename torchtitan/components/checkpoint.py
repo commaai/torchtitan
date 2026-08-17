@@ -650,13 +650,17 @@ class CheckpointManager(Configurable):
                 state_dict,
                 storage_reader=FsspecReader(checkpoint_id),
                 checkpoint_id=checkpoint_id,
-                planner=dcp.DefaultLoadPlanner(allow_partial_load=self.allow_partial_initial_load),
+                planner=self._create_load_planner(),
             )
 
             # TODO: Since we flatten the model states in state_dict, we need to
             # manually call load_state_dict() for the model. Need to fix this.
             if MODEL in self.states:
                 self.states[MODEL].load_state_dict(state_dict)
+
+    def _create_load_planner(self) -> dcp.LoadPlanner:
+        """Build the DCP planner used for native checkpoint loads."""
+        return dcp.DefaultLoadPlanner(allow_partial_load=self.allow_partial_initial_load)
 
     @sl.log_trace_span("checkpoint_save")
     @torch.no_grad()

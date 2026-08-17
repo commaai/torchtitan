@@ -37,6 +37,8 @@ from torchtitan.experiments.worldmodel.model_for_inference import (
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import init_logger
 
+from .checkpoint_planner import WorldModelSuffixCropLoadPlanner
+
 
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 
@@ -365,6 +367,9 @@ class WorldModelTorchPackageCheckpointManager(TorchPackageCheckpointManager):
         torch_package_recipe: str = WORLD_MODEL_TRAINING_TORCH_PACKAGE_RECIPE
         torch_package_recipe_state_file: str = MODEL_CONFIG_FILE
         torch_package_structured_log_dir: str = STRUCTURED_LOG_DIR
+
+    def _create_load_planner(self) -> WorldModelSuffixCropLoadPlanner:
+        return WorldModelSuffixCropLoadPlanner(allow_partial_load=self.allow_partial_initial_load)
 
 
 def main() -> None:
