@@ -20,13 +20,13 @@ from xx.training.lib.checkpoint import Checkpoint
 from xx.training.rldriving.dataloader import RolloutContext
 
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.optim.lr_scheduler import LambdaLR
 
-from torchtitan.components.checkpoint_utils import init_optim_state
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
@@ -143,6 +143,7 @@ class RLDrivingTrainer(Trainer):
         validator: RLDrivingValidator.Config  # pyrefly: ignore [bad-override]
         warm_start_checkpoint: str
         steps_per_epoch: int
+        train_step_barrier_timeout_seconds: int
         ema_tau: float
         fps: int
 
@@ -166,6 +167,11 @@ class RLDrivingTrainer(Trainer):
         super().__init__(config)
         if self.gradient_accumulation_steps != 1:
             raise ValueError("rldriving does not support gradient accumulation")
+        self.train_step_barrier_group: dist.ProcessGroup | None = None
+        if dist.get_world_size() > 1:
+            self.train_step_barrier_group = dist.new_group(
+                backend="gloo", timeout=timedelta(seconds=config.train_step_barrier_timeout_seconds)
+            )
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:rldriving:train")
         self.loss_fn.to(self.device)
@@ -218,6 +224,8 @@ class RLDrivingTrainer(Trainer):
         lr_metrics = self.lr_schedulers.get_metrics()
         metric_sums: dict[str, torch.Tensor] = {}
         self.optimizers.zero_grad()
+        if self.train_step_barrier_group is not None:
+            dist.barrier(group=self.train_step_barrier_group)
         with self.train_context():
             actor_outputs = self.model(current_inputs)
             next_actor_outputs = self.model(next_inputs)
@@ -349,11 +357,6 @@ class RLDrivingTrainer(Trainer):
         sl.log_trace_instant("training_start")
         loaded = self.checkpointer.load(step=config.checkpoint.load_step)
         if not loaded:
-            if self.checkpointer.enable:
-                for optimizer in self.optimizers:
-                    init_optim_state(optimizer)
-                    for state in optimizer.state.values():
-                        state["step"].zero_()
             self.checkpointer.save(0)
         self.set_runtime_seed()
         loaded_step = self.step
@@ -397,6 +400,9 @@ class RLDrivingTrainer(Trainer):
         if self.config.validator.enable:
             self.validator.close()
         super().close()
+        if self.train_step_barrier_group is not None:
+            dist.destroy_process_group(self.train_step_barrier_group)
+            self.train_step_barrier_group = None
 
     def state_dict(self) -> dict[str, Any]:
         return {

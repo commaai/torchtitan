@@ -12,6 +12,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 
+from torchtitan.components.checkpoint import OPTIMIZER
 from torchtitan.components.onnx_checkpoint import OnnxCheckpointManager
 
 from .model import ACTION_HEAD_NAME, RLDrivingModel
@@ -35,6 +36,8 @@ class RLDrivingOnnxCheckpointManager(OnnxCheckpointManager):
         if config.checkpoint_base_folder:
             kwargs["base_folder"] = config.checkpoint_base_folder
         super().__init__(config, **kwargs)
+        if self.enable:
+            self.states.pop(OPTIMIZER)
 
     def _export_onnx(self, model: nn.Module, path: str) -> None:
         model = cast(RLDrivingModel, model)

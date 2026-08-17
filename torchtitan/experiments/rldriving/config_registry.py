@@ -149,6 +149,7 @@ def rldriving() -> RLDrivingTrainer.Config:
             interval=steps_per_epoch,
         ),
         steps_per_epoch=steps_per_epoch,
+        train_step_barrier_timeout_seconds=60 * 60,
         ema_tau=128.0,
         fps=fps,
         activation_checkpoint=None,
