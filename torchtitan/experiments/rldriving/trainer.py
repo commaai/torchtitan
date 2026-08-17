@@ -12,7 +12,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import cache
-from typing import Annotated, Any, cast, Literal
+from typing import Any, cast, Literal
 
 from xx.common.helpers import parse_info
 from xx.ml_tools.constants.model import TEMPORAL_INPUTS
@@ -22,7 +22,6 @@ from xx.training.rldriving.dataloader import RolloutContext
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-import tyro
 from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.optim.lr_scheduler import LambdaLR
@@ -145,23 +144,9 @@ class RLDrivingTrainer(Trainer):
         warm_start_checkpoint: str
         steps_per_epoch: int
         ema_tau: float
-        fps: Annotated[int, tyro.conf.Suppress] = 0
+        fps: int
 
         def __post_init__(self) -> None:
-            path_hparams = _get_path_checkpoint(self.warm_start_checkpoint).metadata["training_args"]
-            model_hparams = path_hparams.get("torchtitan", path_hparams)["model"]
-            from .config_registry import model_registry
-
-            self.model_spec = model_registry(model_hparams["temporal_policy"])
-            self.fps = int(path_hparams["fps"])
-            self.dataloader.fps = self.loss.fps = self.fps
-            self.validator.fps = self.fps
-            model_config = cast(RLDrivingModel.Config, self.model_spec.model)
-            input_shapes = RLDrivingModel.input_shapes(model_config)
-            self.checkpoint.input_names = list(input_shapes)
-            self.checkpoint.input_shapes = [list(shape) for shape in input_shapes.values()]
-            self.checkpoint.input_dtypes = ["float32"] * len(input_shapes)
-
             Trainer.Config.__post_init__(self)
             if self.codedir:
                 self.dataloader.codedir = self.codedir

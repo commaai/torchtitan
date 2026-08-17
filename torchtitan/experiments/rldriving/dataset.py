@@ -27,6 +27,7 @@ class RLDrivingDataLoader(BaseDataLoader):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
         dataset: str
+        fps: int
         training_id: str = ""
         shuffle_size: int = 50_000
         min_mixing: float = 0.9
@@ -46,7 +47,6 @@ class RLDrivingDataLoader(BaseDataLoader):
         save_cache: bool = False
         load_caches: list[str] = field(default_factory=list)
 
-        fps: int = 5
         zero_desire: bool = False
         photo_noise_model: Literal["NONE", "VISION"] = "VISION"
         pre_worldmodel_warmup_seconds: int = 7

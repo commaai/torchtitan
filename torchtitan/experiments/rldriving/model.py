@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
+import math
 from typing import Any, cast
 
-from xx.ml_tools.constants.model import ModelInputs
+from xx.ml_tools.constants.model import ACTION_LEN, ModelInputs
 
 import torch
 import torch.nn as nn
@@ -21,7 +23,16 @@ from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP,
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
-from torchtitan.experiments.path.model import Hydra, LinearEncoder, PathMLP, TemporalPolicy, TemporalSummarizer
+from torchtitan.experiments.path.model import (
+    Hydra,
+    LinearEncoder,
+    PathHead,
+    PathMLP,
+    TemporalPolicy,
+    TemporalSummarizer,
+)
+from torchtitan.experiments.path.model_config import TEMPORAL_HEADS, temporal_policy_config
+from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
@@ -80,15 +91,44 @@ class Critic(Module):
         return q_B1.squeeze(-1).clone()
 
 
-class TwinCritic(Module):
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        critic: Critic.Config
+def actor_config() -> TemporalPolicy.Config:
+    action_heads = tuple(head for head in TEMPORAL_HEADS if head.name == ACTION_HEAD_NAME)
+    return temporal_policy_config(heads=action_heads, dropout=0.0, dense_training_outputs=False)
 
-    def __init__(self, config: Config):
+
+def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
+    dim = actor.temporal_summarizer.pos_embedding.embedding_dim
+    hidden = 256 * math.ceil(2 * dim / 256)
+    post_action_mlp = PathMLP.Config(
+        norm=LayerNorm.Config(normalized_shape=dim),
+        c_fc=Linear.Config(in_features=dim, out_features=hidden, bias=False),
+        c_proj=Linear.Config(in_features=hidden, out_features=dim, bias=False),
+        act="gelu_tanh",
+        dropout=0.0,
+    )
+    return Critic.Config(
+        temporal_summarizer=copy.deepcopy(actor.temporal_summarizer),
+        history_idxs=actor.history_idxs,
+        action_encoder=LinearEncoder.Config(
+            in_layer=Linear.Config(in_features=ACTION_LEN, out_features=dim, bias=True),
+            out_layer=Linear.Config(in_features=dim, out_features=dim, bias=False),
+        ),
+        post_action_mlp1=post_action_mlp,
+        post_action_mlp2=copy.deepcopy(post_action_mlp),
+        q_hydra=Hydra.Config(
+            heads=(PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),),
+            head_mlps={},
+            final_layers={Q_HEAD_NAME: Linear.Config(in_features=dim, out_features=1, bias=True)},
+            scale_layers={},
+        ),
+    )
+
+
+class TwinCritic(nn.Module):
+    def __init__(self, config: Critic.Config):
         super().__init__()
-        self.critic1 = config.critic.build()
-        self.critic2 = config.critic.build()
+        self.critic1 = config.build()
+        self.critic2 = config.build()
 
     def forward(
         self,
@@ -102,7 +142,7 @@ class RLDrivingModel(BaseModel):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseModel.Config):
         actor: TemporalPolicy.Config
-        critic: TwinCritic.Config
+        critic: Critic.Config
 
         def update_from_config(self, *, config, **kwargs) -> None:
             parallelism = config.parallelism
@@ -128,7 +168,7 @@ class RLDrivingModel(BaseModel):
                 name: torch.zeros(shape, dtype=torch.float32, device=device)
                 for name, shape in RLDrivingModel.input_shapes(self).items()
             }
-            action_dim = self.critic.critic.action_encoder.in_layer.in_features
+            action_dim = self.critic.action_encoder.in_layer.in_features
             action_BA = torch.zeros((1, action_dim), dtype=torch.float32, device=device)
             with torch.no_grad(), FlopCounterMode(display=False) as counter:
                 rldriving_model(inputs)
@@ -140,9 +180,9 @@ class RLDrivingModel(BaseModel):
         super().__init__()
         self.config = config
         self.actor = config.actor.build()
-        self.critic = config.critic.build()
+        self.critic = TwinCritic(config.critic)
         self.target_actor = config.actor.build()
-        self.target_critic = config.critic.build()
+        self.target_critic = TwinCritic(config.critic)
 
         self.target_actor.requires_grad_(False).eval()
         self.target_critic.requires_grad_(False).eval()
