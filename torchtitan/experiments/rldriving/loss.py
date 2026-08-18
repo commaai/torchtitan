@@ -95,7 +95,6 @@ def _actor_loss(
     online_critic: nn.Module,
     current_inputs: ModelInputs,
     targets: Targets,
-    action_noise_A: torch.Tensor,
     fps: float,
     smooth_lat_cost: float,
     smooth_long_cost: float,
@@ -104,12 +103,11 @@ def _actor_loss(
     action_bound_loss_weight: float,
 ) -> LossResult:
     action_pred_BA = actor_outputs[ACTION_OUTPUT]
-    sampled_action_BA = _sample_fixed_noise_policy(action_pred_BA, action_noise_A)
     q1_new_B, q2_new_B = online_critic(
         inputs=current_inputs,
-        action=sampled_action_BA,
+        action=action_pred_BA[:, :2],
     )
-    actor_pi_B = -torch.minimum(q1_new_B, q2_new_B)
+    actor_pi_B = -q1_new_B
     actor_q_abs_gap_B = torch.abs(q1_new_B - q2_new_B)
 
     not_done_B = 1.0 - targets["action_reward"][:, 3]
@@ -228,7 +226,6 @@ class RLDrivingLoss(BaseLoss):
             online_critic=online_critic,
             current_inputs=current_inputs,
             targets=targets,
-            action_noise_A=self.action_noise_A,
             fps=self.fps,
             smooth_lat_cost=self.smooth_lat_cost,
             smooth_long_cost=self.smooth_long_cost,
