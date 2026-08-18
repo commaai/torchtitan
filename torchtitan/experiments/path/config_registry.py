@@ -56,6 +56,10 @@ from .trainer import PathTrainer
 from .validate import PathValidator
 
 
+VISION_FEATURES = 512
+VISION_OUTPUT_STRIDE = 32
+
+
 def model_registry(flavor: str) -> ModelSpec:
     return ModelSpec(
         name="path",
@@ -171,7 +175,7 @@ def _path(flavor: str) -> PathTrainer.Config:
 
 
 def _model_config(flavor: str) -> PathModel.Config:
-    vision_features = 512
+    vision_features = VISION_FEATURES
     n_frames_input = N_FRAMES
     input_frame_names = INPUT_FRAMES_NAMES
     input_frame_type = FRAME_TYPE
@@ -181,6 +185,9 @@ def _model_config(flavor: str) -> PathModel.Config:
     desire_window_len = frame_constants["desire_window_len"]
     history_idxs = tuple(int(x) for x in frame_constants["history_idxs"])
     desire_window_starts = tuple(idx - history_idxs[0] for idx in history_idxs)
+    temporal_len = frame_constants["temporal_len"]
+    grid_size = _vision_grid_size(frame_constants)
+    spatial_size = math.prod(grid_size)
     dim = vision_features
 
     return PathModel.Config(
@@ -192,6 +199,7 @@ def _model_config(flavor: str) -> PathModel.Config:
             input_frame_names=tuple(input_frame_names),
             in_channels=in_channels,
             vision_features=vision_features,
+            grid_size=grid_size,
             pretrained=True,
             drop_path_rate=0.2,
             mean=255 / 2,
@@ -200,7 +208,21 @@ def _model_config(flavor: str) -> PathModel.Config:
         point_policy=Policy.Config(
             summarizer=PointSummarizer.Config(
                 mlp1=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
-                mlp2=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
+                transformer=PathTransformer.Config(
+                    layers=[
+                        PathTransformerBlock.Config(
+                            attention=_attention(dim=dim, n_head=8, dropout=0.0, is_causal=False),
+                            mlp=_mlp(dim, mlp_mult=2, bias=True, dropout=0.0),
+                        )
+                        for _ in range(2)
+                    ]
+                ),
+                pos_embedding=Embedding.Config(
+                    num_embeddings=spatial_size,
+                    embedding_dim=dim,
+                ),
+                spatial_size=spatial_size,
+                n_features=dim,
             ),
             hydra=_hydra(_heads(META_HEADS + POSE_HEADS), in_features=dim, mlp_mult=2),
         ),
@@ -216,22 +238,32 @@ def _model_config(flavor: str) -> PathModel.Config:
                 transformer=PathTransformer.Config(
                     layers=[
                         PathTransformerBlock.Config(
-                            attention=_attention(dim=dim, n_head=8, dropout=0.1),
+                            attention=_attention(
+                                dim=dim,
+                                n_head=8,
+                                dropout=0.1,
+                                causal_block_size=spatial_size,
+                            ),
                             mlp=_mlp(dim, mlp_mult=2, bias=True, dropout=0.1),
                         )
                         for _ in range(4)
                     ]
                 ),
-                pos_embedding=Embedding.Config(
+                temporal_pos_embedding=Embedding.Config(
                     num_embeddings=block_size,
                     embedding_dim=dim,
                 ),
-                block_size=block_size,
+                spatial_pos_embedding=Embedding.Config(
+                    num_embeddings=spatial_size,
+                    embedding_dim=dim,
+                ),
+                temporal_size=block_size,
+                spatial_size=spatial_size,
                 dense_training_outputs=True,
             ),
             temporal_hydra=_hydra(_heads(DRIVING_HEADS + TEMPORAL_META_HEADS), in_features=dim, mlp_mult=2),
             history_idxs=history_idxs,
-        ),
+        )
     )
 
 
@@ -278,6 +310,7 @@ def _dataloader_config(
 def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnxCheckpointManager.Config:
     frame_constants = frame_constants_from_fps(n_frames=N_FRAMES, frame_type=FRAME_TYPE)
     temporal_len = frame_constants["temporal_len"]
+    spatial_size = math.prod(_vision_grid_size(frame_constants))
     vision_input_names = [ModelInputs.IMG, ModelInputs.BIG_IMG]
     temporal_policy_input_names = [
         ModelInputs.FEATURES,
@@ -292,7 +325,7 @@ def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnx
     input_shapes = [
         [1, *frame_constants["frame_shapes"][ModelInputs.IMG]],
         [1, *frame_constants["frame_shapes"][ModelInputs.BIG_IMG]],
-        [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.FEATURES][0]],
+        [1, temporal_len, spatial_size, VISION_FEATURES],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.DESIRE][0]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.ACTION_T][0]],
@@ -372,7 +405,14 @@ def _encoder(in_features: int, dim: int) -> LinearEncoder.Config:
     )
 
 
-def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Config:
+def _attention(
+    *,
+    dim: int,
+    n_head: int,
+    dropout: float,
+    is_causal: bool = True,
+    causal_block_size: int = 1,
+) -> PathSelfAttention.Config:
     head_dim = dim // n_head
     return PathSelfAttention.Config(
         norm=LayerNorm.Config(normalized_shape=dim),
@@ -384,7 +424,20 @@ def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Co
         n_head=n_head,
         head_dim=head_dim,
         dropout=dropout,
+        is_causal=is_causal,
+        causal_block_size=causal_block_size,
     )
+
+
+def _vision_grid_size(frame_constants: dict) -> tuple[int, int]:
+    shapes = [frame_constants["frame_shapes"][name] for name in INPUT_FRAMES_NAMES]
+    spatial_shapes = {tuple(shape[-2:]) for shape in shapes}
+    if len(spatial_shapes) != 1:
+        raise ValueError(f"vision inputs must share a spatial shape, got {sorted(spatial_shapes)}")
+    height, width = next(iter(spatial_shapes))
+    if height % VISION_OUTPUT_STRIDE or width % VISION_OUTPUT_STRIDE:
+        raise ValueError(f"vision input {(height, width)} must be divisible by output stride {VISION_OUTPUT_STRIDE}")
+    return height // VISION_OUTPUT_STRIDE, width // VISION_OUTPUT_STRIDE
 
 
 def _hydra(heads: tuple[PathHead, ...], *, in_features: int, mlp_mult: float) -> Hydra.Config:

@@ -11,6 +11,7 @@ from xx.ml_tools.constants.model import frame_constants_from_fps, ModelInputs, T
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
@@ -93,12 +94,14 @@ class PathSelfAttention(Module):
         head_dim: int
         dropout: float
         is_causal: bool = True
+        causal_block_size: int = 1
 
     def __init__(self, config: Config):
         super().__init__()
         self.n_head = config.n_head
         self.head_dim = config.head_dim
         self.is_causal = config.is_causal
+        self.causal_block_size = config.causal_block_size
         self.norm = config.norm.build()
         self.q_norm = config.q_norm.build() if config.q_norm is not None else nn.Identity()
         self.k_norm = config.k_norm.build() if config.k_norm is not None else nn.Identity()
@@ -112,7 +115,17 @@ class PathSelfAttention(Module):
         qkv = self.c_attn(self.norm(x)).view(b, t, 3, self.n_head, self.head_dim)
         q, k, v = qkv.unbind(2)
         q, k = self.q_norm(q), self.k_norm(k)
-        x = self.inner_attention(q, k, v, is_causal=self.is_causal)
+        if self.is_causal and self.causal_block_size > 1:
+            # Tokens are time-major. Let every spatial token attend within its frame
+            # while retaining causal attention between frames.
+            if t % self.causal_block_size != 0:
+                raise ValueError(f"sequence length {t} must be divisible by causal block size {self.causal_block_size}")
+            frame_idx = torch.arange(t, device=x.device) // self.causal_block_size
+            attention_mask = frame_idx[:, None] >= frame_idx[None, :]
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask).transpose(1, 2)
+        else:
+            x = self.inner_attention(q, k, v, is_causal=self.is_causal)
         return self.dropout(self.c_proj(x.reshape(b, t, self.n_head * self.head_dim)))
 
 
@@ -156,19 +169,41 @@ class PathTransformer(Module):
 
 
 class PointSummarizer(Module):
+    """Collapse each spatial feature grid with a learned CLS token."""
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         mlp1: PathMLP.Config
-        mlp2: PathMLP.Config
+        transformer: PathTransformer.Config
+        pos_embedding: Embedding.Config
+        spatial_size: int
+        n_features: int
 
     def __init__(self, config: Config):
         super().__init__()
+        self.spatial_size = config.spatial_size
+        self.n_features = config.n_features
         self.mlp1 = config.mlp1.build()
-        self.mlp2 = config.mlp2.build()
+        self.transformer = config.transformer.build()
+        self.pos_embedding = config.pos_embedding.build()
+        self.cls_token = nn.Parameter(torch.empty(1, 1, config.n_features))
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.cls_token, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-2:] != (self.spatial_size, self.n_features):
+            raise ValueError(
+                f"expected spatial features (..., {self.spatial_size}, {self.n_features}), got {tuple(x.shape)}"
+            )
         x = self.mlp1(x) + x
-        return self.mlp2(x) + x
+        pos = self.pos_embedding(torch.arange(self.spatial_size, device=x.device))
+        x = x + pos
+        leading_shape = x.shape[:-2]
+        cls = self.cls_token.expand(*leading_shape, 1, -1)
+        x = torch.cat((cls, x), dim=-2).reshape(-1, self.spatial_size + 1, self.n_features)
+        x = self.transformer(x)
+        return x.reshape(*leading_shape, self.spatial_size + 1, self.n_features)[..., 0, :]
 
 
 class LinearEncoder(Module):
@@ -196,13 +231,16 @@ class TemporalSummarizer(Module):
         traffic_encoder: LinearEncoder.Config
         action_t_encoder: LinearEncoder.Config
         transformer: PathTransformer.Config
-        pos_embedding: Embedding.Config
-        block_size: int
+        temporal_pos_embedding: Embedding.Config
+        spatial_pos_embedding: Embedding.Config
+        temporal_size: int
+        spatial_size: int
         dense_training_outputs: bool
 
     def __init__(self, config: Config):
         super().__init__()
-        self.block_size = config.block_size
+        self.temporal_size = config.temporal_size
+        self.spatial_size = config.spatial_size
         self.dense_training_outputs = config.dense_training_outputs
         if len(config.desire_window_starts) != self.block_size:
             raise ValueError(f"Expected {self.block_size} desire window starts, got {len(config.desire_window_starts)}")
@@ -216,7 +254,8 @@ class TemporalSummarizer(Module):
         self.traffic_encoder = config.traffic_encoder.build()
         self.action_t_encoder = config.action_t_encoder.build()
         self.transformer = config.transformer.build()
-        self.pos_embedding = config.pos_embedding.build()
+        self.temporal_pos_embedding = config.temporal_pos_embedding.build()
+        self.spatial_pos_embedding = config.spatial_pos_embedding.build()
 
     def reset_parameters(self) -> None:
         nn.init.zeros_(self.unknown_desire_embedding)
@@ -247,15 +286,28 @@ class TemporalSummarizer(Module):
         traffic_convention: torch.Tensor,
         action_t: torch.Tensor,
     ) -> torch.Tensor:
+        if feats.shape[1:3] != (self.temporal_size, self.spatial_size):
+            raise ValueError(
+                f"expected features (B, {self.temporal_size}, {self.spatial_size}, C), got {tuple(feats.shape)}"
+            )
         feats = self.mlp1(feats) + feats
         feats = self.mlp2(feats) + feats
+        b, t, s, c = feats.shape
+        # Temporal attention sees every spatial token. Pool only after attention so
+        # each dense output retains one entry per frame for the existing heads/losses.
+        feats = feats.reshape(b, t * s, c)
         desire = self._encode_desire(self._window_desire(desire))
+        desire = desire.repeat_interleave(s, dim=1)
         traffic_convention = rearrange(self.traffic_encoder(traffic_convention), "b c -> b () c")
         action_t = rearrange(self.action_t_encoder(action_t), "b c -> b () c")
-        pos = self.pos_embedding(torch.arange(self.block_size, device=feats.device))
-        x = feats + rearrange(pos, "t c -> () t c") + desire + traffic_convention + action_t
+        temporal_pos = self.temporal_pos_embedding(torch.arange(t, device=feats.device))
+        spatial_pos = self.spatial_pos_embedding(torch.arange(s, device=feats.device))
+        pos = (temporal_pos[:, None, :] + spatial_pos[None, :, :]).reshape(t * s, c)
+        x = feats + rearrange(pos, "ts c -> () ts c") + desire + traffic_convention + action_t
         x = self.transformer(x)
-        return x if self.dense_training_outputs else x[:, self.block_size - 1]
+        if self.dense_training_outputs:
+            return x.reshape(b, t, s, c).mean(dim=2)
+        return x[:, -s:].mean(dim=1)
 
 
 class Hydra(Module):
@@ -344,6 +396,7 @@ class Vision(Module):
         input_frame_names: tuple[str, ...]
         in_channels: int
         vision_features: int
+        grid_size: tuple[int, int]
         pretrained: bool
         drop_path_rate: float
         mean: float
@@ -356,9 +409,13 @@ class Vision(Module):
             config.flavor,
             pretrained=False,
             in_chans=config.in_channels,
-            num_classes=config.vision_features,
+            num_classes=0,
+            global_pool="",
             drop_path_rate=config.drop_path_rate,
         )
+        # The ConvNeXt head now normalizes without pooling; project its channel-rich
+        # 2-D map to the policy width at every spatial location.
+        self.proj = nn.Conv2d(self.encoder.num_features, config.vision_features, kernel_size=1)
         self.register_buffer("_mean", torch.empty(1, config.in_channels, 1, 1), persistent=True)
         self.register_buffer("_std", torch.empty(1, config.in_channels, 1, 1), persistent=True)
 
@@ -418,7 +475,11 @@ class Vision(Module):
         x = torch.cat([inputs[name] for name in self.config.input_frame_names], dim=1)
         dtype = next(self.encoder.parameters()).dtype
         x = x.to(dtype)
-        return self.encoder((x - self._mean.to(dtype)) / self._std.to(dtype))
+        x = self.encoder((x - self._mean.to(dtype)) / self._std.to(dtype))
+        x = self.proj(x)
+        if x.shape[-2:] != self.config.grid_size:
+            raise ValueError(f"expected vision grid {self.config.grid_size}, got {tuple(x.shape[-2:])}")
+        return x.flatten(2).transpose(1, 2)
 
 
 class PathModel(BaseModel):
@@ -549,7 +610,7 @@ class PathModel(BaseModel):
             for name in self.config.vision.input_frame_names
         }
         features = self.vision(vision_inputs)
-        features = rearrange(features, "(b t) c -> b t c", b=b, t=t)
+        features = rearrange(features, "(b t) s c -> b t s c", b=b, t=t)
         return self.point_policy(features) | self.temporal_policy(
             features,
             inputs[ModelInputs.DESIRE],
@@ -624,6 +685,10 @@ def _apply_activation_checkpointing(
         mode,
         "vision.encoder",
     )
+    model.point_policy.summarizer.transformer.apply_activation_checkpointing(
+        wrap,
+        "point_policy.summarizer.transformer",
+    )
     model.temporal_policy.temporal_summarizer.transformer.apply_activation_checkpointing(
         wrap,
         "temporal_policy.temporal_summarizer.transformer",
@@ -671,6 +736,10 @@ def _apply_fsdp(
         shard,
         reshard_after_forward,
         reshard_after_forward_policy == "always",
+    )
+    model.point_policy.summarizer.transformer.apply_fsdp(
+        shard,
+        reshard_after_forward,
     )
     model.temporal_policy.temporal_summarizer.transformer.apply_fsdp(
         shard,
