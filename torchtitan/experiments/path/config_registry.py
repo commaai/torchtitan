@@ -23,7 +23,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from .dataset import PathDataLoader
 from .loss import PathLoss
 from .model import parallelize_path
-from .model_config import model_config as _model_config
+from .model_config import model_config as _model_config, VISION_FEATURES, _spatial_size
 from .model_constants import (
     frame_constants_from_fps,
     FRAME_TYPE,
@@ -37,11 +37,11 @@ from .trainer import PathTrainer
 from .validate import PathValidator
 
 
-def model_registry(flavor: str) -> ModelSpec:
+def model_registry(flavor: str, *, unvision: bool = False) -> ModelSpec:
     return ModelSpec(
         name="path",
         flavor=flavor,
-        model=_model_config(flavor),
+        model=_model_config(flavor, unvision=unvision),
         parallelize_fn=parallelize_path,
         pipelining_fn=None,
         post_optimizer_build_fn=None,
@@ -56,7 +56,7 @@ def _dp_degrees() -> tuple[int, int]:
     return num_nodes, local_world_size
 
 
-def _path(flavor: str) -> PathTrainer.Config:
+def _path(flavor: str, *, unvision: bool = False) -> PathTrainer.Config:
     steps = 1024 * 55
     validation_freq = 1024
     reports = {
@@ -80,7 +80,7 @@ def _path(flavor: str) -> PathTrainer.Config:
     plan_only = False
     return PathTrainer.Config(
         loss=PathLoss.Config(),
-        model_spec=model_registry(flavor),
+        model_spec=model_registry(flavor, unvision=unvision),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=_dataloader_config(
             dataset=DEFAULT_TRAIN_LIST,
@@ -92,6 +92,7 @@ def _path(flavor: str) -> PathTrainer.Config:
             pipeline_dir=BASE_DIR_GT,
             skip=1,
             val_skip=1,
+            unvision=unvision,
         ),
         optimizer=_optimizer_config(),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -143,6 +144,7 @@ def _path(flavor: str) -> PathTrainer.Config:
                 pipeline_dir=BASE_DIR_GT,
                 skip=1,
                 val_skip=6,
+                unvision=unvision,
             ),
             mixed_precision_param=mixed_precision_param,
             reports=reports,
@@ -162,6 +164,7 @@ def _dataloader_config(
     pipeline_dir: str,
     skip: int,
     val_skip: int,
+    unvision: bool | None = None,
 ) -> PathDataLoader.Config:
     return PathDataLoader.Config(
         dataset=dataset,
@@ -173,12 +176,14 @@ def _dataloader_config(
         limit=limit,
         skip=skip,
         val_skip=val_skip,
+        unvision=unvision,
     )
 
 
 def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnxCheckpointManager.Config:
     frame_constants = frame_constants_from_fps(n_frames=N_FRAMES, frame_type=FRAME_TYPE)
     temporal_len = frame_constants["temporal_len"]
+    spatial_size = _spatial_size(frame_constants)
     vision_input_names = [ModelInputs.IMG, ModelInputs.BIG_IMG]
     temporal_policy_input_names = [
         ModelInputs.FEATURES,
@@ -193,7 +198,7 @@ def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnx
     input_shapes = [
         [1, *frame_constants["frame_shapes"][ModelInputs.IMG]],
         [1, *frame_constants["frame_shapes"][ModelInputs.BIG_IMG]],
-        [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.FEATURES][0]],
+        [1, temporal_len, spatial_size, VISION_FEATURES],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.DESIRE][0]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.ACTION_T][0]],
@@ -245,3 +250,4 @@ convnext_quarterxxl = partial(_path, "convnext_quarterxxl")
 convnext_thirdxxl = partial(_path, "convnext_thirdxxl")
 convnext_base = partial(_path, "convnext_base")
 convnext_xxlarge = partial(_path, "convnext_xxlarge")
+convnext_xxlarge_unvision = partial(_path, "convnext_xxlarge", unvision=True)

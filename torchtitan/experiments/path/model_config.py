@@ -24,6 +24,7 @@ from .model import (
     PointSummarizer,
     Policy,
     ScaleLayer,
+    SpatialUnvision,
     TemporalPolicy,
     TemporalSummarizer,
     Vision,
@@ -38,15 +39,29 @@ from .model_constants import (
 )
 
 
+VISION_FEATURES = 512
+VISION_OUTPUT_STRIDE = 32
+
 POINT_HEADS = tuple(META_HEADS + POSE_HEADS)
 TEMPORAL_HEADS = tuple(DRIVING_HEADS + TEMPORAL_META_HEADS)
 
 
-def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
-    vision_features = 512
+def _vision_grid_size(frame_constants: dict) -> tuple[int, int]:
+    height, width = frame_constants["frame_shapes"][INPUT_FRAMES_NAMES[0]][-2:]
+    return height // VISION_OUTPUT_STRIDE, width // VISION_OUTPUT_STRIDE
+
+
+def _spatial_size(frame_constants: dict) -> int:
+    return math.prod(_vision_grid_size(frame_constants))
+
+
+def model_config(flavor: str = "convnext_xxlarge", *, unvision: bool = False) -> PathModel.Config:
+    vision_features = VISION_FEATURES
     frame_constants = frame_constants_from_fps(n_frames=N_FRAMES, frame_type=FRAME_TYPE)
     input_frame_names = tuple(INPUT_FRAMES_NAMES)
     in_channels = sum(frame_constants["frame_shapes"][name][0] for name in input_frame_names)
+    grid_size = _vision_grid_size(frame_constants)
+    spatial_size = math.prod(grid_size)
 
     return PathModel.Config(
         n_frames_input=N_FRAMES,
@@ -57,6 +72,7 @@ def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
             input_frame_names=input_frame_names,
             in_channels=in_channels,
             vision_features=vision_features,
+            grid_size=grid_size,
             pretrained=True,
             drop_path_rate=0.2,
             mean=255 / 2,
@@ -65,11 +81,26 @@ def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
         point_policy=Policy.Config(
             summarizer=PointSummarizer.Config(
                 mlp1=_mlp(vision_features, mlp_mult=2, bias=False, dropout=0.0),
-                mlp2=_mlp(vision_features, mlp_mult=2, bias=False, dropout=0.0),
+                transformer=PathTransformer.Config(
+                    layers=[
+                        PathTransformerBlock.Config(
+                            attention=_attention(dim=vision_features, n_head=8, dropout=0.0, is_causal=False),
+                            mlp=_mlp(vision_features, mlp_mult=2, bias=True, dropout=0.0),
+                        )
+                        for _ in range(2)
+                    ]
+                ),
+                pos_embedding=Embedding.Config(
+                    num_embeddings=spatial_size,
+                    embedding_dim=vision_features,
+                ),
+                spatial_size=spatial_size,
             ),
             hydra=_hydra(POINT_HEADS, in_features=vision_features, mlp_mult=2),
         ),
         temporal_policy=temporal_policy_config(),
+        unvision=unvision,
+        unvision_decoder=_spatial_unvision_config(in_features=vision_features, grid_size=grid_size),
     )
 
 
@@ -79,11 +110,13 @@ def temporal_policy_config(
     dropout: float = 0.1,
     dense_training_outputs: bool = True,
 ) -> TemporalPolicy.Config:
-    vision_features = 512
+    vision_features = VISION_FEATURES
     frame_constants = frame_constants_from_fps()
     history_idxs = tuple(int(index) for index in frame_constants["history_idxs"])
     desire_window_len = frame_constants["desire_window_len"]
     desire_window_starts = tuple(index - history_idxs[0] for index in history_idxs)
+    block_size = len(history_idxs)
+    spatial_size = _spatial_size(frame_constants)
     return TemporalPolicy.Config(
         temporal_summarizer=TemporalSummarizer.Config(
             mlp1=_mlp(vision_features, mlp_mult=2, bias=False, dropout=0.0),
@@ -96,21 +129,51 @@ def temporal_policy_config(
             transformer=PathTransformer.Config(
                 layers=[
                     PathTransformerBlock.Config(
-                        attention=_attention(dim=vision_features, n_head=8, dropout=dropout),
+                        attention=_attention(
+                            dim=vision_features,
+                            n_head=8,
+                            dropout=dropout,
+                            causal_block_size=spatial_size,
+                        ),
                         mlp=_mlp(vision_features, mlp_mult=2, bias=True, dropout=dropout),
                     )
                     for _ in range(4)
                 ]
             ),
-            pos_embedding=Embedding.Config(
-                num_embeddings=len(history_idxs),
+            temporal_pos_embedding=Embedding.Config(
+                num_embeddings=block_size,
                 embedding_dim=vision_features,
             ),
-            block_size=len(history_idxs),
+            spatial_pos_embedding=Embedding.Config(
+                num_embeddings=spatial_size,
+                embedding_dim=vision_features,
+            ),
+            temporal_size=block_size,
+            spatial_size=spatial_size,
             dense_training_outputs=dense_training_outputs,
         ),
         temporal_hydra=_hydra(heads, in_features=vision_features, mlp_mult=2),
         history_idxs=history_idxs,
+    )
+
+
+def _spatial_unvision_config(
+    *,
+    in_features: int,
+    grid_size: tuple[int, int],
+) -> SpatialUnvision.Config:
+    dim = SpatialUnvision.N_EMBD
+    layers = [
+        PathTransformerBlock.Config(
+            attention=_attention(dim=dim, n_head=SpatialUnvision.N_HEAD, dropout=0.0, is_causal=False),
+            mlp=_mlp(dim=dim, mlp_mult=8 / 3, bias=False, dropout=0.0),
+        )
+        for _ in range(SpatialUnvision.N_LAYER)
+    ]
+    return SpatialUnvision.Config(
+        in_features=in_features,
+        grid_size=grid_size,
+        transformer=PathTransformer.Config(layers=layers),
     )
 
 
@@ -132,7 +195,14 @@ def _encoder(in_features: int, dim: int) -> LinearEncoder.Config:
     )
 
 
-def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Config:
+def _attention(
+    *,
+    dim: int,
+    n_head: int,
+    dropout: float,
+    is_causal: bool = True,
+    causal_block_size: int = 1,
+) -> PathSelfAttention.Config:
     head_dim = dim // n_head
     return PathSelfAttention.Config(
         norm=LayerNorm.Config(normalized_shape=dim),
@@ -144,6 +214,8 @@ def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Co
         n_head=n_head,
         head_dim=head_dim,
         dropout=dropout,
+        is_causal=is_causal,
+        causal_block_size=causal_block_size,
     )
 
 
