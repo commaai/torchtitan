@@ -32,7 +32,7 @@ def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
 
 # some micro optimizations can be made but not worth it for now
 # desire is never -1 in runtime, se we can drop the unknown_desire_embedding code path
-# there are some Unsqueeze -> Gather that can be bipassed (traffic, action_t)
+# there are some Unsqueeze -> Gather that can be bipassed (traffic_convention, action_t)
 class Supercombo(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
