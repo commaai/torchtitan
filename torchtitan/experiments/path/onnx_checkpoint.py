@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from xx.ml_tools.constants.model import ModelInputs
 from xx.training.lib.onnx_helpers import add_onnx_metadata, patch_depthwise_convs
 
 import onnx
@@ -19,6 +18,7 @@ from torchtitan.components import fs
 from torchtitan.components.onnx_checkpoint import _ONNX_DTYPE_MAP, OnnxCheckpointManager
 
 from .model import PathModel
+from .model_constants import ModelInputs
 
 
 class _VisionOnnxModel(nn.Module):

@@ -9,32 +9,61 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.tokenizer import BaseTokenizer
 
+from .model_constants import FRAME_TYPE, N_FRAMES, SUPERCOMBO_FPS, VisionFrameType
+
 
 class PathDataLoader(BaseDataLoader):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
-        split: str
-        shuffle_size: int
-        min_mixing: float
-        num_writers: int
-        num_readers: int
-        fps: int
-        pipeline_dir: str
-        plan_only: bool
-        limit: int | None
-        deterministic_fidxs: bool
-        n_frames: int
-        rgb: bool
-        unvision: bool
-        skip: int
-        val_skip: int
+        dataset: str
+        split: Literal["train", "val"]
+        pipeline_dir: str | None = None
+        shuffle_size: int = 8_000
+        min_mixing: float = 0.5
+        num_writers: int = 6
+        num_readers: int = 1
+        fps: int = SUPERCOMBO_FPS
+        plan_only: bool = False
+        limit: int | None = 2_500_000
+        deterministic_fidxs: bool = False
+        n_frames: int = N_FRAMES
+        rgb: bool = FRAME_TYPE is VisionFrameType.RGB
+        unvision: bool = False
+        skip: int = 1
+        val_skip: int = 1
+
+    def _build_dataset(
+        self,
+        config: Config,
+        *,
+        val: bool,
+    ) -> Any:
+        from .comma1m_dataset import COMMA1M_REPO_ID
+
+        if config.dataset == COMMA1M_REPO_ID:
+            from .comma1m_dataset import Comma1MDataset
+
+            return Comma1MDataset(config, val, self.local_rank, self.dp_rank, self.dp_world_size)
+
+        if config.pipeline_dir is None:
+            raise ValueError("pipeline_dir is required for internal PATH datasets")
+
+        from xx.training.path.dataloader import get_dataset
+
+        return get_dataset(
+            config,
+            val=val,
+            local_rank=self.local_rank,
+            global_rank=self.dp_rank,
+            global_world_size=self.dp_world_size,
+        )
 
     def __init__(
         self,
@@ -64,35 +93,10 @@ class PathDataLoader(BaseDataLoader):
         val_shuffle_size = local_batch_size * validation_steps * self.local_world_size
         shuffle_size = val_shuffle_size if val else config.shuffle_size
 
-        from .comma1m_dataset import COMMA1M_REPO_ID
-
-        if config.dataset == COMMA1M_REPO_ID:
-            from .comma1m_dataset import Comma1MDataset
-
-            dataset = Comma1MDataset(config, val, self.local_rank, dp_rank, dp_world_size)
-        else:
-            from xx.training.path.config import DatasetConfig as XXPathDatasetConfig
-            from xx.training.path.dataloader import get_dataset as get_xx_dataset
-
-            xx_config = XXPathDatasetConfig(
-                bs=local_batch_size,
-                shuffle_size=str(config.shuffle_size),
-                val_shuffle_size=str(val_shuffle_size),
-                min_mixing=config.min_mixing,
-                num_writers=config.num_writers,
-                num_readers=config.num_readers,
-                fps=config.fps,
-                pipeline_dir=config.pipeline_dir,
-                plan_only=config.plan_only,
-                limit=config.limit,
-                deterministic_fidxs=config.deterministic_fidxs,
-                n_frames=config.n_frames,
-                rgb=config.rgb,
-                unvision=config.unvision,
-                skip=config.skip,
-                val_skip=config.val_skip,
-            )
-            dataset = get_xx_dataset(config.dataset, xx_config, val, self.local_rank, dp_rank, dp_world_size)
+        dataset = self._build_dataset(
+            config,
+            val=val,
+        )
         self.dataset = dataset
         loader_config = DataloaderConfig(
             bs=local_batch_size,
