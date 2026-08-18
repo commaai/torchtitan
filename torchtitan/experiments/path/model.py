@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from xx.ml_tools.constants.model import frame_constants_from_fps, ModelInputs, TEMPORAL_INPUTS
 
 import torch
 import torch.nn as nn
@@ -33,6 +32,7 @@ from torchtitan.protocols.module import Module, ModuleDict, ModuleList, Sequenti
 from torchtitan.tools.logging import logger
 
 from . import convnext
+from .model_constants import frame_constants_from_fps, ModelInputs, TEMPORAL_INPUTS, VisionFrameType
 
 
 @dataclass(frozen=True)
@@ -426,7 +426,7 @@ class PathModel(BaseModel):
     class Config(BaseModel.Config):
         n_frames_input: int
         input_frame_names: tuple[str, ...]
-        frame_type: str
+        frame_type: VisionFrameType
         vision: Vision.Config
         point_policy: Policy.Config
         temporal_policy: TemporalPolicy.Config
