@@ -5,9 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 from types import MethodType
+from xx.ml_tools.constants.model import ModelInputs
 
 import torch
-from xx.ml_tools.constants.model import ModelInputs
+
 from torchtitan.experiments.path.model import PathSelfAttention
 from torchtitan.experiments.path.model_config import model_config
 from .model import actor_config
@@ -29,6 +30,7 @@ def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
     scores = (q @ k.transpose(-2, -1)) * self.head_dim**-0.5
     x = (scores.masked_fill(~self._supercombo_mask, float("-inf")).softmax(-1) @ v).transpose(1, 2)
     return self.dropout(self.c_proj(x.reshape(b, t, self.n_head * self.head_dim)))
+
 
 # some micro optimizations can be made but not worth it for now
 # desire is never -1 in runtime, se we can drop the unknown_desire_embedding code path

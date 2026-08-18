@@ -41,9 +41,7 @@ class DeviceMemoryMonitor:
         self.device = torch.device(device)  # device object
         self.device_name = device_module.get_device_name(self.device)
         self.device_index = device_module.current_device()
-        self.device_capacity = device_module.get_device_properties(
-            self.device
-        ).total_memory
+        self.device_capacity = device_module.get_device_properties(self.device).total_memory
         self.device_capacity_gib = self._to_gib(self.device_capacity)
 
         device_module.reset_peak_memory_stats()
@@ -73,9 +71,7 @@ class DeviceMemoryMonitor:
         num_ooms = device_info.get("num_ooms", -1)
 
         if num_retries > 0:
-            logger.warning(
-                f"{num_retries} {device_type.upper()} memory allocation retries."
-            )
+            logger.warning(f"{num_retries} {device_type.upper()} memory allocation retries.")
         if num_ooms > 0:
             logger.warning(f"{num_ooms} {device_type.upper()} OOM errors thrown.")
 
@@ -108,9 +104,7 @@ class BaseLogger:
         pass
 
     def write_report(self, data: Any, step: int, name: str, output_type: str) -> None:
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support write_report"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support write_report")
 
     def close(self) -> None:
         pass
@@ -168,10 +162,7 @@ class WandBLogger(BaseLogger):
         logger.info("WandB logging enabled")
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
-        wandb_metrics = {
-            (k if self.tag is None else f"{self.tag}/{k}"): v
-            for k, v in metrics.items()
-        }
+        wandb_metrics = {(k if self.tag is None else f"{self.tag}/{k}"): v for k, v in metrics.items()}
         self.wandb.log(wandb_metrics, step=step)
 
     def close(self) -> None:
@@ -193,9 +184,7 @@ class ReporterV2Logger(BaseLogger):
             raise ValueError("REPORTERV2_HOST must be set to use ReporterV2 logging")
         training_id = os.getenv("REPORTERV2_TRAINING_ID")
         if not training_id:
-            raise ValueError(
-                "REPORTERV2_TRAINING_ID must be set to use ReporterV2 logging"
-            )
+            raise ValueError("REPORTERV2_TRAINING_ID must be set to use ReporterV2 logging")
         from reporterv2 import ReporterV2
 
         reporter_config = dict(config_dict or {})
@@ -204,11 +193,7 @@ class ReporterV2Logger(BaseLogger):
             metrics_config = {}
         self.save_freq = int(metrics_config.get("save_freq", 1))
         model_spec = reporter_config.get("model_spec", {})
-        model_name = (
-            model_spec.get("name", "torchtitan")
-            if isinstance(model_spec, dict)
-            else "torchtitan"
-        )
+        model_name = model_spec.get("name", "torchtitan") if isinstance(model_spec, dict) else "torchtitan"
         reporter_config["training_id"] = training_id
         reporter_config["reporterv2_host"] = host
         reporter_config.setdefault("trainer", model_name)
@@ -269,9 +254,7 @@ class LoggerContainer(BaseLogger):
             logger_instance.close()
 
 
-def ensure_pp_loss_visible(
-    *, parallel_dims: ParallelDims, pp_schedule: str, color: Color | NoColor
-) -> None:
+def ensure_pp_loss_visible(*, parallel_dims: ParallelDims, pp_schedule: str, color: Color | NoColor) -> None:
     """
     Ensures that the loss is visible on the console for pipeline-parallel training.
 
@@ -424,9 +407,7 @@ class MetricsProcessor(Configurable):
         # used for colorful printing
         self.color = utils.NoColor() if config.disable_color_printing else utils.Color()
 
-        self.gpu_peak_flops = utils.get_peak_flops(
-            self.device_memory_monitor.device_name
-        )
+        self.gpu_peak_flops = utils.get_peak_flops(self.device_memory_monitor.device_name)
         self.ntokens_since_last_log = 0
         self.data_loading_times = []
         self.time_last_log = time.perf_counter()
@@ -465,23 +446,15 @@ class MetricsProcessor(Configurable):
         )
 
         # Check if any logging backend is enabled
-        has_logging_enabled = (
-            config.enable_tensorboard
-            or config.enable_wandb
-            or config.enable_reporterv2
-        )
+        has_logging_enabled = config.enable_tensorboard or config.enable_wandb or config.enable_reporterv2
 
         # Determine if this rank should log
         should_log = has_logging_enabled
         if (not config.save_for_all_ranks) and should_log:
-            metrics_rank = _get_metrics_rank(
-                parallel_dims=parallel_dims, pp_schedule=pp_schedule
-            )
+            metrics_rank = _get_metrics_rank(parallel_dims=parallel_dims, pp_schedule=pp_schedule)
             should_log = torch.distributed.get_rank() == metrics_rank
 
-        logger.debug(
-            f"Logging decision: has_logging_enabled={has_logging_enabled}, should_log={should_log}"
-        )
+        logger.debug(f"Logging decision: has_logging_enabled={has_logging_enabled}, should_log={should_log}")
 
         if not should_log:
             logger.debug("Returning BaseLogger due to should_log=False")
@@ -501,9 +474,7 @@ class MetricsProcessor(Configurable):
             )
 
         if config.save_for_all_ranks:
-            base_log_dir = os.path.join(
-                base_log_dir, f"rank_{torch.distributed.get_rank()}"
-            )
+            base_log_dir = os.path.join(base_log_dir, f"rank_{torch.distributed.get_rank()}")
 
         # Create logger container
         logger_container = LoggerContainer()
@@ -512,9 +483,7 @@ class MetricsProcessor(Configurable):
         if config.enable_wandb:
             logger.debug("Attempting to create WandB logger")
             try:
-                wandb_logger = WandBLogger(
-                    base_log_dir, config_dict=config_dict, tag=tag
-                )
+                wandb_logger = WandBLogger(base_log_dir, config_dict=config_dict, tag=tag)
                 logger_container.add_logger(wandb_logger)
             except Exception as e:
                 if "No module named 'wandb'" in str(e):
@@ -573,9 +542,7 @@ class MetricsProcessor(Configurable):
         time_delta = time.perf_counter() - self.time_last_log
 
         # tokens per second per device, abbreviated as tps
-        tps = self.ntokens_since_last_log / (
-            time_delta * self.parallel_dims.non_data_parallel_size
-        )
+        tps = self.ntokens_since_last_log / (time_delta * self.parallel_dims.non_data_parallel_size)
         # model FLOPS utilization
         # For its definition and calculation, please refer to the PaLM paper:
         # https://arxiv.org/abs/2204.02311
@@ -635,17 +602,13 @@ class MetricsProcessor(Configurable):
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
 
-    def log_validation(
-        self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
-    ):
+    def log_validation(self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None):
         time_delta = time.perf_counter() - self.time_last_log
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
         # tokens per second per device, abbreviated as tps
-        tps = self.ntokens_since_last_log / (
-            time_delta * self.parallel_dims.non_data_parallel_size
-        )
+        tps = self.ntokens_since_last_log / (time_delta * self.parallel_dims.non_data_parallel_size)
 
         metrics = {
             "validation_metrics/loss": loss,

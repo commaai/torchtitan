@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Any, cast
 
 from xx.ml_tools.constants.model import ACTION_LEN, ModelInputs
