@@ -30,15 +30,28 @@ def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
     x = (scores.masked_fill(~self._supercombo_mask, float("-inf")).softmax(-1) @ v).transpose(1, 2)
     return self.dropout(self.c_proj(x.reshape(b, t, self.n_head * self.head_dim)))
 
-
+# some micro optimizations can be made but not worth it for now
+# desire is never -1 in runtime, se we can drop the unknown_desire_embedding code path
+# there are some Unsqueeze -> Gather that can be bipassed (traffic, action_t)
 class Supercombo(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         config = model_config()
+        config.temporal_policy.temporal_summarizer.dense_training_outputs = False
         self.vision = config.vision.build()
         self.point_policy = config.point_policy.build()
         self.off_policy = config.temporal_policy.build()
         self.on_policy = actor_config().build()
+        output_size = self.vision.config.vision_features + sum(
+            hydra.final_layer[name].out_features
+            for hydra, names in (
+                (self.point_policy.hydra, VISION_OUTPUT_ORDER),
+                (self.off_policy.temporal_hydra, OFF_POLICY_OUTPUT_ORDER),
+                (self.on_policy.temporal_hydra, ON_POLICY_OUTPUT_ORDER),
+            )
+            for name in names
+        )
+        self.register_buffer("pad", torch.zeros(1, -output_size % 4), persistent=False)
         for policy in (self.off_policy, self.on_policy):
             for layer in policy.temporal_summarizer.transformer.layers:
                 attention = layer.attention
@@ -59,9 +72,6 @@ class Supercombo(torch.nn.Module):
                 inputs[ModelInputs.TRAFFIC][:, None],
                 inputs[ModelInputs.ACTION_T][:, None],
             )
-            for name in names:
-                value = policy_outputs[name]
-                outputs[name] = value[:, -1] if value.ndim == 3 else value
+            outputs.update({name: policy_outputs[name] for name in names})
         outputs["hidden_state"] = current.detach()
-        output = torch.cat([outputs[name] for name in OUTPUT_ORDER], dim=1)
-        return torch.nn.functional.pad(output, (0, -output.shape[1] % 4))
+        return torch.cat([outputs[name] for name in OUTPUT_ORDER] + [self.pad], dim=1)
