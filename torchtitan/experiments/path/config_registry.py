@@ -8,16 +8,9 @@ from __future__ import annotations
 
 import os
 from functools import partial
+from typing import Literal
+
 from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TEST_5K_LIST_TAGGED, DEFAULT_TRAIN_LIST
-from xx.ml_tools.constants.model import (
-    frame_constants_from_fps,
-    FRAME_TYPE,
-    ModelInputs,
-    N_FRAMES,
-    SUPERCOMBO_FPS,
-    TEMPORAL_INPUTS,
-)
-from xx.training.path.config import DatasetConfig as XXPathDatasetConfig
 
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
@@ -31,6 +24,14 @@ from .dataset import PathDataLoader
 from .loss import PathLoss
 from .model import parallelize_path
 from .model_config import model_config as _model_config
+from .model_constants import (
+    frame_constants_from_fps,
+    FRAME_TYPE,
+    ModelInputs,
+    N_FRAMES,
+    SUPERCOMBO_FPS,
+    TEMPORAL_INPUTS,
+)
 from .onnx_checkpoint import PathOnnxCheckpointManager
 from .trainer import PathTrainer
 from .validate import PathValidator
@@ -153,7 +154,7 @@ def _path(flavor: str) -> PathTrainer.Config:
 def _dataloader_config(
     *,
     dataset: str,
-    split: str,
+    split: Literal["train", "val"],
     fps: int,
     plan_only: bool,
     limit: int | None,
@@ -162,31 +163,16 @@ def _dataloader_config(
     skip: int,
     val_skip: int,
 ) -> PathDataLoader.Config:
-    base = XXPathDatasetConfig(
-        fps=fps,
-        plan_only=plan_only,
-        limit=limit,
-        pipeline_dir=pipeline_dir,
-        skip=skip,
-        val_skip=val_skip,
-    )
     return PathDataLoader.Config(
         dataset=dataset,
         split=split,
-        shuffle_size=_si_int(base.shuffle_size),
         deterministic_fidxs=deterministic_fidxs,
-        min_mixing=base.min_mixing,
-        num_writers=base.num_writers,
-        num_readers=base.num_readers,
-        fps=base.fps,
-        pipeline_dir=base.pipeline_dir,
-        plan_only=base.plan_only,
-        limit=base.limit,
-        n_frames=base.n_frames,
-        rgb=base.rgb,
-        unvision=base.unvision,
-        skip=base.skip,
-        val_skip=base.val_skip,
+        fps=fps,
+        pipeline_dir=pipeline_dir,
+        plan_only=plan_only,
+        limit=limit,
+        skip=skip,
+        val_skip=val_skip,
     )
 
 
@@ -228,12 +214,6 @@ def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnx
         vision_input_names=vision_input_names,
         temporal_policy_input_names=temporal_policy_input_names,
     )
-
-
-def _si_int(value: str | int) -> int:
-    suffixes = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
-    value = str(value).strip().lower()
-    return int(float(value[:-1]) * suffixes[value[-1]]) if value[-1] in suffixes else int(value)
 
 
 def _optimizer_config() -> OptimizersContainer.Config:
