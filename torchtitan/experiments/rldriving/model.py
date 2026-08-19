@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import copy
-import math
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -23,6 +22,12 @@ from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP,
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
+from torchtitan.experiments.path.model_config import (
+    TEMPORAL_HEADS,
+    _hydra,
+    _mlp,
+    temporal_policy_config,
+)
 from torchtitan.experiments.path.model import (
     Hydra,
     LinearEncoder,
@@ -31,14 +36,13 @@ from torchtitan.experiments.path.model import (
     TemporalPolicy,
     TemporalSummarizer,
 )
-from torchtitan.experiments.path.model_config import TEMPORAL_HEADS, temporal_policy_config
-from torchtitan.models.common import LayerNorm, Linear
+from torchtitan.models.common import Linear
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 
 
-# B: batch, T: temporal steps, D: model width, A: action components.
+# B: batch, T: temporal steps, S: spatial tokens, D: model width, A: action components.
 ACTION_HEAD_NAME = "action"
 Q_HEAD_NAME = "q"
 
@@ -76,10 +80,10 @@ class Critic(Module):
         self.q_hydra = config.q_hydra.build()
 
     def forward(self, inputs: TemporalInputs, action: torch.Tensor) -> torch.Tensor:
-        features_BTD = inputs[ModelInputs.FEATURES]
-        dtype = features_BTD.dtype
+        features_BTSD = inputs[ModelInputs.FEATURES]
+        dtype = features_BTSD.dtype
         critic_features_BD = self.temporal_summarizer(
-            features_BTD[:, self.history_idxs],
+            features_BTSD[:, self.history_idxs],
             inputs[ModelInputs.DESIRE].to(dtype),
             inputs[ModelInputs.TRAFFIC][:, -1].to(dtype),
             inputs[ModelInputs.ACTION_T][:, -1].to(dtype),
@@ -97,15 +101,7 @@ def actor_config() -> TemporalPolicy.Config:
 
 
 def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
-    dim = actor.temporal_summarizer.pos_embedding.embedding_dim
-    hidden = 256 * math.ceil(2 * dim / 256)
-    post_action_mlp = PathMLP.Config(
-        norm=LayerNorm.Config(normalized_shape=dim),
-        c_fc=Linear.Config(in_features=dim, out_features=hidden, bias=False),
-        c_proj=Linear.Config(in_features=hidden, out_features=dim, bias=False),
-        act="gelu_tanh",
-        dropout=0.0,
-    )
+    dim = actor.temporal_summarizer.temporal_pos_embedding.embedding_dim
     return Critic.Config(
         temporal_summarizer=copy.deepcopy(actor.temporal_summarizer),
         history_idxs=actor.history_idxs,
@@ -113,14 +109,9 @@ def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
             in_layer=Linear.Config(in_features=ACTION_LEN, out_features=dim, bias=True),
             out_layer=Linear.Config(in_features=dim, out_features=dim, bias=False),
         ),
-        post_action_mlp1=post_action_mlp,
-        post_action_mlp2=copy.deepcopy(post_action_mlp),
-        q_hydra=Hydra.Config(
-            heads=(PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),),
-            head_mlps={},
-            final_layers={Q_HEAD_NAME: Linear.Config(in_features=dim, out_features=1, bias=True)},
-            scale_layers={},
-        ),
+        post_action_mlp1=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
+        post_action_mlp2=_mlp(dim, mlp_mult=2, bias=False, dropout=0.0),
+        q_hydra=_hydra((PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),), in_features=dim, mlp_mult=2),
     )
 
 
@@ -199,7 +190,8 @@ class RLDrivingModel(BaseModel):
             ModelInputs.FEATURES: (
                 batch_size,
                 temporal_len,
-                summarizer.pos_embedding.embedding_dim,
+                summarizer.spatial_size,
+                summarizer.temporal_pos_embedding.embedding_dim,
             ),
             ModelInputs.DESIRE: (batch_size, temporal_len, desire_dim),
             ModelInputs.TRAFFIC: (
@@ -262,7 +254,7 @@ def parallelize_rldriving(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: CompileConfig,
-    ac_config: ActivationCheckpointingConfig,
+    ac_config: ActivationCheckpointingConfig | None,
     dump_folder: str,
 ) -> RLDrivingModel:
     if compile_config.enable and "model" in compile_config.components:
