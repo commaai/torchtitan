@@ -54,17 +54,19 @@ class Supercombo(torch.nn.Module):
         )
         self.register_buffer("pad", torch.zeros(1, -output_size % 4), persistent=False)
         for policy in (self.off_policy, self.on_policy):
-            for layer in policy.temporal_summarizer.transformer.layers:
+            summarizer = policy.temporal_summarizer
+            # tokens are time-major (t * spatial); attend within the frame and causally across frames
+            n_tokens = summarizer.temporal_size * summarizer.spatial_size
+            for layer in summarizer.transformer.layers:
                 attention = layer.attention
-                mask = torch.ones(
-                    1, 1, policy.temporal_summarizer.block_size, policy.temporal_summarizer.block_size, dtype=torch.bool
-                )
-                attention.register_buffer("_supercombo_mask", mask.tril(), persistent=False)
+                frame_idx = torch.arange(n_tokens) // attention.causal_block_size
+                mask = (frame_idx[:, None] >= frame_idx[None, :]).view(1, 1, n_tokens, n_tokens)
+                attention.register_buffer("_supercombo_mask", mask, persistent=False)
                 attention.forward = MethodType(_naive_attention, attention)
 
     def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
-        current = self.vision(inputs)
-        features = torch.cat((inputs["features_buffer"], current[:, None]), dim=1)
+        current = self.vision(inputs)  # (1, S, C)
+        features = torch.cat((inputs["features_buffer"], current[:, None]), dim=1)  # (1, T, S, C)
         outputs = self.point_policy(current)
         for policy, names in ((self.off_policy, OFF_POLICY_OUTPUT_ORDER), (self.on_policy, ON_POLICY_OUTPUT_ORDER)):
             policy_outputs = policy(
@@ -74,5 +76,5 @@ class Supercombo(torch.nn.Module):
                 inputs[ModelInputs.ACTION_T][:, None],
             )
             outputs.update({name: policy_outputs[name] for name in names})
-        outputs["hidden_state"] = current.detach()
+        outputs["hidden_state"] = current.detach().reshape(1, -1)
         return torch.cat([outputs[name] for name in OUTPUT_ORDER] + [self.pad], dim=1)
