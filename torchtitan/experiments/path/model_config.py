@@ -129,11 +129,7 @@ def temporal_policy_config(
             transformer=PathTransformer.Config(
                 layers=[
                     PathTransformerBlock.Config(
-                        attention=_attention(
-                            dim=vision_features,
-                            n_head=8,
-                            dropout=dropout,
-                        ),
+                        attention=_attention(dim=vision_features, n_head=8, dropout=dropout),
                         mlp=_mlp(vision_features, mlp_mult=2, bias=True, dropout=dropout),
                     )
                     for _ in range(4)
