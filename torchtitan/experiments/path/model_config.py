@@ -77,7 +77,18 @@ def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
                 transformer=PathTransformer.Config(
                     layers=[
                         PathTransformerBlock.Config(
-                            attention=_attention(dim=vision_features, n_head=8, dropout=0.0, is_causal=False),
+                            attention=PathSelfAttention.Config(
+                                norm=LayerNorm.Config(normalized_shape=vision_features),
+                                q_norm=LayerNorm.Config(normalized_shape=vision_features // 8),
+                                k_norm=LayerNorm.Config(normalized_shape=vision_features // 8),
+                                c_attn=Linear.Config(in_features=vision_features, out_features=3 * vision_features, bias=True),
+                                c_proj=Linear.Config(in_features=vision_features, out_features=vision_features, bias=True),
+                                inner_attention=ScaledDotProductAttention.Config(),
+                                n_head=8,
+                                head_dim=vision_features // 8,
+                                dropout=0.0,
+                                is_causal=False,
+                            ),
                             mlp=_mlp(vision_features, mlp_mult=2, bias=True, dropout=0.0),
                         )
                         for _ in range(2)
@@ -173,13 +184,7 @@ def _encoder(in_features: int, dim: int) -> LinearEncoder.Config:
     )
 
 
-def _attention(
-    *,
-    dim: int,
-    n_head: int,
-    dropout: float,
-    is_causal: bool = True,
-) -> PathSelfAttention.Config:
+def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Config:
     head_dim = dim // n_head
     return PathSelfAttention.Config(
         norm=LayerNorm.Config(normalized_shape=dim),
@@ -191,7 +196,6 @@ def _attention(
         n_head=n_head,
         head_dim=head_dim,
         dropout=dropout,
-        is_causal=is_causal,
     )
 
 
