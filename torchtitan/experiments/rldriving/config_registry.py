@@ -83,7 +83,7 @@ def rldriving() -> RLDrivingTrainer.Config:
         ),
         warm_start_checkpoint=os.getenv(
             "RLDRIVING_WARM_START_CHECKPOINT",
-            "44b83fa5-2a33-7ee7-40f1-e86e3c24ad36/56320",
+            "849a624a-8a7d-8946-bf04-86148e5e0ef8/44032",
         ),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=RLDrivingDataLoader.Config(
@@ -183,6 +183,7 @@ def _checkpoint_config(
         enable=True,
         checkpoint_base_folder=base_folder,
         export_onnx=True,
+        enable_first_step_checkpoint=True,
         folder=folder,
         interval=interval,
         input_names=list(input_shapes),

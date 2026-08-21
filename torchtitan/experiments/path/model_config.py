@@ -38,6 +38,7 @@ from .model_constants import (
     SPATIAL_SIZE,
     TEMPORAL_INPUTS,
     VISION_FEATURES,
+    VISION_GRID_SIZE,
 )
 
 
@@ -49,11 +50,7 @@ def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
     frame_constants = frame_constants_from_fps(n_frames=N_FRAMES, frame_type=FRAME_TYPE)
     input_frame_names = tuple(INPUT_FRAMES_NAMES)
     in_channels = sum(frame_constants["frame_shapes"][name][0] for name in input_frame_names)
-    grid_size = (
-        frame_constants["frame_shapes"][INPUT_FRAMES_NAMES[0]][-2] // 32,
-        frame_constants["frame_shapes"][INPUT_FRAMES_NAMES[0]][-1] // 32,
-    )
-    spatial_size = math.prod(grid_size)
+    grid_size = VISION_GRID_SIZE
 
     return PathModel.Config(
         n_frames_input=N_FRAMES,
@@ -73,20 +70,7 @@ def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
         point_policy=Policy.Config(
             summarizer=PointSummarizer.Config(
                 mlp1=_mlp(VISION_FEATURES, mlp_mult=2, bias=False, dropout=0.0),
-                transformer=PathTransformer.Config(
-                    layers=[
-                        PathTransformerBlock.Config(
-                            attention=_attention(dim=VISION_FEATURES, n_head=8, dropout=0.0, is_causal=False),
-                            mlp=_mlp(VISION_FEATURES, mlp_mult=2, bias=True, dropout=0.0),
-                        )
-                        for _ in range(2)
-                    ]
-                ),
-                pos_embedding=Embedding.Config(
-                    num_embeddings=spatial_size,
-                    embedding_dim=VISION_FEATURES,
-                ),
-                spatial_size=spatial_size,
+                mlp2=_mlp(VISION_FEATURES, mlp_mult=2, bias=False, dropout=0.0),
             ),
             hydra=_hydra(POINT_HEADS, in_features=VISION_FEATURES, mlp_mult=2),
         ),

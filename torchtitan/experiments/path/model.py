@@ -209,35 +209,19 @@ class SpatialUnvision(Module):
 
 
 class PointSummarizer(Module):
-
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         mlp1: PathMLP.Config
-        transformer: PathTransformer.Config
-        pos_embedding: Embedding.Config
-        spatial_size: int
+        mlp2: PathMLP.Config
 
     def __init__(self, config: Config):
         super().__init__()
-        self.spatial_size = config.spatial_size
-        self.n_features = config.pos_embedding.embedding_dim
         self.mlp1 = config.mlp1.build()
-        self.transformer = config.transformer.build()
-        self.pos_embedding = config.pos_embedding.build()
-        self.cls_token = nn.Parameter(torch.empty(1, 1, self.n_features))
-
-    def reset_parameters(self) -> None:
-        nn.init.normal_(self.cls_token, std=0.02)
+        self.mlp2 = config.mlp2.build()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.mlp1(x) + x
-        pos = self.pos_embedding(torch.arange(self.spatial_size, device=x.device))
-        x = x + pos
-        leading_shape = x.shape[:-2]
-        cls = self.cls_token.expand(*leading_shape, 1, -1)
-        x = torch.cat((cls, x), dim=-2).reshape(-1, self.spatial_size + 1, self.n_features)
-        x = self.transformer(x)
-        return x.reshape(*leading_shape, self.spatial_size + 1, self.n_features)[..., 0, :]
+        return self.mlp2(x) + x
 
 
 class LinearEncoder(Module):
@@ -277,7 +261,9 @@ class TemporalSummarizer(Module):
         self.spatial_size = config.spatial_size
         self.dense_training_outputs = config.dense_training_outputs
         if len(config.desire_window_starts) != self.temporal_size:
-            raise ValueError(f"Expected {self.temporal_size} desire window starts, got {len(config.desire_window_starts)}")
+            raise ValueError(
+                f"Expected {self.temporal_size} desire window starts, got {len(config.desire_window_starts)}"
+            )
         self.desire_window_len = config.desire_window_len
         self.desire_window_starts = config.desire_window_starts
         self.register_buffer("desire_window_idxs", self._make_desire_window_idxs(), persistent=False)
@@ -631,7 +617,7 @@ class PathModel(BaseModel):
         }
         features = self.vision(vision_inputs)
         features = rearrange(features, "(b t) s c -> b t s c", b=b, t=t)
-        outputs = self.point_policy(features) | self.temporal_policy(
+        outputs = self.point_policy(features.mean(dim=2)) | self.temporal_policy(
             features,
             inputs[ModelInputs.DESIRE],
             inputs[ModelInputs.TRAFFIC],

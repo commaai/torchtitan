@@ -198,7 +198,8 @@ class RLDrivingTrainer(Trainer):
 
     def prepare_batch(self, batch: Batch) -> PreparedBatch:
         inputs, targets, metadata = batch
-        inputs = {name: value.to(self.device) for name, value in inputs.items()}
+        # info is a serialized host-side column, not a model tensor.
+        inputs = {name: value.to(self.device) for name, value in inputs.items() if isinstance(value, torch.Tensor)}
         targets = {name: value.to(self.device) for name, value in targets.items()}
         metadata = {name: value.to(self.device) for name, value in metadata.items()}
         current_inputs = {name: inputs[name].float() for name in TEMPORAL_INPUTS}
@@ -215,7 +216,8 @@ class RLDrivingTrainer(Trainer):
         batch = next(data_iterator)
         info = batch[0].get("info")
         if info is not None:
-            self.unique_segment_counter.update(parse_info(value)["name"] for value in info.cpu().numpy())
+            info = info.cpu().numpy() if isinstance(info, torch.Tensor) else info
+            self.unique_segment_counter.update(parse_info(value)["name"] for value in info)
         current_inputs, next_inputs, targets, metadata = self.prepare_batch(batch)
         batch_size = next(iter(current_inputs.values())).shape[0]
         self.ntokens_seen += batch_size

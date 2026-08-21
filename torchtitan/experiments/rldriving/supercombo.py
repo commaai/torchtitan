@@ -43,7 +43,15 @@ class Supercombo(torch.nn.Module):
         self.point_policy = config.point_policy.build()
         self.off_policy = config.temporal_policy.build()
         self.on_policy = actor_config().build()
-        output_size = self.vision.config.vision_features + sum(
+        spatial_sizes = {
+            self.vision.config.grid_size[0] * self.vision.config.grid_size[1],
+            self.off_policy.temporal_summarizer.spatial_size,
+            self.on_policy.temporal_summarizer.spatial_size,
+        }
+        if len(spatial_sizes) != 1:
+            raise ValueError(f"Supercombo spatial sizes do not match: {sorted(spatial_sizes)}")
+        spatial_size = spatial_sizes.pop()
+        output_size = spatial_size * self.vision.config.vision_features + sum(
             hydra.final_layer[name].out_features
             for hydra, names in (
                 (self.point_policy.hydra, VISION_OUTPUT_ORDER),
@@ -54,18 +62,18 @@ class Supercombo(torch.nn.Module):
         )
         self.register_buffer("pad", torch.zeros(1, -output_size % 4), persistent=False)
         for policy in (self.off_policy, self.on_policy):
+            summarizer = policy.temporal_summarizer
+            n_tokens = summarizer.temporal_size * summarizer.spatial_size
             for layer in policy.temporal_summarizer.transformer.layers:
                 attention = layer.attention
-                mask = torch.ones(
-                    1, 1, policy.temporal_summarizer.block_size, policy.temporal_summarizer.block_size, dtype=torch.bool
-                )
+                mask = torch.ones(1, 1, n_tokens, n_tokens, dtype=torch.bool)
                 attention.register_buffer("_supercombo_mask", mask.tril(), persistent=False)
                 attention.forward = MethodType(_naive_attention, attention)
 
     def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
         current = self.vision(inputs)
         features = torch.cat((inputs["features_buffer"], current[:, None]), dim=1)
-        outputs = self.point_policy(current)
+        outputs = self.point_policy(current.mean(dim=1))
         for policy, names in ((self.off_policy, OFF_POLICY_OUTPUT_ORDER), (self.on_policy, ON_POLICY_OUTPUT_ORDER)):
             policy_outputs = policy(
                 features,
@@ -74,5 +82,5 @@ class Supercombo(torch.nn.Module):
                 inputs[ModelInputs.ACTION_T][:, None],
             )
             outputs.update({name: policy_outputs[name] for name in names})
-        outputs["hidden_state"] = current.detach()
+        outputs["hidden_state"] = current.detach().flatten(1)
         return torch.cat([outputs[name] for name in OUTPUT_ORDER] + [self.pad], dim=1)
