@@ -157,7 +157,6 @@ class PathTransformer(Module):
 
 
 class SpatialUnvision(Module):
-    """Training-only conv decoder from a spatial ConvNeXt token grid to two RGB views."""
 
     OUTPUT_SIZE = (128, 256)
     OUTPUT_CHANNELS = 6
@@ -198,7 +197,6 @@ class SpatialUnvision(Module):
 
 
 class PointSummarizer(Module):
-    """Collapse each spatial feature grid with a learned CLS token."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
