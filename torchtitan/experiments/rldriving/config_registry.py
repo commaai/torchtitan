@@ -183,7 +183,6 @@ def _checkpoint_config(
         enable=True,
         checkpoint_base_folder=base_folder,
         export_onnx=True,
-        enable_first_step_checkpoint=True,
         folder=folder,
         interval=interval,
         input_names=list(input_shapes),
