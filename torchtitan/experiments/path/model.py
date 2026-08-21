@@ -212,14 +212,10 @@ class TemporalSummarizer(Module):
         self.mlp1 = config.mlp1.build()
         self.mlp2 = config.mlp2.build()
         self.desire_encoder = config.desire_encoder.build()
-        self.unknown_desire_embedding = nn.Parameter(torch.empty(config.desire_encoder.out_layer.out_features))
         self.traffic_encoder = config.traffic_encoder.build()
         self.action_t_encoder = config.action_t_encoder.build()
         self.transformer = config.transformer.build()
         self.pos_embedding = config.pos_embedding.build()
-
-    def reset_parameters(self) -> None:
-        nn.init.zeros_(self.unknown_desire_embedding)
 
     def _make_desire_window_idxs(self, device: torch.device | None = None) -> torch.Tensor:
         starts = torch.tensor(self.desire_window_starts, dtype=torch.long, device=device)
@@ -234,12 +230,6 @@ class TemporalSummarizer(Module):
         desire = desire.index_select(1, self.desire_window_idxs)
         return desire.reshape(desire.shape[0], self.block_size, -1)
 
-    def _encode_desire(self, desire: torch.Tensor) -> torch.Tensor:
-        unknown = (desire < 0).any(dim=-1, keepdim=True)
-        encoded = self.desire_encoder(desire.clamp_min(0))
-        unknown_embedding = self.unknown_desire_embedding.to(dtype=encoded.dtype)
-        return torch.where(unknown, unknown_embedding, encoded)
-
     def forward(
         self,
         feats: torch.Tensor,
@@ -249,7 +239,7 @@ class TemporalSummarizer(Module):
     ) -> torch.Tensor:
         feats = self.mlp1(feats) + feats
         feats = self.mlp2(feats) + feats
-        desire = self._encode_desire(self._window_desire(desire))
+        desire = self.desire_encoder(self._window_desire(desire))
         traffic_convention = rearrange(self.traffic_encoder(traffic_convention), "b c -> b () c")
         action_t = rearrange(self.action_t_encoder(action_t), "b c -> b () c")
         pos = self.pos_embedding(torch.arange(self.block_size, device=feats.device))
