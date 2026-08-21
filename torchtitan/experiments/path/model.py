@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from xx.training.lib.positional_embeddings import get_2d_sincos_pos_embed
 
 import torch
 import torch.nn as nn
@@ -198,17 +197,15 @@ class SpatialUnvision(Module):
             out_features=self.OUTPUT_CHANNELS * (self.patch_size[0] * self.patch_size[1]),
             bias=True,
         ).build()
-        self.register_buffer("pos_embedding", torch.empty(1, grid_h * grid_w, dim), persistent=True)
-
-    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
-        device = buffer_device if buffer_device is not None else self.pos_embedding.device
-        embedding = get_2d_sincos_pos_embed(self.N_EMBD, self.config.grid_size)
-        self.pos_embedding = torch.from_numpy(embedding).to(device=device, dtype=torch.float32).unsqueeze(0)
+        self.pos_embedding = Embedding.Config(
+            num_embeddings=grid_h * grid_w,
+            embedding_dim=dim,
+        ).build()
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         grid_h, grid_w = self.config.grid_size
         tokens = self.input_norm(self.input_projection(features))
-        tokens = tokens + self.pos_embedding.to(tokens.dtype)
+        tokens = tokens + self.pos_embedding(torch.arange(grid_h * grid_w, device=features.device))
         tokens = self.output_projection(self.output_norm(self.transformer(tokens)))
         patch_h, patch_w = self.patch_size
         images = rearrange(
