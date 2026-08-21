@@ -76,18 +76,7 @@ def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
                 transformer=PathTransformer.Config(
                     layers=[
                         PathTransformerBlock.Config(
-                            attention=PathSelfAttention.Config(
-                                norm=LayerNorm.Config(normalized_shape=VISION_FEATURES),
-                                q_norm=LayerNorm.Config(normalized_shape=VISION_FEATURES // 8),
-                                k_norm=LayerNorm.Config(normalized_shape=VISION_FEATURES // 8),
-                                c_attn=Linear.Config(in_features=VISION_FEATURES, out_features=3 * VISION_FEATURES, bias=True),
-                                c_proj=Linear.Config(in_features=VISION_FEATURES, out_features=VISION_FEATURES, bias=True),
-                                inner_attention=ScaledDotProductAttention.Config(),
-                                n_head=8,
-                                head_dim=VISION_FEATURES // 8,
-                                dropout=0.0,
-                                is_causal=False,
-                            ),
+                            attention=_attention(dim=VISION_FEATURES, n_head=8, dropout=0.0, is_causal=False),
                             mlp=_mlp(VISION_FEATURES, mlp_mult=2, bias=True, dropout=0.0),
                         )
                         for _ in range(2)
@@ -182,7 +171,7 @@ def _encoder(in_features: int, dim: int) -> LinearEncoder.Config:
     )
 
 
-def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Config:
+def _attention(*, dim: int, n_head: int, dropout: float, is_causal: bool = True) -> PathSelfAttention.Config:
     head_dim = dim // n_head
     return PathSelfAttention.Config(
         norm=LayerNorm.Config(normalized_shape=dim),
@@ -194,6 +183,7 @@ def _attention(*, dim: int, n_head: int, dropout: float) -> PathSelfAttention.Co
         n_head=n_head,
         head_dim=head_dim,
         dropout=dropout,
+        is_causal=is_causal,
     )
 
 
