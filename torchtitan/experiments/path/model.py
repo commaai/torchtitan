@@ -10,7 +10,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
@@ -94,14 +93,12 @@ class PathSelfAttention(Module):
         head_dim: int
         dropout: float
         is_causal: bool = True
-        causal_block_size: int = 1
 
     def __init__(self, config: Config):
         super().__init__()
         self.n_head = config.n_head
         self.head_dim = config.head_dim
         self.is_causal = config.is_causal
-        self.causal_block_size = config.causal_block_size
         self.norm = config.norm.build()
         self.q_norm = config.q_norm.build() if config.q_norm is not None else nn.Identity()
         self.k_norm = config.k_norm.build() if config.k_norm is not None else nn.Identity()
@@ -115,15 +112,8 @@ class PathSelfAttention(Module):
         qkv = self.c_attn(self.norm(x)).view(b, t, 3, self.n_head, self.head_dim)
         q, k, v = qkv.unbind(2)
         q, k = self.q_norm(q), self.k_norm(k)
-        if self.is_causal and self.causal_block_size > 1:
-            # Tokens are time-major. Let every spatial token attend within its frame
-            # while retaining causal attention between frames.
-            frame_idx = torch.arange(t, device=x.device) // self.causal_block_size
-            attention_mask = frame_idx[:, None] >= frame_idx[None, :]
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask).transpose(1, 2)
-        else:
-            x = self.inner_attention(q, k, v, is_causal=self.is_causal)
+        # slightly weird to do causal instead of block_causal for spatial tokens
+        x = self.inner_attention(q, k, v, is_causal=self.is_causal)
         return self.dropout(self.c_proj(x.reshape(b, t, self.n_head * self.head_dim)))
 
 

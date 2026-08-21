@@ -133,7 +133,6 @@ def temporal_policy_config(
                             dim=vision_features,
                             n_head=8,
                             dropout=dropout,
-                            causal_block_size=spatial_size,
                         ),
                         mlp=_mlp(vision_features, mlp_mult=2, bias=True, dropout=dropout),
                     )
@@ -201,7 +200,6 @@ def _attention(
     n_head: int,
     dropout: float,
     is_causal: bool = True,
-    causal_block_size: int = 1,
 ) -> PathSelfAttention.Config:
     head_dim = dim // n_head
     return PathSelfAttention.Config(
@@ -215,7 +213,6 @@ def _attention(
         head_dim=head_dim,
         dropout=dropout,
         is_causal=is_causal,
-        causal_block_size=causal_block_size,
     )
 
 
