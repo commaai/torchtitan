@@ -35,24 +35,14 @@ from .model_constants import (
     INPUT_FRAMES_NAMES,
     ModelInputs,
     N_FRAMES,
+    SPATIAL_SIZE,
     TEMPORAL_INPUTS,
+    VISION_FEATURES,
 )
 
 
-VISION_FEATURES = 512
-VISION_OUTPUT_STRIDE = 32
-
 POINT_HEADS = tuple(META_HEADS + POSE_HEADS)
 TEMPORAL_HEADS = tuple(DRIVING_HEADS + TEMPORAL_META_HEADS)
-
-
-def _vision_grid_size(frame_constants: dict) -> tuple[int, int]:
-    height, width = frame_constants["frame_shapes"][INPUT_FRAMES_NAMES[0]][-2:]
-    return height // VISION_OUTPUT_STRIDE, width // VISION_OUTPUT_STRIDE
-
-
-def _spatial_size(frame_constants: dict) -> int:
-    return math.prod(_vision_grid_size(frame_constants))
 
 
 def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
@@ -60,7 +50,10 @@ def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
     frame_constants = frame_constants_from_fps(n_frames=N_FRAMES, frame_type=FRAME_TYPE)
     input_frame_names = tuple(INPUT_FRAMES_NAMES)
     in_channels = sum(frame_constants["frame_shapes"][name][0] for name in input_frame_names)
-    grid_size = _vision_grid_size(frame_constants)
+    grid_size = (
+        frame_constants["frame_shapes"][INPUT_FRAMES_NAMES[0]][-2] // 32,
+        frame_constants["frame_shapes"][INPUT_FRAMES_NAMES[0]][-1] // 32,
+    )
     spatial_size = math.prod(grid_size)
 
     return PathModel.Config(
@@ -115,7 +108,7 @@ def temporal_policy_config(
     desire_window_len = frame_constants["desire_window_len"]
     desire_window_starts = tuple(index - history_idxs[0] for index in history_idxs)
     block_size = len(history_idxs)
-    spatial_size = _spatial_size(frame_constants)
+    spatial_size = SPATIAL_SIZE
     return TemporalPolicy.Config(
         temporal_summarizer=TemporalSummarizer.Config(
             mlp1=_mlp(vision_features, mlp_mult=2, bias=False, dropout=0.0),

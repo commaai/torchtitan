@@ -23,7 +23,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from .dataset import PathDataLoader
 from .loss import PathLoss
 from .model import parallelize_path
-from .model_config import model_config as _model_config, VISION_FEATURES, _spatial_size
+from .model_config import model_config as _model_config
 from .model_constants import (
     frame_constants_from_fps,
     FRAME_TYPE,
@@ -179,7 +179,6 @@ def _dataloader_config(
 def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnxCheckpointManager.Config:
     frame_constants = frame_constants_from_fps(n_frames=N_FRAMES, frame_type=FRAME_TYPE)
     temporal_len = frame_constants["temporal_len"]
-    spatial_size = _spatial_size(frame_constants)
     vision_input_names = [ModelInputs.IMG, ModelInputs.BIG_IMG]
     temporal_policy_input_names = [
         ModelInputs.FEATURES,
@@ -194,7 +193,7 @@ def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnx
     input_shapes = [
         [1, *frame_constants["frame_shapes"][ModelInputs.IMG]],
         [1, *frame_constants["frame_shapes"][ModelInputs.BIG_IMG]],
-        [1, temporal_len, spatial_size, VISION_FEATURES],
+        [1, temporal_len, *TEMPORAL_INPUTS[ModelInputs.FEATURES]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.DESIRE][0]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.ACTION_T][0]],
