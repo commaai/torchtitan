@@ -37,11 +37,11 @@ from .trainer import PathTrainer
 from .validate import PathValidator
 
 
-def model_registry(flavor: str, *, unvision: bool = False) -> ModelSpec:
+def model_registry(flavor: str) -> ModelSpec:
     return ModelSpec(
         name="path",
         flavor=flavor,
-        model=_model_config(flavor, unvision=unvision),
+        model=_model_config(flavor),
         parallelize_fn=parallelize_path,
         pipelining_fn=None,
         post_optimizer_build_fn=None,
@@ -56,7 +56,7 @@ def _dp_degrees() -> tuple[int, int]:
     return num_nodes, local_world_size
 
 
-def _path(flavor: str, *, unvision: bool = False) -> PathTrainer.Config:
+def _path(flavor: str) -> PathTrainer.Config:
     steps = 1024 * 55
     validation_freq = 1024
     reports = {
@@ -80,7 +80,7 @@ def _path(flavor: str, *, unvision: bool = False) -> PathTrainer.Config:
     plan_only = False
     return PathTrainer.Config(
         loss=PathLoss.Config(),
-        model_spec=model_registry(flavor, unvision=unvision),
+        model_spec=model_registry(flavor),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=_dataloader_config(
             dataset=DEFAULT_TRAIN_LIST,
@@ -92,7 +92,6 @@ def _path(flavor: str, *, unvision: bool = False) -> PathTrainer.Config:
             pipeline_dir=BASE_DIR_GT,
             skip=1,
             val_skip=1,
-            unvision=unvision,
         ),
         optimizer=_optimizer_config(),
         lr_scheduler=LRSchedulersContainer.Config(
@@ -144,7 +143,6 @@ def _path(flavor: str, *, unvision: bool = False) -> PathTrainer.Config:
                 pipeline_dir=BASE_DIR_GT,
                 skip=1,
                 val_skip=6,
-                unvision=unvision,
             ),
             mixed_precision_param=mixed_precision_param,
             reports=reports,
@@ -164,7 +162,6 @@ def _dataloader_config(
     pipeline_dir: str,
     skip: int,
     val_skip: int,
-    unvision: bool | None = None,
 ) -> PathDataLoader.Config:
     return PathDataLoader.Config(
         dataset=dataset,
@@ -176,7 +173,6 @@ def _dataloader_config(
         limit=limit,
         skip=skip,
         val_skip=val_skip,
-        unvision=unvision,
     )
 
 
@@ -250,4 +246,3 @@ convnext_quarterxxl = partial(_path, "convnext_quarterxxl")
 convnext_thirdxxl = partial(_path, "convnext_thirdxxl")
 convnext_base = partial(_path, "convnext_base")
 convnext_xxlarge = partial(_path, "convnext_xxlarge")
-convnext_xxlarge_unvision = partial(_path, "convnext_xxlarge", unvision=True)

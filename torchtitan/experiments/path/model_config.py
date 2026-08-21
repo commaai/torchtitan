@@ -55,7 +55,7 @@ def _spatial_size(frame_constants: dict) -> int:
     return math.prod(_vision_grid_size(frame_constants))
 
 
-def model_config(flavor: str = "convnext_xxlarge", *, unvision: bool = False) -> PathModel.Config:
+def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
     vision_features = VISION_FEATURES
     frame_constants = frame_constants_from_fps(n_frames=N_FRAMES, frame_type=FRAME_TYPE)
     input_frame_names = tuple(INPUT_FRAMES_NAMES)
@@ -99,7 +99,6 @@ def model_config(flavor: str = "convnext_xxlarge", *, unvision: bool = False) ->
             hydra=_hydra(POINT_HEADS, in_features=vision_features, mlp_mult=2),
         ),
         temporal_policy=temporal_policy_config(),
-        unvision=unvision,
         unvision_decoder=_spatial_unvision_config(in_features=vision_features, grid_size=grid_size),
     )
 

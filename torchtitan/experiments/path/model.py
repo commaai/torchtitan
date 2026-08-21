@@ -499,7 +499,6 @@ class PathModel(BaseModel):
         vision: Vision.Config
         point_policy: Policy.Config
         temporal_policy: TemporalPolicy.Config
-        unvision: bool
         unvision_decoder: SpatialUnvision.Config
 
         def update_from_config(self, *, config, **kwargs) -> None:
@@ -533,7 +532,7 @@ class PathModel(BaseModel):
         self.vision = config.vision.build()
         self.point_policy = config.point_policy.build()
         self.temporal_policy = config.temporal_policy.build()
-        self.unvision = config.unvision_decoder.build() if config.unvision else None
+        self.unvision = config.unvision_decoder.build()
 
     @staticmethod
     def input_shapes(
@@ -628,8 +627,7 @@ class PathModel(BaseModel):
             inputs[ModelInputs.TRAFFIC],
             inputs[ModelInputs.ACTION_T],
         )
-        if self.unvision is not None:
-            outputs |= self.unvision(features[:, -1])
+        outputs |= self.unvision(features[:, -1])
         return outputs
 
 
@@ -712,8 +710,7 @@ def _apply_compile(model: PathModel, compile_config: CompileConfig) -> None:
     model.vision.encoder.compile(backend=compile_config.backend)
     model.point_policy.compile(backend=compile_config.backend)
     model.temporal_policy.compile(backend=compile_config.backend)
-    if model.unvision is not None:
-        model.unvision.compile(backend=compile_config.backend)
+    model.unvision.compile(backend=compile_config.backend)
 
     logger.info("Compiling path model components with torch.compile")
 
