@@ -46,4 +46,5 @@ class PathLoss(BaseLoss):
         del global_valid_tokens
         pred = {k: v.float() if v.is_floating_point() else v for k, v in pred.items()}
         loss, losses = self.loss_fn(pred, targets)
-        return loss, losses | self.metric_fn(pred, targets)
+        metrics = losses | self.metric_fn(pred, targets)
+        return loss, {f"path/{name}": value for name, value in metrics.items() if name != "loss"}

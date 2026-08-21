@@ -164,7 +164,7 @@ class PathValidator(BaseValidator):
             samples = torch.as_tensor(total_samples, dtype=torch.float32, device=device)
             loss = float((torch.as_tensor(total_loss, dtype=torch.float32, device=device) / samples).item())
             extra_metrics = {
-                f"validation_metrics/path/{k}": float(
+                f"validation_metrics/{k}": float(
                     (torch.as_tensor(v, dtype=torch.float32, device=device) / samples).item()
                 )
                 for k, v in metric_sums.items()

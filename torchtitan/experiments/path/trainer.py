@@ -46,9 +46,6 @@ class PathTrainer(BaseTrainer):
             return ()
         return (name for name, _ in segment_names_and_fidxs_from_info(info))
 
-    def metric_name(self, name: str) -> str:
-        return f"path/{name}"
-
     def close(self) -> None:
         self.dataloader.close()
         if self.config.validator.enable:
