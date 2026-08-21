@@ -157,56 +157,44 @@ class PathTransformer(Module):
 
 
 class SpatialUnvision(Module):
-    """Training-only decoder from a spatial ConvNeXt token grid to two RGB views."""
+    """Training-only conv decoder from a spatial ConvNeXt token grid to two RGB views."""
 
     OUTPUT_SIZE = (128, 256)
     OUTPUT_CHANNELS = 6
-    N_EMBD = 256
-    N_HEAD = 8
-    N_LAYER = 4
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         in_features: int
         grid_size: tuple[int, int]
-        transformer: PathTransformer.Config
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
         grid_h, grid_w = config.grid_size
-        output_h, output_w = self.OUTPUT_SIZE
-        self.patch_size = (output_h // grid_h, output_w // grid_w)
-        dim = self.N_EMBD
-        self.input_projection = Linear.Config(in_features=config.in_features, out_features=dim, bias=True).build()
-        self.input_norm = LayerNorm.Config(normalized_shape=dim).build()
-        self.transformer = config.transformer.build()
-        self.output_norm = LayerNorm.Config(normalized_shape=dim).build()
-        self.output_projection = Linear.Config(
-            in_features=dim,
-            out_features=self.OUTPUT_CHANNELS * (self.patch_size[0] * self.patch_size[1]),
-            bias=True,
-        ).build()
-        self.pos_embedding = Embedding.Config(
-            num_embeddings=grid_h * grid_w,
-            embedding_dim=dim,
-        ).build()
+        dim = config.in_features
+        self.proj = nn.ConvTranspose2d(dim, dim, kernel_size=4, stride=2, padding=1, bias=False)
+        self.norm = nn.BatchNorm2d(dim, eps=0.001, momentum=0.01)
+        self.act = nn.ReLU(inplace=True)
+        self.upsample = nn.Sequential(
+            nn.ConvTranspose2d(dim, dim // 2, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(dim // 2, eps=0.001, momentum=0.01),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(dim // 2, dim // 4, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(dim // 4, eps=0.001, momentum=0.01),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(dim // 4, dim // 8, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(dim // 8, eps=0.001, momentum=0.01),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim // 8, self.OUTPUT_CHANNELS, 7, stride=1, padding=3),
+        )
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         grid_h, grid_w = self.config.grid_size
-        tokens = self.input_norm(self.input_projection(features))
-        tokens = tokens + self.pos_embedding(torch.arange(grid_h * grid_w, device=features.device))
-        tokens = self.output_projection(self.output_norm(self.transformer(tokens)))
-        patch_h, patch_w = self.patch_size
-        images = rearrange(
-            tokens,
-            "b (grid_h grid_w) (c patch_h patch_w) -> b c (grid_h patch_h) (grid_w patch_w)",
-            grid_h=grid_h,
-            grid_w=grid_w,
-            patch_h=patch_h,
-            patch_w=patch_w,
-        )
-        return {"imgs": ((images + 1.0) / 2.0) * 255.0}
+        # (b, s, c) -> (b, c, grid_h, grid_w)
+        x = features.transpose(1, 2).reshape(features.shape[0], -1, grid_h, grid_w)
+        x = self.act(self.norm(self.proj(x)))
+        x = self.upsample(x)
+        return {"imgs": ((x + 1.0) / 2.0) * 255.0}
 
 
 class PointSummarizer(Module):
@@ -715,9 +703,6 @@ def _apply_activation_checkpointing(
         wrap,
         "temporal_policy.temporal_summarizer.transformer",
     )
-    if model.unvision is not None:
-        model.unvision.transformer.apply_activation_checkpointing(wrap, "unvision.transformer")
-
     logger.info(f"Applied {mode} activation checkpointing to the path model")
 
 
@@ -729,6 +714,7 @@ def _apply_compile(model: PathModel, compile_config: CompileConfig) -> None:
     model.temporal_policy.compile(backend=compile_config.backend)
     if model.unvision is not None:
         model.unvision.compile(backend=compile_config.backend)
+
     logger.info("Compiling path model components with torch.compile")
 
 

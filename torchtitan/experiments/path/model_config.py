@@ -157,18 +157,9 @@ def _spatial_unvision_config(
     in_features: int,
     grid_size: tuple[int, int],
 ) -> SpatialUnvision.Config:
-    dim = SpatialUnvision.N_EMBD
-    layers = [
-        PathTransformerBlock.Config(
-            attention=_attention(dim=dim, n_head=SpatialUnvision.N_HEAD, dropout=0.0, is_causal=False),
-            mlp=_mlp(dim=dim, mlp_mult=8 / 3, bias=False, dropout=0.0),
-        )
-        for _ in range(SpatialUnvision.N_LAYER)
-    ]
     return SpatialUnvision.Config(
         in_features=in_features,
         grid_size=grid_size,
-        transformer=PathTransformer.Config(layers=layers),
     )
 
 
