@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from types import MethodType
-from xx.ml_tools.constants.model import ModelInputs
+from xx.ml_tools.constants.model import ModelInputs, SPATIAL_SIZE
 
 import torch
 
@@ -43,15 +43,7 @@ class Supercombo(torch.nn.Module):
         self.point_policy = config.point_policy.build()
         self.off_policy = config.temporal_policy.build()
         self.on_policy = actor_config().build()
-        spatial_sizes = {
-            self.vision.config.grid_size[0] * self.vision.config.grid_size[1],
-            self.off_policy.temporal_summarizer.spatial_size,
-            self.on_policy.temporal_summarizer.spatial_size,
-        }
-        if len(spatial_sizes) != 1:
-            raise ValueError(f"Supercombo spatial sizes do not match: {sorted(spatial_sizes)}")
-        spatial_size = spatial_sizes.pop()
-        output_size = spatial_size * self.vision.config.vision_features + sum(
+        output_size = SPATIAL_SIZE * self.vision.config.vision_features + sum(
             hydra.final_layer[name].out_features
             for hydra, names in (
                 (self.point_policy.hydra, VISION_OUTPUT_ORDER),
