@@ -23,26 +23,12 @@ class PathTrainer(BaseTrainer):
         loss: PathLoss.Config
         validator: PathValidator.Config
         checkpoint: PathOnnxCheckpointManager.Config
-        miniray: dict[str, Any] = field(default_factory=dict)
-        fps: int
-
-        def __post_init__(self) -> None:
-            BaseTrainer.Config.__post_init__(self)
-            if self.codedir:
-                self.miniray = {**self.miniray, "codedir": self.codedir}
-                self.validator.miniray = {
-                    **self.validator.miniray,
-                    "codedir": self.codedir,
-                }
 
     def __init__(self, config: Config):
         super().__init__(config)
         self.loss_fn.to(self.device)
 
     def close(self) -> None:
-        self.dataloader.close()
-        if self.config.validator.enable:
-            self.validator.close()
         super().close()
 
     def state_dict(self) -> dict[str, Any]:
