@@ -299,8 +299,8 @@ class TemporalSummarizer(Module):
         feats = self.mlp1(feats) + feats
         feats = self.mlp2(feats) + feats
         b, t, s, c = feats.shape
-        # Temporal attention sees every spatial token. Pool only after attention so
-        # each dense output retains one entry per frame for the existing heads/losses.
+        # Tokens are time-major. Under plain causal attention, the last spatial token
+        # of each frame is its readout because it has seen the complete frame context.
         feats = feats.reshape(b, t * s, c)
         desire = self.desire_encoder(self._window_desire(desire))
         desire = desire.repeat_interleave(s, dim=1)
@@ -312,8 +312,8 @@ class TemporalSummarizer(Module):
         x = feats + rearrange(pos, "ts c -> () ts c") + desire + traffic_convention + action_t
         x = self.transformer(x)
         if self.dense_training_outputs:
-            return x.reshape(b, t, s, c).mean(dim=2)
-        return x[:, -s:].mean(dim=1)
+            return x.reshape(b, t, s, c)[:, :, -1]
+        return x[:, -1]
 
 
 class Hydra(Module):
