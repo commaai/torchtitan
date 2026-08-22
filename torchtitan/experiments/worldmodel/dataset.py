@@ -236,7 +236,7 @@ class WorldModelDataLoader(BaseDataLoader):
 
 
 def main() -> None:
-    from xx.datasets.constants import DEFAULT_TRAIN_LIST
+    from xx.comma_data.constants import DEFAULT_TRAIN_LIST
 
     from torchtitan.experiments.worldmodel.dataset_config import _dataloader_config
 

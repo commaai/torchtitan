@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from typing import cast
 
-from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TRAIN_LIST
+from xx.comma_data.constants import BASE_DIR_GT, DEFAULT_TRAIN_LIST
 from xx.ml_tools.constants.model import SUPERCOMBO_FPS
 
 from torchtitan.components.metrics import MetricsProcessor
