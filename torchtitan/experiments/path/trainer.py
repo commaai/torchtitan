@@ -28,7 +28,11 @@ class PathTrainer(BaseTrainer):
         super().__init__(config)
         self.loss_fn.to(self.device)
 
+    # TODO do we really need to close those?
     def close(self) -> None:
+        self.dataloader.close()
+        if self.config.validator.enable:
+            self.validator.close()
         super().close()
 
     def state_dict(self) -> dict[str, Any]:
