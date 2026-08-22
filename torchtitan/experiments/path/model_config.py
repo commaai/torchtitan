@@ -47,6 +47,7 @@ TEMPORAL_HEADS = tuple(DRIVING_HEADS + TEMPORAL_META_HEADS)
 
 
 def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
+    vision_features = VISION_FEATURES
     frame_constants = frame_constants_from_fps(n_frames=N_FRAMES, frame_type=FRAME_TYPE)
     input_frame_names = tuple(INPUT_FRAMES_NAMES)
     in_channels = sum(frame_constants["frame_shapes"][name][0] for name in input_frame_names)
@@ -60,8 +61,7 @@ def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
             flavor=flavor,
             input_frame_names=input_frame_names,
             in_channels=in_channels,
-            vision_features=VISION_FEATURES,
-            grid_size=grid_size,
+            vision_features=vision_features,
             pretrained=True,
             drop_path_rate=0.2,
             mean=255 / 2,
@@ -69,13 +69,13 @@ def model_config(flavor: str = "convnext_xxlarge") -> PathModel.Config:
         ),
         point_policy=Policy.Config(
             summarizer=PointSummarizer.Config(
-                mlp1=_mlp(VISION_FEATURES, mlp_mult=2, bias=False, dropout=0.0),
-                mlp2=_mlp(VISION_FEATURES, mlp_mult=2, bias=False, dropout=0.0),
+                mlp1=_mlp(vision_features, mlp_mult=2, bias=False, dropout=0.0),
+                mlp2=_mlp(vision_features, mlp_mult=2, bias=False, dropout=0.0),
             ),
-            hydra=_hydra(POINT_HEADS, in_features=VISION_FEATURES, mlp_mult=2),
+            hydra=_hydra(POINT_HEADS, in_features=vision_features, mlp_mult=2),
         ),
         temporal_policy=temporal_policy_config(),
-        unvision_decoder=_spatial_unvision_config(in_features=VISION_FEATURES, grid_size=grid_size),
+        unvision_decoder=_spatial_unvision_config(in_features=vision_features, grid_size=grid_size),
     )
 
 
@@ -85,6 +85,7 @@ def temporal_policy_config(
     dropout: float = 0.1,
     dense_training_outputs: bool = True,
 ) -> TemporalPolicy.Config:
+    vision_features = VISION_FEATURES
     frame_constants = frame_constants_from_fps()
     history_idxs = tuple(int(index) for index in frame_constants["history_idxs"])
     desire_window_len = frame_constants["desire_window_len"]
@@ -93,35 +94,35 @@ def temporal_policy_config(
     spatial_size = SPATIAL_SIZE
     return TemporalPolicy.Config(
         temporal_summarizer=TemporalSummarizer.Config(
-            mlp1=_mlp(VISION_FEATURES, mlp_mult=2, bias=False, dropout=0.0),
-            mlp2=_mlp(VISION_FEATURES, mlp_mult=2, bias=False, dropout=0.0),
-            desire_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.DESIRE][0] * desire_window_len, VISION_FEATURES),
+            mlp1=_mlp(vision_features, mlp_mult=2, bias=False, dropout=0.0),
+            mlp2=_mlp(vision_features, mlp_mult=2, bias=False, dropout=0.0),
+            desire_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.DESIRE][0] * desire_window_len, vision_features),
             desire_window_len=desire_window_len,
             desire_window_starts=desire_window_starts,
-            traffic_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0], VISION_FEATURES),
-            action_t_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.ACTION_T][0], VISION_FEATURES),
+            traffic_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0], vision_features),
+            action_t_encoder=_encoder(TEMPORAL_INPUTS[ModelInputs.ACTION_T][0], vision_features),
             transformer=PathTransformer.Config(
                 layers=[
                     PathTransformerBlock.Config(
-                        attention=_attention(dim=VISION_FEATURES, n_head=8, dropout=dropout),
-                        mlp=_mlp(VISION_FEATURES, mlp_mult=2, bias=True, dropout=dropout),
+                        attention=_attention(dim=vision_features, n_head=8, dropout=dropout),
+                        mlp=_mlp(vision_features, mlp_mult=2, bias=True, dropout=dropout),
                     )
                     for _ in range(4)
                 ]
             ),
             temporal_pos_embedding=Embedding.Config(
                 num_embeddings=block_size,
-                embedding_dim=VISION_FEATURES,
+                embedding_dim=vision_features,
             ),
             spatial_pos_embedding=Embedding.Config(
                 num_embeddings=spatial_size,
-                embedding_dim=VISION_FEATURES,
+                embedding_dim=vision_features,
             ),
             temporal_size=block_size,
             spatial_size=spatial_size,
             dense_training_outputs=dense_training_outputs,
         ),
-        temporal_hydra=_hydra(heads, in_features=VISION_FEATURES, mlp_mult=2),
+        temporal_hydra=_hydra(heads, in_features=vision_features, mlp_mult=2),
         history_idxs=history_idxs,
     )
 

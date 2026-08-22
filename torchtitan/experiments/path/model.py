@@ -112,7 +112,6 @@ class PathSelfAttention(Module):
         qkv = self.c_attn(self.norm(x)).view(b, t, 3, self.n_head, self.head_dim)
         q, k, v = qkv.unbind(2)
         q, k = self.q_norm(q), self.k_norm(k)
-        # slightly weird to do causal instead of block_causal for spatial tokens
         x = self.inner_attention(q, k, v, is_causal=self.is_causal)
         return self.dropout(self.c_proj(x.reshape(b, t, self.n_head * self.head_dim)))
 
@@ -157,7 +156,6 @@ class PathTransformer(Module):
 
 
 class SpatialUnvision(Module):
-
     OUTPUT_SIZE = (128, 256)
     OUTPUT_CHANNELS = 6
     N_EMBD = 256
@@ -400,7 +398,6 @@ class Vision(Module):
         input_frame_names: tuple[str, ...]
         in_channels: int
         vision_features: int
-        grid_size: tuple[int, int]
         pretrained: bool
         drop_path_rate: float
         mean: float
@@ -691,8 +688,7 @@ def _apply_activation_checkpointing(
         wrap,
         "temporal_policy.temporal_summarizer.transformer",
     )
-    if model.unvision is not None:
-        model.unvision.transformer.apply_activation_checkpointing(wrap, "unvision.transformer")
+    model.unvision.transformer.apply_activation_checkpointing(wrap, "unvision.transformer")
 
     logger.info(f"Applied {mode} activation checkpointing to the path model")
 
@@ -703,8 +699,7 @@ def _apply_compile(model: PathModel, compile_config: CompileConfig) -> None:
     model.vision.encoder.compile(backend=compile_config.backend)
     model.point_policy.compile(backend=compile_config.backend)
     model.temporal_policy.compile(backend=compile_config.backend)
-    if model.unvision is not None:
-        model.unvision.compile(backend=compile_config.backend)
+    model.unvision.compile(backend=compile_config.backend)
     logger.info("Compiling path model components with torch.compile")
 
 

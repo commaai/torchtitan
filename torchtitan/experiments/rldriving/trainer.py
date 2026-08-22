@@ -198,8 +198,7 @@ class RLDrivingTrainer(Trainer):
 
     def prepare_batch(self, batch: Batch) -> PreparedBatch:
         inputs, targets, metadata = batch
-        # info is a serialized host-side column, not a model tensor.
-        inputs = {name: value.to(self.device) for name, value in inputs.items() if name != "info"}
+        inputs = {name: value.to(self.device) for name, value in inputs.items()}
         targets = {name: value.to(self.device) for name, value in targets.items()}
         metadata = {name: value.to(self.device) for name, value in metadata.items()}
         current_inputs = {name: inputs[name].float() for name in TEMPORAL_INPUTS}
