@@ -299,8 +299,6 @@ class TemporalSummarizer(Module):
         feats = self.mlp1(feats) + feats
         feats = self.mlp2(feats) + feats
         b, t, s, c = feats.shape
-        # Tokens are time-major. Under plain causal attention, the last spatial token
-        # of each frame is its readout because it has seen the complete frame context.
         feats = feats.reshape(b, t * s, c)
         desire = self.desire_encoder(self._window_desire(desire))
         desire = desire.repeat_interleave(s, dim=1)
@@ -415,13 +413,10 @@ class Vision(Module):
             config.flavor,
             pretrained=False,
             in_chans=config.in_channels,
-            num_classes=0,
+            num_classes=config.vision_features,
             global_pool="",
             drop_path_rate=config.drop_path_rate,
         )
-        # The ConvNeXt head now normalizes without pooling; project its channel-rich
-        # 2-D map to the policy width at every spatial location.
-        self.proj = nn.Conv2d(self.encoder.num_features, config.vision_features, kernel_size=1)
         self.register_buffer("_mean", torch.empty(1, config.in_channels, 1, 1), persistent=True)
         self.register_buffer("_std", torch.empty(1, config.in_channels, 1, 1), persistent=True)
 
@@ -482,8 +477,7 @@ class Vision(Module):
         dtype = next(self.encoder.parameters()).dtype
         x = x.to(dtype)
         x = self.encoder((x - self._mean.to(dtype)) / self._std.to(dtype))
-        x = self.proj(x)
-        return x.flatten(2).transpose(1, 2)
+        return rearrange(x, "b c h w -> b (h w) c")
 
 
 class PathModel(BaseModel):
