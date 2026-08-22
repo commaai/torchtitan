@@ -39,13 +39,6 @@ class PathTrainer(BaseTrainer):
         super().__init__(config)
         self.loss_fn.to(self.device)
 
-    def unique_ids(self, batch: Any) -> Iterable[str]:
-        inputs, _ = batch
-        info = inputs.get("info")
-        if info is None:
-            return ()
-        return (name for name, _ in segment_names_and_fidxs_from_info(info))
-
     def close(self) -> None:
         self.dataloader.close()
         if self.config.validator.enable:
