@@ -738,9 +738,11 @@ def _apply_fsdp(
         shard,
         reshard_after_forward,
     )
+    model.unvision.transformer.apply_fsdp(shard, reshard_after_forward)
     shard(model.vision.encoder, reshard_after_forward)
     shard(model.point_policy, reshard_after_forward)
     shard(model.temporal_policy, reshard_after_forward)
+    shard(model.unvision, reshard_after_forward)
     fully_shard(model, **fsdp_config)
 
     if enable_symm_mem:
