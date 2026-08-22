@@ -10,9 +10,9 @@ import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from xx.comma_data.constants import BASE_DIR_GT
 
 from xx.common.basedir import XX_BASEDIR
-from xx.datasets.constants import BASE_DIR_GT
 from xx.training.lib.dataloader import DataLoader
 from xx.training.rldriving.config import DatasetConfig
 from xx.training.rldriving.dataloader import get_dataset, RolloutContext

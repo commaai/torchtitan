@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TRAIN_LIST
+from xx.comma_data.constants import BASE_DIR_GT, DEFAULT_TRAIN_LIST
 
 from .dataset import WorldModelDataLoader
 from .model_config import COMPRESSOR_MODEL, LATENT_CHANNELS, LATENT_SIZE
