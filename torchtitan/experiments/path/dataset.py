@@ -35,7 +35,6 @@ class PathDataLoader(BaseDataLoader):
         deterministic_fidxs: bool = False
         n_frames: int = N_FRAMES
         rgb: bool = FRAME_TYPE is VisionFrameType.RGB
-        unvision: bool = False
         skip: int = 1
         val_skip: int = 1
 

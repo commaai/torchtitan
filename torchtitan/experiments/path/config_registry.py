@@ -193,7 +193,7 @@ def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnx
     input_shapes = [
         [1, *frame_constants["frame_shapes"][ModelInputs.IMG]],
         [1, *frame_constants["frame_shapes"][ModelInputs.BIG_IMG]],
-        [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.FEATURES][0]],
+        [1, temporal_len, *TEMPORAL_INPUTS[ModelInputs.FEATURES]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.DESIRE][0]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.ACTION_T][0]],
