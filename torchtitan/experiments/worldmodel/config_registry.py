@@ -7,26 +7,47 @@
 from __future__ import annotations
 
 import os
+from dataclasses import fields, replace
+from pathlib import Path
 
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.experiments.wan_vae.tokenizer import (
+    DEFAULT_WAN_TEXT_CONTEXT_FILENAME,
+    DEFAULT_WAN_TEXT_PROMPT,
+    WanVAETokenizer,
+)
 
-from .dataset_config import _dataloader_config, BASE_DIR_GT, DEFAULT_TRAIN_LIST, IMAGE_SIZE
+from .dataset_config import (
+    _dataloader_config,
+    _wan_dataloader_config,
+    BASE_DIR_GT,
+    DEFAULT_TRAIN_LIST,
+    IMAGE_SIZE,
+)
 from .loss import WorldModelLoss
 from .model_config import (
     _blocks_only_float8,
+    _wan_blocks_only_float8,
     COMPRESSOR_MODEL,
     LATENT_CHANNELS,
     LATENT_SIZE,
     model_registry,
+    WAN_FLOAT8_FILTER_FQNS,
     WORLD_MODEL_FLOAT8_FILTER_FQNS,
 )
 from .tokenizer import WorldModelTokenizer
 from .torchpackage_checkpoint import WorldModelTorchPackageCheckpointManager
-from .trainer import WorldModelTrainer, WorldModelValidator
+from .trainer import (
+    WanWorldModelTrainer,
+    WanWorldModelValidator,
+    WorldModelFloat8Config,
+    WorldModelTrainer,
+    WorldModelValidator,
+)
 
 
 __all__ = [
@@ -37,16 +58,21 @@ __all__ = [
     "LATENT_CHANNELS",
     "LATENT_SIZE",
     "WORLD_MODEL_FLOAT8_FILTER_FQNS",
+    "WAN_FLOAT8_FILTER_FQNS",
     "_blocks_only_float8",
+    "_wan_blocks_only_float8",
     "_dataloader_config",
+    "_wan_dataloader_config",
     "model_registry",
     "worldmodel",
+    "worldmodel_wan",
+    "worldmodel_wan_debug",
 ]
 
 
 def worldmodel() -> WorldModelTrainer.Config:
     local_batch_size = 16
-    validation_freq = 512
+    validation_freq = 32
     steps = validation_freq * 30
     validation_steps = 8
     compile_config = CompileConfig(enable=True, components=["model", "loss"])
@@ -129,6 +155,161 @@ def worldmodel() -> WorldModelTrainer.Config:
         noise_scheduler_steps=10,
         no_noise_prefill_frames_prob=0.5,
         fake_timesteps_prob=0.5,
+        debug=DebugConfig(seed=0),
+    )
+
+
+def _wan_checkpoint_dir() -> str:
+    default = Path("/raid.unprotected/yassine/Wan2.2-TI2V-5B")
+    return os.getenv("WAN_TI2V_5B_CHECKPOINT", str(default))
+
+
+def _wan_text_context_path(checkpoint_dir: str) -> str:
+    default = os.path.join(checkpoint_dir, DEFAULT_WAN_TEXT_CONTEXT_FILENAME)
+    return os.getenv("WAN_TEXT_CONTEXT_PATH", default)
+
+
+def _wan_validator_config(
+    config: WorldModelValidator.Config,
+    **changes: object,
+) -> WanWorldModelValidator.Config:
+    values = {item.name: getattr(config, item.name) for item in fields(WanWorldModelValidator.Config) if item.init}
+    values.update(changes)
+    return WanWorldModelValidator.Config(**values)
+
+
+def _wan_trainer_config(
+    config: WorldModelTrainer.Config,
+    **changes: object,
+) -> WanWorldModelTrainer.Config:
+    values = {item.name: getattr(config, item.name) for item in fields(WanWorldModelTrainer.Config) if item.init}
+    values.update(changes)
+    return WanWorldModelTrainer.Config(**values)
+
+
+def worldmodel_wan() -> WanWorldModelTrainer.Config:
+    """Train the pretrained Wan 2.2 TI2V-5B transformer on camera video."""
+    base = worldmodel()
+    optimizer = replace(
+        base.optimizer,
+        param_groups=[
+            replace(
+                group,
+                optimizer_kwargs={**group.optimizer_kwargs, "lr": 1e-5},
+            )
+            for group in base.optimizer.param_groups
+        ],
+    )
+    checkpoint_dir = _wan_checkpoint_dir()
+    train_dataloader = _wan_dataloader_config(split="train")
+    validation_dataloader = _wan_dataloader_config(
+        split="val",
+        fill_once=True,
+    )
+    return _wan_trainer_config(
+        base,
+        hf_assets_path=checkpoint_dir,
+        loss=WorldModelLoss.Config(plan_loss_weight=0.0),
+        tokenizer=WanVAETokenizer.Config(
+            compressor_model=checkpoint_dir,
+            image_size=train_dataloader.image_size,
+            text_context_path=_wan_text_context_path(checkpoint_dir),
+            text_prompt=DEFAULT_WAN_TEXT_PROMPT,
+        ),
+        model_spec=model_registry("wan_ti2v_5b"),
+        dataloader=train_dataloader,
+        optimizer=optimizer,
+        training=replace(
+            base.training,
+            local_batch_size=8,
+            global_batch_size=-1,
+            seq_len=1,
+        ),
+        checkpoint=replace(
+            base.checkpoint,
+            initial_load_path=checkpoint_dir,
+            initial_load_in_hf=True,
+            initial_load_model_only=True,
+        ),
+        validator=_wan_validator_config(
+            base.validator,
+            dataloader=validation_dataloader,
+            pose_dropout=0.0,
+            no_noise_prefill_frames_prob=0.0,
+            fake_timesteps_prob=0.0,
+        ),
+        float8=WorldModelFloat8Config(enable=True),
+        activation_checkpoint=FullAC.Config(),
+        pose_dropout=0.0,
+        no_noise_prefill_frames_prob=0.5,
+        fake_timesteps_prob=0.5,
+    )
+
+
+def worldmodel_wan_debug() -> WanWorldModelTrainer.Config:
+    """Run the Wan RF training path with a reduced model and mock latents."""
+    base = worldmodel_wan()
+    dataloader = _wan_dataloader_config(
+        split="train",
+        dataset="mock",
+        pipeline_dir="",
+        image_size=(64, 64),
+        latent_channels=4,
+        latent_size=(4, 4),
+        shuffle_size=4,
+        min_mixing=1.0,
+        num_writers=1,
+        num_readers=1,
+        mock_data=True,
+        mock_segment_batch_size=1,
+        mock_latents=True,
+    )
+    return replace(
+        base,
+        hf_assets_path=".",
+        dump_folder="./outputs/worldmodel_wan_debug",
+        tokenizer=WanVAETokenizer.Config(
+            compressor_model="",
+            image_size=dataloader.image_size,
+            text_context_path="",
+            text_prompt="",
+        ),
+        model_spec=model_registry("wan_debug"),
+        dataloader=dataloader,
+        optimizer=default_adamw(lr=1e-3),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=0,
+            total_steps=1,
+        ),
+        training=TrainingConfig(
+            local_batch_size=1,
+            global_batch_size=-1,
+            seq_len=1,
+            steps=1,
+            max_norm=1.0,
+            dtype="float32",
+            mixed_precision_param="float32",
+            mixed_precision_reduce="float32",
+        ),
+        activation_checkpoint=None,
+        compile=CompileConfig(enable=False),
+        metrics=MetricsProcessor.Config(
+            log_freq=1,
+            enable_reporterv2=False,
+        ),
+        checkpoint=replace(
+            base.checkpoint,
+            enable=False,
+            initial_load_path=None,
+            initial_load_in_hf=False,
+        ),
+        validator=replace(
+            base.validator,
+            enable=False,
+            steps=0,
+            dataloader=replace(dataloader, split="val", fill_once=True),
+        ),
+        float8=WorldModelFloat8Config(enable=False),
         debug=DebugConfig(seed=0),
     )
 

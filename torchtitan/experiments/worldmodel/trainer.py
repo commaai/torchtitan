@@ -28,15 +28,23 @@ from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.observability import structured_logger as sl
 from torchtitan.trainer import Trainer
-from .dataset import WorldModelDataLoader
+from torchtitan.experiments.wan_vae.tokenizer import WanVAETokenizer
+
+from .dataset import WanWorldModelDataLoader, WorldModelDataLoader
 from .loss import WorldModelLoss
 from .model import WorldModel
+from .model_wan import WanModel
 from .schedulers import RFScheduler
 from .tokenizer import WorldModelTokenizer
-from .torchpackage_checkpoint import WorldModelTorchPackageCheckpointManager
+from .torchpackage_checkpoint import (
+    WanTorchPackageConfig,
+    WorldModelTorchPackageCheckpointManager,
+)
 
 
 ValidationContext = Callable[[], AbstractContextManager[None]]
+TrainingModel = WorldModel | WanModel
+TrainingTokenizer = WorldModelTokenizer | WanVAETokenizer
 
 
 @dataclass(kw_only=True, slots=True)
@@ -47,6 +55,20 @@ class WorldModelFloat8Config:
 
 def _batch_size(inputs: dict[str, torch.Tensor]) -> int:
     return next(iter(inputs.values())).shape[0]
+
+
+def _model_batch_size(
+    inputs: dict[str, torch.Tensor],
+    tokenizer: BaseTokenizer,
+) -> int:
+    batch_size = _batch_size(inputs)
+    if (
+        isinstance(tokenizer, WanVAETokenizer)
+        and "imgs" in inputs
+        and "big_imgs" in inputs
+    ):
+        return WanVAETokenizer.NUM_VIEWS * batch_size
+    return batch_size
 
 
 def _copy_microbatch(
@@ -158,6 +180,159 @@ def _prepare_worldmodel_batch(
     }, targets
 
 
+def _prepare_wan_batch(
+    *,
+    model: WanModel,
+    tokenizer: WanVAETokenizer,
+    input_dict: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+    scheduler: RFScheduler,
+    discrete_timesteps: torch.Tensor,
+    train: bool,
+) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    del targets
+    latents_BFCHW = tokenizer.encode(input_dict, device=device, dtype=dtype)
+    if latents_BFCHW.ndim != 5:
+        raise ValueError(
+            f"Wan latents must have shape [B, F, C, H, W], got {tuple(latents_BFCHW.shape)}"
+        )
+    batch_size, num_frames, channels, height, width = latents_BFCHW.shape
+    if num_frames < 1:
+        raise ValueError("Wan worldmodel training requires at least one latent frame")
+    if channels != model.in_dim:
+        raise ValueError(
+            f"Wan model expects {model.in_dim} latent channels, got {channels}"
+        )
+
+    latent_shape = (num_frames, height, width)
+    if any(size % patch for size, patch in zip(latent_shape, model.patch_size)):
+        raise ValueError(
+            f"Wan latent shape {latent_shape} must be divisible by patch size {model.patch_size}"
+        )
+    seq_len = 1
+    for size, patch in zip(latent_shape, model.patch_size):
+        seq_len *= size // patch
+
+    with torch.no_grad():
+        noise_BFCHW = torch.randn_like(latents_BFCHW)
+        if train:
+            timesteps_B = scheduler.sample_timestep((batch_size,))
+        else:
+            indexes_B = torch.randint(
+                0,
+                discrete_timesteps.numel(),
+                (batch_size,),
+                device=device,
+            )
+            timesteps_B = discrete_timesteps[indexes_B]
+        noisy_latents_BFCHW = scheduler.add_noise(
+            latents_BFCHW,
+            noise_BFCHW,
+            timesteps_B,
+        )
+        prepared_targets = {
+            # Preserve Wan's pretrained forward-flow convention. For
+            # x_t=(1-t)*x_0+t*epsilon, upstream Wan predicts epsilon-x_0.
+            "v": noise_BFCHW - latents_BFCHW,
+            "mask": torch.ones_like(
+                latents_BFCHW,
+                device=device,
+                dtype=torch.bool,
+            ),
+        }
+
+        # Production uses a cached raw UMT5 context. The null fallback keeps
+        # the reduced CPU smoke recipe independent of the 11B text encoder.
+        text_context_BLC = tokenizer.fixed_text_context(
+            batch_size,
+            expected_dim=model.text_dim,
+            device=device,
+            dtype=dtype,
+        )
+        if text_context_BLC is None:
+            text_context_BLC = model.get_null_text_embedding(
+                batch_size,
+                device=device,
+                dtype=dtype,
+            )
+
+    noisy_latents_BCFHW = noisy_latents_BFCHW.permute(0, 2, 1, 3, 4)
+    return {
+        "x": list(noisy_latents_BCFHW.unbind(0)),
+        # Wan's published transformer uses [0, 1000], while RFScheduler and
+        # the velocity target stay in the existing worldmodel [0, 1] domain.
+        "t": timesteps_B * 1000.0,
+        "context": list(text_context_BLC.unbind(0)),
+        "seq_len": seq_len,
+    }, prepared_targets
+
+
+def _prepare_training_batch(
+    *,
+    model: TrainingModel,
+    tokenizer: TrainingTokenizer,
+    input_dict: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+    scheduler: RFScheduler,
+    discrete_timesteps: torch.Tensor,
+    pose_dropout: float,
+    inference_prefill_frames: int,
+    future_size_frames: int,
+    no_noise_prefill_frames_prob: float,
+    fake_timesteps_prob: float,
+    train: bool,
+) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+    if isinstance(model, WanModel):
+        if not isinstance(tokenizer, WanVAETokenizer):
+            raise TypeError("Wan training requires WanVAETokenizer")
+        return _prepare_wan_batch(
+            model=model,
+            tokenizer=tokenizer,
+            input_dict=input_dict,
+            targets=targets,
+            device=device,
+            dtype=dtype,
+            scheduler=scheduler,
+            discrete_timesteps=discrete_timesteps,
+            train=train,
+        )
+    if not isinstance(tokenizer, WorldModelTokenizer):
+        raise TypeError("DiT worldmodel training requires WorldModelTokenizer")
+    return _prepare_worldmodel_batch(
+        model=model,
+        tokenizer=tokenizer,
+        input_dict=input_dict,
+        targets=targets,
+        device=device,
+        dtype=dtype,
+        scheduler=scheduler,
+        discrete_timesteps=discrete_timesteps,
+        pose_dropout=pose_dropout,
+        inference_prefill_frames=inference_prefill_frames,
+        future_size_frames=future_size_frames,
+        no_noise_prefill_frames_prob=no_noise_prefill_frames_prob,
+        fake_timesteps_prob=fake_timesteps_prob,
+        train=train,
+    )
+
+
+def _loss_outputs(outputs: Any) -> dict[str, torch.Tensor]:
+    if isinstance(outputs, dict):
+        return outputs
+    if not isinstance(outputs, list) or not outputs:
+        raise TypeError(
+            f"unsupported worldmodel output type {type(outputs).__name__}"
+        )
+    if any(sample_CFH.ndim != 4 for sample_CFH in outputs):
+        raise ValueError("Wan outputs must contain [C, F, H, W] tensors")
+    sample_BCFHW = torch.stack(outputs)
+    return {"sample": sample_BCFHW.permute(0, 2, 1, 3, 4)}
+
+
 class WorldModelValidator(BaseValidator):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseValidator.Config):
@@ -193,14 +368,14 @@ class WorldModelValidator(BaseValidator):
         super().__init__(config=config)
         self.dp_world_size = dp_world_size
         self.dp_rank = dp_rank
-        self.tokenizer = cast(WorldModelTokenizer, tokenizer)
+        self.tokenizer = cast(TrainingTokenizer, tokenizer)
         self.parallel_dims = parallel_dims
         self.loss_fn = loss_fn
         self.validation_context = validation_context
         self.metrics_processor = metrics_processor
         self.seq_len = seq_len
         self.local_batch_size = local_batch_size
-        self.dataloader: WorldModelDataLoader | None = None
+        self.dataloader: WorldModelDataLoader | WanWorldModelDataLoader | None = None
         if self.config.steps != 0:
             self.dataloader = self.config.dataloader.build(
                 dp_world_size=self.dp_world_size,
@@ -219,7 +394,7 @@ class WorldModelValidator(BaseValidator):
     def validate(self, model_parts: list[nn.Module], step: int) -> None:
         if self.config.steps == 0 or self.dataloader is None:
             return
-        model = cast(WorldModel, model_parts[0])
+        model = cast(TrainingModel, model_parts[0])
         model.eval()
         device = next(model.parameters()).device
         dtype = _floating_model_dtype(model)
@@ -234,7 +409,7 @@ class WorldModelValidator(BaseValidator):
             for num_steps, (input_dict, targets) in enumerate(data_iterator):
                 if num_steps >= self.config.steps:
                     break
-                batch_size = _batch_size(input_dict)
+                batch_size = _model_batch_size(input_dict, self.tokenizer)
                 samples += batch_size
                 self.metrics_processor.ntokens_since_last_log += (
                     batch_size * self.seq_len
@@ -243,7 +418,7 @@ class WorldModelValidator(BaseValidator):
                     self.unique_segment_counter.update(
                         _segment_names_from_info(input_dict["info"])
                     )
-                model_inputs, targets = _prepare_worldmodel_batch(
+                model_inputs, targets = _prepare_training_batch(
                     model=model,
                     tokenizer=self.tokenizer,
                     input_dict=input_dict,
@@ -253,14 +428,22 @@ class WorldModelValidator(BaseValidator):
                     scheduler=scheduler,
                     discrete_timesteps=discrete_timesteps,
                     pose_dropout=self.config.pose_dropout,
-                    inference_prefill_frames=self.config.dataloader.inference_prefill_frames,
-                    future_size_frames=self.config.dataloader.future_size_frames,
+                    inference_prefill_frames=getattr(
+                        self.config.dataloader,
+                        "inference_prefill_frames",
+                        0,
+                    ),
+                    future_size_frames=getattr(
+                        self.config.dataloader,
+                        "future_size_frames",
+                        0,
+                    ),
                     no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
                     fake_timesteps_prob=self.config.fake_timesteps_prob,
                     train=False,
                 )
                 with self.validation_context():
-                    outputs = model(**model_inputs)
+                    outputs = _loss_outputs(model(**model_inputs))
                     _loss_vec, terms = self.loss_fn(outputs, targets)
                 for name, term in terms.items():
                     term_sums[name] = (
@@ -312,6 +495,12 @@ class WorldModelValidator(BaseValidator):
             self.dataloader.close()
 
 
+class WanWorldModelValidator(WorldModelValidator):
+    @dataclass(kw_only=True, slots=True)
+    class Config(WorldModelValidator.Config):
+        dataloader: WanWorldModelDataLoader.Config
+
+
 class WorldModelTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
@@ -336,6 +525,24 @@ class WorldModelTrainer(Trainer):
             _apply_worldmodel_float8(config, config.model_spec.model)
 
         super().__init__(config)
+        self.tokenizer = cast(TrainingTokenizer, self.tokenizer)
+        if isinstance(self.package_config, WanModel.Config):
+            wan_tokenizer = cast(WanVAETokenizer, self.tokenizer)
+            text_context_BLC = wan_tokenizer.fixed_text_context(
+                1,
+                expected_dim=self.package_config.text_dim,
+                device=torch.device("cpu"),
+                dtype=torch.bfloat16,
+            )
+            self.package_config = WanTorchPackageConfig(
+                model_config=self.package_config,
+                text_context_LC=(
+                    text_context_BLC[0].clone()
+                    if text_context_BLC is not None
+                    else None
+                ),
+                text_prompt=wan_tokenizer.config.text_prompt,
+            )
         for model_part in self.model_parts:
             model_part.package_config = self.package_config
         self.dtype = TORCH_DTYPE_MAP[config.training.mixed_precision_param]
@@ -343,7 +550,6 @@ class WorldModelTrainer(Trainer):
             device=self.device
         )
         self.discrete_timesteps = self.train_noise_scheduler.timesteps[:-1]
-        self.tokenizer = cast(WorldModelTokenizer, self.tokenizer)
         self.loss_fn = cast(WorldModelLoss, self.loss_fn)
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
         self.unique_segment_counter = StringUniqueCounter(
@@ -364,7 +570,8 @@ class WorldModelTrainer(Trainer):
             except StopIteration as ex:
                 raise DataloaderExhaustedError() from ex
             self.metrics_processor.ntokens_since_last_log += (
-                _batch_size(input_dict) * self.config.training.seq_len
+                _model_batch_size(input_dict, self.tokenizer)
+                * self.config.training.seq_len
             )
             self.metrics_processor.data_loading_times.append(
                 time.perf_counter() - data_load_start
@@ -379,9 +586,9 @@ class WorldModelTrainer(Trainer):
         targets: dict[str, torch.Tensor],
         local_samples: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        model = cast(WorldModel, self.model_parts[0])
+        model = cast(TrainingModel, self.model_parts[0])
         with sl.log_trace_span("worldmodel_prepare_batch"):
-            model_inputs, targets = _prepare_worldmodel_batch(
+            model_inputs, targets = _prepare_training_batch(
                 model=model,
                 tokenizer=self.tokenizer,
                 input_dict=input_dict,
@@ -391,15 +598,28 @@ class WorldModelTrainer(Trainer):
                 scheduler=self.train_noise_scheduler,
                 discrete_timesteps=self.discrete_timesteps,
                 pose_dropout=self.config.pose_dropout,
-                inference_prefill_frames=self.config.dataloader.inference_prefill_frames,
-                future_size_frames=self.config.dataloader.future_size_frames,
+                inference_prefill_frames=getattr(
+                    self.config.dataloader,
+                    "inference_prefill_frames",
+                    0,
+                ),
+                future_size_frames=getattr(
+                    self.config.dataloader,
+                    "future_size_frames",
+                    0,
+                ),
                 no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
                 fake_timesteps_prob=self.config.fake_timesteps_prob,
                 train=True,
             )
-        self.ntokens_seen += model_inputs["x"].shape[0] * self.config.training.seq_len
+        prepared_batch_size = (
+            model_inputs["x"].shape[0]
+            if isinstance(model_inputs["x"], torch.Tensor)
+            else len(model_inputs["x"])
+        )
+        self.ntokens_seen += prepared_batch_size * self.config.training.seq_len
         with self.train_context():
-            outputs = model(**model_inputs)
+            outputs = _loss_outputs(model(**model_inputs))
             loss_vec, terms = self.loss_fn(outputs, targets)
             loss = loss_vec.sum() / local_samples
             del outputs, loss_vec
@@ -423,7 +643,7 @@ class WorldModelTrainer(Trainer):
         for _ in range(self.gradient_accumulation_steps):
             with sl.log_trace_span("fetching_batch"):
                 input_dict, targets = next(data_iterator)
-            local_samples += _batch_size(input_dict)
+            local_samples += _model_batch_size(input_dict, self.tokenizer)
             if "info" in input_dict:
                 step_segment_names.update(_segment_names_from_info(input_dict["info"]))
             if self.gradient_accumulation_steps > 1:
@@ -561,6 +781,14 @@ class WorldModelTrainer(Trainer):
             )
 
 
+class WanWorldModelTrainer(WorldModelTrainer):
+    @dataclass(kw_only=True, slots=True)
+    class Config(WorldModelTrainer.Config):
+        dataloader: WanWorldModelDataLoader.Config
+        tokenizer: WanVAETokenizer.Config
+        validator: WanWorldModelValidator.Config
+
+
 def _floating_model_dtype(model: torch.nn.Module) -> torch.dtype:
     for param in model.parameters():
         if param.is_floating_point():
@@ -569,14 +797,20 @@ def _floating_model_dtype(model: torch.nn.Module) -> torch.dtype:
 
 
 def _apply_worldmodel_float8(
-    config: WorldModelTrainer.Config, model_config: WorldModel.Config
+    config: WorldModelTrainer.Config,
+    model_config: WorldModel.Config | WanModel.Config,
 ) -> None:
-    from .model_config import _blocks_only_float8
+    from .model_config import _blocks_only_float8, _wan_blocks_only_float8
 
     model_compile_enabled = (
         config.compile.enable and "model" in config.compile.components
     )
-    converter = _blocks_only_float8(
+    converter_config = (
+        _wan_blocks_only_float8
+        if isinstance(model_config, WanModel.Config)
+        else _blocks_only_float8
+    )
+    converter = converter_config(
         model_compile_enabled=model_compile_enabled,
         emulate=config.float8.emulate,
     )
@@ -586,9 +820,62 @@ def _apply_worldmodel_float8(
 def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
     if config.model_spec is None:
         raise ValueError("worldmodel requires a model_spec")
-    if not isinstance(config.model_spec.model, WorldModel.Config):
-        raise TypeError("worldmodel model_spec must contain WorldModel.Config")
     model_config = config.model_spec.model
+    if (
+        config.parallelism.tensor_parallel_degree > 1
+        or config.parallelism.pipeline_parallel_degree > 1
+        or config.parallelism.context_parallel_degree > 1
+        or config.parallelism.expert_parallel_degree > 1
+    ):
+        raise ValueError("worldmodel supports FSDP/HSDP only")
+
+    if isinstance(model_config, WanModel.Config):
+        if not isinstance(config.dataloader, WanWorldModelDataLoader.Config):
+            raise TypeError(
+                "Wan worldmodel requires WanWorldModelDataLoader.Config"
+            )
+        if not isinstance(config.tokenizer, WanVAETokenizer.Config):
+            raise TypeError("Wan worldmodel requires WanVAETokenizer.Config")
+        if (
+            not config.dataloader.mock_latents
+            and not config.tokenizer.compressor_model
+        ):
+            raise ValueError("Wan image training requires a pretrained VAE checkpoint")
+        if config.tokenizer.image_size != config.dataloader.image_size:
+            raise ValueError("Wan tokenizer and dataloader image_size must match")
+        if model_config.in_dim != config.dataloader.latent_channels:
+            raise ValueError(
+                "Wan model in_dim must match dataloader latent_channels"
+            )
+        if model_config.out_dim != config.dataloader.latent_channels:
+            raise ValueError(
+                "Wan model out_dim must match dataloader latent_channels"
+            )
+
+        latent_frames = 1 + (config.dataloader.clip_frames - 1) // 4
+        latent_shape = (latent_frames, *config.dataloader.latent_size)
+        if any(
+            size % patch
+            for size, patch in zip(latent_shape, model_config.patch_size)
+        ):
+            raise ValueError(
+                f"Wan latent shape {latent_shape} must be divisible by patch size {model_config.patch_size}"
+            )
+        seq_len = 1
+        for size, patch in zip(latent_shape, model_config.patch_size):
+            seq_len *= size // patch
+        model_config._sync_derived_fields()
+        config.training.seq_len = seq_len
+        return
+
+    if not isinstance(model_config, WorldModel.Config):
+        raise TypeError(
+            "worldmodel model_spec must contain WorldModel.Config or WanModel.Config"
+        )
+    if not isinstance(config.dataloader, WorldModelDataLoader.Config):
+        raise TypeError("DiT worldmodel requires WorldModelDataLoader.Config")
+    if not isinstance(config.tokenizer, WorldModelTokenizer.Config):
+        raise TypeError("DiT worldmodel requires WorldModelTokenizer.Config")
     total_frames = (
         config.dataloader.context_size_frames + config.dataloader.future_size_frames
     )
@@ -600,13 +887,6 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
         raise ValueError("model input spatial size must match dataloader latent_size")
     if model_config.in_channels != config.dataloader.in_channels:
         raise ValueError("model in_channels must match dataloader in_channels")
-    if (
-        config.parallelism.tensor_parallel_degree > 1
-        or config.parallelism.pipeline_parallel_degree > 1
-        or config.parallelism.context_parallel_degree > 1
-        or config.parallelism.expert_parallel_degree > 1
-    ):
-        raise ValueError("worldmodel supports FSDP/HSDP only")
     model_config._sync_derived_fields()
     config.training.seq_len = model_config.num_patches
 

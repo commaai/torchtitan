@@ -47,7 +47,9 @@ OPTIMIZER = "optimizer"
 LR_SCHEDULER = "lr_scheduler"
 DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
-CHECKPOINT_UPLOAD_TIMEOUT_SECONDS = 600.0
+CHECKPOINT_IO_TIMEOUT_SECONDS = 600.0
+# Backward-compatible name for callers that only use the write path.
+CHECKPOINT_UPLOAD_TIMEOUT_SECONDS = CHECKPOINT_IO_TIMEOUT_SECONDS
 
 
 class AsyncMode(str, enum.Enum):
@@ -565,10 +567,14 @@ class CheckpointManager(Configurable):
             # `consolidate_safetensors_files_on_every_rank` is used later to manage
             # the multi-file merging process.
         else:
-            storage_writer = FsspecWriter(checkpoint_id, timeout=CHECKPOINT_UPLOAD_TIMEOUT_SECONDS)
+            storage_writer = FsspecWriter(checkpoint_id, timeout=CHECKPOINT_IO_TIMEOUT_SECONDS)
 
         # Execution Dispatch
-        checkpoint_save_id = None if to_hf else checkpoint_id  # for HF the storage_writer handles the path
+        # The explicit writer already owns the checkpoint path. Passing the ID
+        # again makes DCP call FsspecWriter.reset(), which recreates the fsspec
+        # filesystem without its storage options and silently drops the MKV
+        # timeout back to 30 seconds.
+        checkpoint_save_id = None
 
         if async_mode == AsyncMode.ASYNC:
             ret = dcp.async_save(
@@ -646,10 +652,14 @@ class CheckpointManager(Configurable):
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
             self.states[MODEL].load_state_dict(state_dict)
         else:
+            storage_reader = FsspecReader(
+                checkpoint_id,
+                timeout=CHECKPOINT_IO_TIMEOUT_SECONDS,
+            )
             dcp.load(
                 state_dict,
-                storage_reader=FsspecReader(checkpoint_id),
-                checkpoint_id=checkpoint_id,
+                storage_reader=storage_reader,
+                checkpoint_id=None,
                 planner=dcp.DefaultLoadPlanner(allow_partial_load=self.allow_partial_initial_load),
             )
 
