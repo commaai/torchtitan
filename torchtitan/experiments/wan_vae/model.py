@@ -853,6 +853,8 @@ class WanVAE(BaseModel):
     def _apply_training_stage(self) -> None:
         self.requires_grad_(self.config.training_stage == "full")
         if self.config.training_stage == "decoder":
+            if self.decoder is None or self.conv2 is None:
+                raise RuntimeError("decoder training requires a decoder-complete Wan VAE")
             self.decoder.requires_grad_(True)
             self.conv2.requires_grad_(True)
 
@@ -916,6 +918,8 @@ class WanVAE(BaseModel):
         return latents / inv_std.view(1, self.z_dim, 1, 1, 1) + mean.view(1, self.z_dim, 1, 1, 1)
 
     def _encode_impl(self, video: torch.Tensor, *, chunk_size: int | None = 4) -> torch.Tensor:
+        if self.encoder is None or self.conv1 is None:
+            raise RuntimeError("this Wan VAE instance was loaded without its encoder")
         self._validate_video(video)
         x = patchify(video, patch_size=2)
         feat_cache: list[CacheEntry] = [None] * self._encoder_cache_slots
@@ -965,6 +969,8 @@ class WanVAE(BaseModel):
         return latents.unflatten(0, (b, views))
 
     def _decode_impl(self, latents: torch.Tensor) -> torch.Tensor:
+        if self.decoder is None or self.conv2 is None:
+            raise RuntimeError("this Wan VAE instance was loaded without its decoder")
         if latents.ndim != 5 or latents.shape[1] != self.z_dim:
             raise ValueError(f"latents must have shape [B, {self.z_dim}, T, H, W], got {tuple(latents.shape)}")
         z = self._unscale_latents(latents)
@@ -1016,6 +1022,8 @@ class WanVAE(BaseModel):
         **kwargs: Any,
     ) -> torch.Tensor:
         del kwargs
+        if self.encoder is None or self.conv1 is None or self.decoder is None or self.conv2 is None:
+            raise RuntimeError("Wan VAE forward requires both encoder and decoder components")
         if not video.is_floating_point():
             video = video.float().div(127.5).sub(1.0)
         # FSDP cannot mixed-precision cast an integer input before forward.
@@ -1044,21 +1052,44 @@ class WanVAE(BaseModel):
         device: torch.device | str = "cpu",
         dtype: torch.dtype | None = None,
         strict: bool = True,
+        component: Literal["all", "encoder", "decoder"] = "all",
     ) -> "WanVAE":
-        """Load the official ``Wan2.2_VAE.pth`` with mmap-backed CPU storage."""
+        """Load all or one side of ``Wan2.2_VAE.pth`` with mmap-backed storage."""
 
         path = pathlib.Path(checkpoint_path)
         if not path.is_file():
             raise FileNotFoundError(path)
         config = config or cls.Config()
+        if component not in {"all", "encoder", "decoder"}:
+            raise ValueError(f"unsupported Wan VAE component {component!r}")
+        if component != "all" and config.training_stage != "frozen":
+            raise ValueError("component-only Wan VAE loading requires training_stage='frozen'")
         with torch.device("meta"):
             model = cls(config)
+        if component == "encoder":
+            model.decoder = None
+            model.conv2 = None
+        elif component == "decoder":
+            model.encoder = None
+            model.conv1 = None
         state_dict = torch.load(
             path,
             map_location="cpu",
             weights_only=True,
             mmap=True,
         )
+        if component == "encoder":
+            state_dict = {
+                key: value
+                for key, value in state_dict.items()
+                if key.startswith(("encoder.", "conv1."))
+            }
+        elif component == "decoder":
+            state_dict = {
+                key: value
+                for key, value in state_dict.items()
+                if key.startswith(("decoder.", "conv2."))
+            }
         incompatible = model.load_state_dict(state_dict, strict=strict, assign=True)
         if strict and (incompatible.missing_keys or incompatible.unexpected_keys):
             raise RuntimeError(

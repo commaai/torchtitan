@@ -47,9 +47,20 @@ OPTIMIZER = "optimizer"
 LR_SCHEDULER = "lr_scheduler"
 DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
-CHECKPOINT_IO_TIMEOUT_SECONDS = 600.0
-# Backward-compatible name for callers that only use the write path.
-CHECKPOINT_UPLOAD_TIMEOUT_SECONDS = CHECKPOINT_IO_TIMEOUT_SECONDS
+CHECKPOINT_UPLOAD_TIMEOUT_SECONDS = 600.0
+
+
+class _FsspecWriterWithStorageOptions(FsspecWriter):
+    """Keep fsspec options when DCP resets a caller-provided writer."""
+
+    def __init__(self, path: str, **storage_options: Any) -> None:
+        self._storage_options = dict(storage_options)
+        super().__init__(path, **storage_options)
+
+    def reset(self, checkpoint_id: str | None = None) -> None:
+        if checkpoint_id:
+            self.path = self.fs.init_path(checkpoint_id, **self._storage_options)
+        super().reset()
 
 
 class AsyncMode(str, enum.Enum):
@@ -567,14 +578,13 @@ class CheckpointManager(Configurable):
             # `consolidate_safetensors_files_on_every_rank` is used later to manage
             # the multi-file merging process.
         else:
-            storage_writer = FsspecWriter(checkpoint_id, timeout=CHECKPOINT_IO_TIMEOUT_SECONDS)
+            storage_writer = _FsspecWriterWithStorageOptions(
+                checkpoint_id,
+                timeout=CHECKPOINT_UPLOAD_TIMEOUT_SECONDS,
+            )
 
         # Execution Dispatch
-        # The explicit writer already owns the checkpoint path. Passing the ID
-        # again makes DCP call FsspecWriter.reset(), which recreates the fsspec
-        # filesystem without its storage options and silently drops the MKV
-        # timeout back to 30 seconds.
-        checkpoint_save_id = None
+        checkpoint_save_id = None if to_hf else checkpoint_id  # for HF the storage_writer handles the path
 
         if async_mode == AsyncMode.ASYNC:
             ret = dcp.async_save(
@@ -652,14 +662,10 @@ class CheckpointManager(Configurable):
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
             self.states[MODEL].load_state_dict(state_dict)
         else:
-            storage_reader = FsspecReader(
-                checkpoint_id,
-                timeout=CHECKPOINT_IO_TIMEOUT_SECONDS,
-            )
             dcp.load(
                 state_dict,
-                storage_reader=storage_reader,
-                checkpoint_id=None,
+                storage_reader=FsspecReader(checkpoint_id),
+                checkpoint_id=checkpoint_id,
                 planner=dcp.DefaultLoadPlanner(allow_partial_load=self.allow_partial_initial_load),
             )
 

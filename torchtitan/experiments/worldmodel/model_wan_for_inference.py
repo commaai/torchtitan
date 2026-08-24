@@ -25,6 +25,10 @@ from torchtitan.experiments.worldmodel.model_for_inference import (
 )
 from torchtitan.experiments.worldmodel.model_wan import (
     _autocast_disabled,
+    _compact_padded_context,
+    _gate_wan,
+    _modulate_wan,
+    frame_block_causal_mask,
     sinusoidal_embedding_1d,
     WanAttentionBlock,
     WanCrossAttention,
@@ -35,19 +39,6 @@ from torchtitan.experiments.worldmodel.schedulers import RFScheduler
 
 
 PACKAGED_TEXT_CONTEXT_BUFFER = "packaged_text_context"
-
-
-def frame_block_causal_mask(
-    query_pos_Q: torch.Tensor,
-    key_pos_K: torch.Tensor,
-    spatial_tokens: int,
-) -> torch.Tensor:
-    """Allow a frame to see itself and all earlier latent frames."""
-    if spatial_tokens <= 0:
-        raise ValueError(f"spatial_tokens must be positive, got {spatial_tokens}")
-    query_frames_Q = torch.div(query_pos_Q, spatial_tokens, rounding_mode="floor")
-    key_frames_K = torch.div(key_pos_K, spatial_tokens, rounding_mode="floor")
-    return key_frames_K.view(1, -1) <= query_frames_Q.view(-1, 1)
 
 
 def _rope_apply_positions(
@@ -92,6 +83,7 @@ def _inference_sdpa(
     *,
     input_mask: torch.Tensor | None,
     compute_dtype: torch.dtype,
+    key_bias_BL: torch.Tensor | None = None,
 ) -> torch.Tensor:
     q_BNSD = q_BSND.to(compute_dtype).transpose(1, 2)
     k_BNLD = k_BLND.to(compute_dtype).transpose(1, 2)
@@ -103,6 +95,21 @@ def _inference_sdpa(
             input_mask = input_mask.unsqueeze(1)
         if input_mask.ndim != 4:
             raise ValueError(f"attention mask must have 2, 3, or 4 dimensions, got {input_mask.ndim}")
+    if key_bias_BL is not None:
+        if key_bias_BL.shape != (q_BNSD.size(0), k_BNLD.size(2)):
+            raise ValueError(
+                "key bias must have shape "
+                f"[{q_BNSD.size(0)}, {k_BNLD.size(2)}], got {tuple(key_bias_BL.shape)}"
+            )
+        key_bias_B11L = key_bias_BL.to(device=q_BNSD.device, dtype=compute_dtype).view(
+            q_BNSD.size(0), 1, 1, k_BNLD.size(2)
+        )
+        if input_mask is None:
+            input_mask = key_bias_B11L
+        elif input_mask.dtype == torch.bool:
+            input_mask = key_bias_B11L.masked_fill(~input_mask, float("-inf"))
+        else:
+            input_mask = input_mask.to(compute_dtype) + key_bias_B11L
     output_BNSD = F.scaled_dot_product_attention(
         q_BNSD,
         k_BNLD,
@@ -172,9 +179,14 @@ class WanInferenceSelfAttention(WanSelfAttention):
         input_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if semantic_pos_S is None:
-            if cache_pos_S is not None or input_mask is not None:
-                raise ValueError("cached or masked Wan attention requires semantic positions")
-            return super().forward(x_BSC, grid_size, freqs_MD)
+            if cache_pos_S is not None:
+                raise ValueError("cached Wan attention requires semantic positions")
+            return super().forward(
+                x_BSC,
+                grid_size,
+                freqs_MD,
+                input_mask=input_mask,
+            )
         if spatial_grid is None:
             raise ValueError("spatial_grid is required with semantic positions")
 
@@ -216,11 +228,17 @@ class WanInferenceCrossAttention(WanCrossAttention):
         x_BSC: torch.Tensor,
         context_BLC: torch.Tensor,
         context_lens_B: torch.Tensor | None,
+        context_key_bias_BL: torch.Tensor | None = None,
         *,
         input_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_mask is None:
-            return super().forward(x_BSC, context_BLC, context_lens_B)
+            return super().forward(
+                x_BSC,
+                context_BLC,
+                context_lens_B,
+                context_key_bias_BL,
+            )
         batch_size, query_len = x_BSC.shape[:2]
         context_len = context_BLC.size(1)
         q_BSND = self.norm_q(self.q(x_BSC)).view(batch_size, query_len, self.num_heads, self.head_dim)
@@ -232,6 +250,7 @@ class WanInferenceCrossAttention(WanCrossAttention):
             v_BLND,
             input_mask=input_mask,
             compute_dtype=v_BLND.dtype,
+            key_bias_BL=context_key_bias_BL,
         )
         return self.o(output_BSND.flatten(2))
 
@@ -240,11 +259,12 @@ class WanInferenceAttentionBlock(WanAttentionBlock):
     def forward(
         self,
         x_BSC: torch.Tensor,
-        e_BS6C: torch.Tensor,
+        e_BK6C: torch.Tensor,
         grid_size: tuple[int, int, int],
         freqs_MD: torch.Tensor,
         context_BLC: torch.Tensor | None,
         context_lens_B: torch.Tensor | None,
+        context_key_bias_BL: torch.Tensor | None = None,
         *,
         semantic_pos_S: torch.Tensor | None = None,
         spatial_grid: tuple[int, int] | None = None,
@@ -262,20 +282,26 @@ class WanInferenceAttentionBlock(WanAttentionBlock):
         ):
             return super().forward(
                 x_BSC,
-                e_BS6C,
+                e_BK6C,
                 grid_size,
                 freqs_MD,
                 context_BLC,
                 context_lens_B,
+                context_key_bias_BL,
             )
 
-        if e_BS6C.dtype != torch.float32:
-            raise ValueError(f"Wan modulation must be float32, got {e_BS6C.dtype}")
+        if e_BK6C.dtype != torch.float32:
+            raise ValueError(f"Wan modulation must be float32, got {e_BK6C.dtype}")
         with _autocast_disabled(x_BSC):
-            modulation_BS6C = self.modulation.float().unsqueeze(0) + e_BS6C
-            shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = modulation_BS6C.chunk(6, dim=2)
+            modulation_BK6C = self.modulation.float().unsqueeze(0) + e_BK6C
+            shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = modulation_BK6C.chunk(6, dim=2)
 
-        attention_input_BSC = self.norm1(x_BSC).float() * (1 + scale_msa.squeeze(2)) + shift_msa.squeeze(2)
+        attention_input_BSC = _modulate_wan(
+            self.norm1(x_BSC),
+            shift_msa,
+            scale_msa,
+            grid_size,
+        )
         attention_output_BSC = self.self_attn(
             attention_input_BSC.to(self.self_attn.q.weight.dtype),
             grid_size,
@@ -287,7 +313,7 @@ class WanInferenceAttentionBlock(WanAttentionBlock):
             input_mask=input_mask,
         )
         with _autocast_disabled(x_BSC):
-            x_BSC = x_BSC.float() + attention_output_BSC.float() * gate_msa.squeeze(2)
+            x_BSC = x_BSC.float() + _gate_wan(attention_output_BSC, gate_msa, grid_size)
 
         if context_BLC is not None:
             cross_attention_dtype = self.cross_attn.q.weight.dtype
@@ -295,14 +321,20 @@ class WanInferenceAttentionBlock(WanAttentionBlock):
                 self.norm3(x_BSC).to(cross_attention_dtype),
                 context_BLC.to(cross_attention_dtype),
                 context_lens_B,
+                context_key_bias_BL,
                 input_mask=cross_attention_mask,
             )
             with _autocast_disabled(x_BSC):
                 x_BSC = x_BSC.float() + cross_attention_output_BSC.float()
-        ffn_input_BSC = self.norm2(x_BSC).float() * (1 + scale_ffn.squeeze(2)) + shift_ffn.squeeze(2)
+        ffn_input_BSC = _modulate_wan(
+            self.norm2(x_BSC),
+            shift_ffn,
+            scale_ffn,
+            grid_size,
+        )
         ffn_output_BSC = self.ffn(ffn_input_BSC.to(self.ffn[0].weight.dtype))
         with _autocast_disabled(x_BSC):
-            return x_BSC.float() + ffn_output_BSC.float() * gate_ffn.squeeze(2)
+            return x_BSC.float() + _gate_wan(ffn_output_BSC, gate_ffn, grid_size)
 
 
 class WanModelForInference(WanModel):
@@ -315,6 +347,7 @@ class WanModelForInference(WanModel):
         default_kv_cache_dtype: KVCacheDType = FP8_KV_CACHE_DTYPE,
     ):
         super().__init__(config)
+        self.attention_mask = "BLOCKWISE_LOWER_TRIANGLE"
         if self.patch_size[0] != 1:
             raise ValueError("Wan prefix caching currently requires temporal patch_size=1")
         for block in self.blocks:
@@ -454,6 +487,22 @@ class WanModelForInference(WanModel):
         device: torch.device,
         use_packaged_context: bool = True,
     ) -> torch.Tensor:
+        projected_context_BLC, _ = self._project_context_with_bias(
+            context,
+            batch_size=batch_size,
+            device=device,
+            use_packaged_context=use_packaged_context,
+        )
+        return projected_context_BLC
+
+    def _project_context_with_bias(
+        self,
+        context: torch.Tensor | Sequence[torch.Tensor] | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+        use_packaged_context: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         weight_dtype = self.text_embedding[0].weight.dtype
         if context is None and use_packaged_context and self.has_packaged_text_context():
             context_LC = self._buffers[PACKAGED_TEXT_CONTEXT_BUFFER]
@@ -479,29 +528,19 @@ class WanModelForInference(WanModel):
                 raise ValueError(f"context batch {len(context)} does not match latent batch {batch_size}")
             context_list = list(context)
 
-        padded_context = []
+        context_on_device = []
         for context_LC in context_list:
             if context_LC.ndim != 2 or context_LC.size(1) != self.text_dim:
                 raise ValueError(f"each context must have shape [L, {self.text_dim}], got {tuple(context_LC.shape)}")
             if context_LC.size(0) > self.text_len:
                 raise ValueError(f"context length {context_LC.size(0)} exceeds text_len {self.text_len}")
-            context_LC = context_LC.to(device=device, dtype=weight_dtype)
-            padding_length = self.text_len - context_LC.size(0)
-            null_token_1C = self.get_null_text_embedding(
-                1,
-                device=device,
-                dtype=weight_dtype,
-            )[0]
-            padded_context.append(
-                torch.cat(
-                    (
-                        context_LC,
-                        null_token_1C.expand(padding_length, -1),
-                    ),
-                    dim=0,
-                )
-            )
-        return self.text_embedding(torch.stack(padded_context))
+            context_on_device.append(context_LC.to(device=device, dtype=weight_dtype))
+        compact_context_BLC, context_key_bias_BL = _compact_padded_context(
+            context_on_device,
+            text_len=self.text_len,
+            text_dim=self.text_dim,
+        )
+        return self.text_embedding(compact_context_BLC), context_key_bias_BL
 
     def _patchify(self, latents_BFCHW: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
         if latents_BFCHW.ndim != 5 or latents_BFCHW.size(2) != self.in_dim:
@@ -511,7 +550,7 @@ class WanModelForInference(WanModel):
         grid_size = tuple(patches_BCFHW.shape[2:])
         return patches_BCFHW.flatten(2).transpose(1, 2), grid_size
 
-    def _expand_timesteps(
+    def _compact_timesteps(
         self,
         timesteps: torch.Tensor,
         *,
@@ -523,9 +562,9 @@ class WanModelForInference(WanModel):
         if timesteps.ndim == 1:
             if timesteps.numel() != batch_size:
                 raise ValueError(f"timestep batch {timesteps.numel()} does not match {batch_size}")
-            return timesteps[:, None].expand(batch_size, seq_len)
+            return timesteps[:, None]
         if timesteps.shape == (batch_size, frames):
-            return timesteps.repeat_interleave(spatial_tokens, dim=1)
+            return timesteps
         if timesteps.shape == (batch_size, seq_len):
             return timesteps
         raise ValueError(
@@ -571,6 +610,7 @@ class WanModelForInference(WanModel):
         semantic_pos_S: torch.Tensor,
         input_mask: torch.Tensor | None,
         context_BLC: torch.Tensor,
+        context_key_bias_BL: torch.Tensor | None = None,
         cross_attention_mask: torch.Tensor | None = None,
         cache_pos_S: torch.Tensor | None = None,
         cache_seq_length: int | None = None,
@@ -580,22 +620,23 @@ class WanModelForInference(WanModel):
         frames, height, width = grid_size
         if semantic_pos_S.numel() != seq_len:
             raise ValueError(f"semantic_pos has {semantic_pos_S.numel()} entries for {seq_len} tokens")
-        t_BS = self._expand_timesteps(
+        t_BK = self._compact_timesteps(
             timesteps,
             batch_size=batch_size,
             frames=frames,
             spatial_tokens=height * width,
         )
-        with _autocast_disabled(t_BS):
-            timestep_embedding_BSC = sinusoidal_embedding_1d(
+        conditioning_len = t_BK.size(1)
+        with _autocast_disabled(t_BK):
+            timestep_embedding_BKC = sinusoidal_embedding_1d(
                 self.freq_dim,
-                t_BS.flatten(),
-            ).unflatten(0, (batch_size, seq_len))
+                t_BK.flatten(),
+            ).unflatten(0, (batch_size, conditioning_len))
             time_dtype = self.time_embedding[0].weight.dtype
-            e_BSC = self.time_embedding(timestep_embedding_BSC.to(time_dtype)).float()
+            e_BKC = self.time_embedding(timestep_embedding_BKC.to(time_dtype)).float()
             projection_dtype = self.time_projection[1].weight.dtype
-            e_BS6C = (
-                self.time_projection(e_BSC.to(projection_dtype))
+            e_BK6C = (
+                self.time_projection(e_BKC.to(projection_dtype))
                 .float()
                 .unflatten(
                     2,
@@ -607,11 +648,12 @@ class WanModelForInference(WanModel):
         for block in self.blocks:
             x_BSC = block(
                 x_BSC,
-                e_BS6C,
+                e_BK6C,
                 grid_size,
                 freqs_MD,
                 context_BLC,
                 None,
+                context_key_bias_BL,
                 semantic_pos_S=semantic_pos_S,
                 spatial_grid=(height, width),
                 cache_pos_S=cache_pos_S,
@@ -619,7 +661,7 @@ class WanModelForInference(WanModel):
                 input_mask=input_mask,
                 cross_attention_mask=cross_attention_mask,
             )
-        return self._unpatchify_uniform(self.head(x_BSC, e_BSC), grid_size)
+        return self._unpatchify_uniform(self.head(x_BSC, e_BKC, grid_size), grid_size)
 
     def forward_causal(
         self,
@@ -641,7 +683,7 @@ class WanModelForInference(WanModel):
             semantic_pos_S,
             spatial_tokens,
         ).view(1, 1, semantic_pos_S.numel(), semantic_pos_S.numel())
-        context_BLC = self._project_context(
+        context_BLC, context_key_bias_BL = self._project_context_with_bias(
             context,
             batch_size=batch_size,
             device=latents_BFCHW.device,
@@ -652,6 +694,7 @@ class WanModelForInference(WanModel):
             semantic_pos_S=semantic_pos_S,
             input_mask=input_mask,
             context_BLC=context_BLC,
+            context_key_bias_BL=context_key_bias_BL,
         )
 
     def _has_compatible_caches(
@@ -779,13 +822,13 @@ class WanModelForInference(WanModel):
         decode_tokens: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        null_context_BLC = self._project_context(
+        null_context_BLC, null_key_bias_BL = self._project_context_with_bias(
             None,
             batch_size=batch_size,
             device=device,
             use_packaged_context=False,
         )
-        conditional_context_BLC = self._project_context(
+        conditional_context_BLC, conditional_key_bias_BL = self._project_context_with_bias(
             context,
             batch_size=batch_size,
             device=device,
@@ -795,9 +838,35 @@ class WanModelForInference(WanModel):
             dim=1,
         )
         query_branch_Q = torch.arange(2, device=device).repeat_interleave(decode_tokens)
-        key_branch_K = torch.arange(2, device=device).repeat_interleave(self.text_len)
-        cross_attention_mask = (query_branch_Q.view(-1, 1) == key_branch_K.view(1, -1)).view(
-            1, 1, decode_tokens * 2, self.text_len * 2
+        key_branch_K = torch.cat(
+            (
+                torch.zeros(null_context_BLC.size(1), device=device, dtype=torch.long),
+                torch.ones(conditional_context_BLC.size(1), device=device, dtype=torch.long),
+            )
+        )
+        branch_mask_11QK = (query_branch_Q.view(-1, 1) == key_branch_K.view(1, -1)).view(
+            1, 1, decode_tokens * 2, key_branch_K.numel()
+        )
+        if null_key_bias_BL is None:
+            null_key_bias_BL = torch.zeros(
+                (batch_size, null_context_BLC.size(1)),
+                device=device,
+                dtype=torch.float32,
+            )
+        if conditional_key_bias_BL is None:
+            conditional_key_bias_BL = torch.zeros(
+                (batch_size, conditional_context_BLC.size(1)),
+                device=device,
+                dtype=torch.float32,
+            )
+        packed_key_bias_B11K = torch.cat(
+            (null_key_bias_BL, conditional_key_bias_BL),
+            dim=1,
+        ).view(batch_size, 1, 1, -1)
+        cross_attention_mask = torch.where(
+            branch_mask_11QK,
+            packed_key_bias_B11K,
+            packed_key_bias_B11K.new_tensor(float("-inf")),
         )
         return packed_context_BL2C, cross_attention_mask
 
@@ -816,7 +885,7 @@ class WanModelForInference(WanModel):
         width = latents_BFCHW.size(4) // self.patch_size[2]
         prefix_tokens = frames * height * width
         prefix_pos_P = torch.arange(prefix_tokens, device=latents_BFCHW.device)
-        context_BLC = self._project_context(
+        context_BLC, context_key_bias_BL = self._project_context_with_bias(
             None,
             batch_size=batch_size,
             device=latents_BFCHW.device,
@@ -832,6 +901,7 @@ class WanModelForInference(WanModel):
             semantic_pos_S=prefix_pos_P,
             input_mask=input_mask,
             context_BLC=context_BLC,
+            context_key_bias_BL=context_key_bias_BL,
             cache_pos_S=prefix_pos_P,
             cache_seq_length=cache_seq_length,
         )
@@ -881,10 +951,11 @@ class WanModelForInference(WanModel):
                 decode_tokens=decode_tokens,
                 device=latents_BFCHW.device,
             )
+            context_key_bias_BL = None
         else:
             packed_latents_BFCHW = latents_BFCHW
             packed_timesteps = timesteps
-            context_BLC = self._project_context(
+            context_BLC, context_key_bias_BL = self._project_context_with_bias(
                 context,
                 batch_size=batch_size,
                 device=latents_BFCHW.device,
@@ -897,6 +968,7 @@ class WanModelForInference(WanModel):
             semantic_pos_S=semantic_pos_S,
             input_mask=input_mask,
             context_BLC=context_BLC,
+            context_key_bias_BL=context_key_bias_BL,
             cross_attention_mask=cross_attention_mask,
             cache_pos_S=cache_pos_S,
             cache_seq_length=cache_seq_length,

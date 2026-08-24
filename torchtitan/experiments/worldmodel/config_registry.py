@@ -72,8 +72,8 @@ __all__ = [
 
 def worldmodel() -> WorldModelTrainer.Config:
     local_batch_size = 16
-    validation_freq = 32
-    steps = validation_freq * 30
+    validation_freq = 512
+    steps = validation_freq * 10
     validation_steps = 8
     compile_config = CompileConfig(enable=True, components=["model", "loss"])
     optimizer = default_adamw(lr=2e-4, weight_decay=1e-2)
@@ -234,6 +234,7 @@ def worldmodel_wan() -> WanWorldModelTrainer.Config:
         validator=_wan_validator_config(
             base.validator,
             dataloader=validation_dataloader,
+            local_batch_size_override=4,
             pose_dropout=0.0,
             no_noise_prefill_frames_prob=0.0,
             fake_timesteps_prob=0.0,

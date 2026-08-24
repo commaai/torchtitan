@@ -38,9 +38,10 @@ from torchtitan.tools.logging import logger
 
 
 # Shape suffix legend for this file:
-# B: batch, S: padded video-patch sequence, L: text sequence, N: attention
-# heads, D: head dimension, C: channel/embedding dimension, F/H/W: video
-# frame/height/width dimensions, and M: a flattened position dimension.
+# B: batch, S: padded video-patch sequence, K: compact conditioning sequence,
+# L: text sequence, N: attention heads, D: head dimension, C: channel/embedding
+# dimension, F/H/W: video frame/height/width dimensions, and M: a flattened
+# position dimension.
 
 WAN_TI2V_5B_REPO_ID = "Wan-AI/Wan2.2-TI2V-5B"
 WAN_TI2V_5B_MODEL_TYPE = "ti2v"
@@ -223,6 +224,27 @@ def _autocast_disabled(tensor: torch.Tensor) -> AbstractContextManager:
     return torch.autocast(device_type=tensor.device.type, enabled=False)
 
 
+def frame_block_causal_mask(
+    query_pos_Q: torch.Tensor,
+    key_pos_K: torch.Tensor,
+    spatial_tokens: int,
+) -> torch.Tensor:
+    """Allow a latent frame to see itself and all earlier latent frames."""
+    if spatial_tokens <= 0:
+        raise ValueError(f"spatial_tokens must be positive, got {spatial_tokens}")
+    query_frames_Q = torch.div(
+        query_pos_Q,
+        spatial_tokens,
+        rounding_mode="floor",
+    )
+    key_frames_K = torch.div(
+        key_pos_K,
+        spatial_tokens,
+        rounding_mode="floor",
+    )
+    return key_frames_K.view(1, -1) <= query_frames_Q.view(-1, 1)
+
+
 def _attention_mask(
     *,
     query_len: int,
@@ -270,6 +292,8 @@ def _scaled_dot_product_attention(
     v_BLND: torch.Tensor,
     *,
     key_lens_B: torch.Tensor | None = None,
+    key_bias_BL: torch.Tensor | None = None,
+    input_mask: torch.Tensor | None = None,
     window_size: tuple[int, int] = (-1, -1),
 ) -> torch.Tensor:
     # Upstream FlashAttention casts normalized float32 queries and keys to the
@@ -286,6 +310,50 @@ def _scaled_dot_product_attention(
         window_size=window_size,
         device=q_BNSD.device,
     )
+    if input_mask is not None:
+        if input_mask.ndim == 2:
+            input_mask = input_mask.view(1, 1, *input_mask.shape)
+        elif input_mask.ndim == 3:
+            input_mask = input_mask.unsqueeze(1)
+        if input_mask.ndim != 4:
+            raise ValueError(
+                "attention mask must have 2, 3, or 4 dimensions, "
+                f"got {input_mask.ndim}"
+            )
+        if input_mask.dtype != torch.bool:
+            raise ValueError(
+                f"Wan self-attention mask must be bool, got {input_mask.dtype}"
+            )
+        if input_mask.shape[-2:] != (
+            q_BNSD.size(2),
+            k_BNLD.size(2),
+        ):
+            raise ValueError(
+                "attention mask query/key shape must be "
+                f"[{q_BNSD.size(2)}, {k_BNLD.size(2)}], got "
+                f"{tuple(input_mask.shape[-2:])}"
+            )
+        input_mask = input_mask.to(device=q_BNSD.device)
+        attention_mask_B1SL = (
+            input_mask
+            if attention_mask_B1SL is None
+            else attention_mask_B1SL & input_mask
+        )
+    if key_bias_BL is not None:
+        if key_bias_BL.shape != (q_BNSD.size(0), k_BNLD.size(2)):
+            raise ValueError(
+                "key bias must have shape "
+                f"[{q_BNSD.size(0)}, {k_BNLD.size(2)}], got {tuple(key_bias_BL.shape)}"
+            )
+        key_bias_B11L = key_bias_BL.to(device=q_BNSD.device, dtype=q_BNSD.dtype).view(
+            q_BNSD.size(0), 1, 1, k_BNLD.size(2)
+        )
+        if attention_mask_B1SL is None:
+            attention_mask_B1SL = key_bias_B11L
+        elif attention_mask_B1SL.dtype == torch.bool:
+            attention_mask_B1SL = key_bias_B11L.masked_fill(~attention_mask_B1SL, float("-inf"))
+        else:
+            attention_mask_B1SL = attention_mask_B1SL + key_bias_B11L
     output_BNSD = F.scaled_dot_product_attention(
         q_BNSD,
         k_BNLD,
@@ -295,6 +363,108 @@ def _scaled_dot_product_attention(
         is_causal=False,
     )
     return output_BNSD.transpose(1, 2).contiguous()
+
+
+def _compact_padded_context(
+    context: Sequence[torch.Tensor],
+    *,
+    text_len: int,
+    text_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Collapse identical zero-padding tokens without changing their softmax mass.
+
+    Official Wan pads every raw text context to ``text_len`` with zeros before
+    the token-wise text MLP. All of those padding tokens therefore produce the
+    same key and value. One copy with an additive ``log(padding_count)`` key
+    bias is mathematically equivalent to attending to every duplicate.
+    """
+    if not context:
+        raise ValueError("context must contain at least one sample")
+
+    lengths: list[int] = []
+    compressed_lengths: list[int] = []
+    for context_LC in context:
+        if context_LC.ndim != 2 or context_LC.size(1) != text_dim:
+            raise ValueError(f"each context must have shape [L, {text_dim}], got {tuple(context_LC.shape)}")
+        context_length = context_LC.size(0)
+        if context_length > text_len:
+            raise ValueError(f"context length {context_length} exceeds text_len {text_len}")
+        lengths.append(context_length)
+        compressed_lengths.append(context_length + int(context_length < text_len))
+
+    compressed_len = max(compressed_lengths)
+    context_BLC = context[0].new_zeros((len(context), compressed_len, text_dim))
+    key_bias_BL = torch.full(
+        (len(context), compressed_len),
+        float("-inf"),
+        device=context_BLC.device,
+        dtype=torch.float32,
+    )
+    for batch_idx, (context_LC, context_length) in enumerate(zip(context, lengths)):
+        context_BLC[batch_idx, :context_length] = context_LC
+        key_bias_BL[batch_idx, :context_length] = 0
+        padding_count = text_len - context_length
+        if padding_count:
+            # context_BLC[:, context_length] is the single retained raw zero token.
+            key_bias_BL[batch_idx, context_length] = math.log(padding_count)
+
+    if all(context_length == text_len for context_length in lengths):
+        return context_BLC, None
+    return context_BLC, key_bias_BL
+
+
+def _conditioning_view(
+    conditioning_BKC: torch.Tensor,
+    x_BSC: torch.Tensor,
+    grid_size: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Return conditioning and activations with a broadcastable token layout."""
+    batch_size, seq_len = x_BSC.shape[:2]
+    frames, height, width = grid_size
+    if seq_len != frames * height * width:
+        raise ValueError(f"token length {seq_len} does not match conditioning grid {grid_size}")
+    if conditioning_BKC.size(0) != batch_size:
+        raise ValueError(
+            f"conditioning batch {conditioning_BKC.size(0)} does not match activation batch {batch_size}"
+        )
+
+    conditioning_len = conditioning_BKC.size(1)
+    if conditioning_len == seq_len:
+        return conditioning_BKC, x_BSC, False
+    if conditioning_len == 1:
+        return conditioning_BKC, x_BSC, False
+    if conditioning_len == frames:
+        return (
+            conditioning_BKC.unsqueeze(2),
+            x_BSC.view(batch_size, frames, height * width, x_BSC.size(2)),
+            True,
+        )
+    raise ValueError(
+        "conditioning length must be one, framewise, or tokenwise; "
+        f"got {conditioning_len} for grid {grid_size}"
+    )
+
+
+def _modulate_wan(
+    x_BSC: torch.Tensor,
+    shift_BK1C: torch.Tensor,
+    scale_BK1C: torch.Tensor,
+    grid_size: tuple[int, int, int],
+) -> torch.Tensor:
+    shift, x, framewise = _conditioning_view(shift_BK1C.squeeze(2), x_BSC, grid_size)
+    scale, _, _ = _conditioning_view(scale_BK1C.squeeze(2), x_BSC, grid_size)
+    output = x.float() * (1 + scale) + shift
+    return output.flatten(1, 2) if framewise else output
+
+
+def _gate_wan(
+    x_BSC: torch.Tensor,
+    gate_BK1C: torch.Tensor,
+    grid_size: tuple[int, int, int],
+) -> torch.Tensor:
+    gate, x, framewise = _conditioning_view(gate_BK1C.squeeze(2), x_BSC, grid_size)
+    output = x.float() * gate
+    return output.flatten(1, 2) if framewise else output
 
 
 class WanRMSNorm(nn.Module):
@@ -357,6 +527,8 @@ class WanSelfAttention(nn.Module):
         x_BSC: torch.Tensor,
         grid_size: tuple[int, int, int],
         freqs_MD: torch.Tensor,
+        *,
+        input_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len = x_BSC.shape[:2]
         q_BSND = self.norm_q(self.q(x_BSC)).view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -369,6 +541,7 @@ class WanSelfAttention(nn.Module):
             q_BSND,
             k_BSND,
             v_BSND,
+            input_mask=input_mask,
             window_size=self.window_size,
         )
         return self.o(output_BSND.flatten(2))
@@ -380,6 +553,7 @@ class WanCrossAttention(WanSelfAttention):
         x_BSC: torch.Tensor,
         context_BLC: torch.Tensor,
         context_lens_B: torch.Tensor | None,
+        context_key_bias_BL: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = x_BSC.size(0)
         query_len = x_BSC.size(1)
@@ -392,6 +566,7 @@ class WanCrossAttention(WanSelfAttention):
             k_BLND,
             v_BLND,
             key_lens_B=context_lens_B,
+            key_bias_BL=context_key_bias_BL,
         )
         return self.o(output_BSND.flatten(2))
 
@@ -447,39 +622,54 @@ class WanAttentionBlock(nn.Module):
     def forward(
         self,
         x_BSC: torch.Tensor,
-        e_BS6C: torch.Tensor,
+        e_BK6C: torch.Tensor,
         grid_size: tuple[int, int, int],
         freqs_MD: torch.Tensor,
         context_BLC: torch.Tensor,
         context_lens_B: torch.Tensor | None,
+        context_key_bias_BL: torch.Tensor | None = None,
+        *,
+        input_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if e_BS6C.dtype != torch.float32:
-            raise ValueError(f"Wan modulation must be float32, got {e_BS6C.dtype}")
+        if e_BK6C.dtype != torch.float32:
+            raise ValueError(f"Wan modulation must be float32, got {e_BK6C.dtype}")
         with _autocast_disabled(x_BSC):
-            modulation_BS6C = self.modulation.float().unsqueeze(0) + e_BS6C
-            shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = modulation_BS6C.chunk(6, dim=2)
+            modulation_BK6C = self.modulation.float().unsqueeze(0) + e_BK6C
+            shift_msa, scale_msa, gate_msa, shift_ffn, scale_ffn, gate_ffn = modulation_BK6C.chunk(6, dim=2)
 
-        attention_input_BSC = self.norm1(x_BSC).float() * (1 + scale_msa.squeeze(2)) + shift_msa.squeeze(2)
+        attention_input_BSC = _modulate_wan(
+            self.norm1(x_BSC),
+            shift_msa,
+            scale_msa,
+            grid_size,
+        )
         attention_output_BSC = self.self_attn(
             attention_input_BSC.to(self.self_attn.q.weight.dtype),
             grid_size,
             freqs_MD,
+            input_mask=input_mask,
         )
         with _autocast_disabled(x_BSC):
-            x_BSC = x_BSC.float() + attention_output_BSC.float() * gate_msa.squeeze(2)
+            x_BSC = x_BSC.float() + _gate_wan(attention_output_BSC, gate_msa, grid_size)
 
         cross_attention_dtype = self.cross_attn.q.weight.dtype
         cross_attention_output_BSC = self.cross_attn(
             self.norm3(x_BSC).to(cross_attention_dtype),
             context_BLC.to(cross_attention_dtype),
             context_lens_B,
+            context_key_bias_BL,
         )
         with _autocast_disabled(x_BSC):
             x_BSC = x_BSC.float() + cross_attention_output_BSC.float()
-        ffn_input_BSC = self.norm2(x_BSC).float() * (1 + scale_ffn.squeeze(2)) + shift_ffn.squeeze(2)
+        ffn_input_BSC = _modulate_wan(
+            self.norm2(x_BSC),
+            shift_ffn,
+            scale_ffn,
+            grid_size,
+        )
         ffn_output_BSC = self.ffn(ffn_input_BSC.to(self.ffn[0].weight.dtype))
         with _autocast_disabled(x_BSC):
-            return x_BSC.float() + ffn_output_BSC.float() * gate_ffn.squeeze(2)
+            return x_BSC.float() + _gate_wan(ffn_output_BSC, gate_ffn, grid_size)
 
 
 class Head(nn.Module):
@@ -501,15 +691,25 @@ class Head(nn.Module):
         self.head = linears.head.build()
         self.modulation = nn.Parameter(torch.empty(1, 2, dim))
 
-    def forward(self, x_BSC: torch.Tensor, e_BSC: torch.Tensor) -> torch.Tensor:
-        if e_BSC.dtype != torch.float32:
-            raise ValueError(f"Wan head modulation must be float32, got {e_BSC.dtype}")
+    def forward(
+        self,
+        x_BSC: torch.Tensor,
+        e_BKC: torch.Tensor,
+        grid_size: tuple[int, int, int],
+    ) -> torch.Tensor:
+        if e_BKC.dtype != torch.float32:
+            raise ValueError(f"Wan head modulation must be float32, got {e_BKC.dtype}")
         with _autocast_disabled(x_BSC):
-            shift_BS1C, scale_BS1C = (self.modulation.float().unsqueeze(0) + e_BSC.unsqueeze(2)).chunk(2, dim=2)
-            normalized_BSC = self.norm(x_BSC).float()
+            shift_BK1C, scale_BK1C = (self.modulation.float().unsqueeze(0) + e_BKC.unsqueeze(2)).chunk(2, dim=2)
+            normalized_BSC = _modulate_wan(
+                self.norm(x_BSC),
+                shift_BK1C,
+                scale_BK1C,
+                grid_size,
+            )
             bias_C = self.head.bias.float() if self.head.bias is not None else None
             return F.linear(
-                normalized_BSC * (1 + scale_BS1C.squeeze(2)) + shift_BS1C.squeeze(2),
+                normalized_BSC,
                 self.head.weight.float(),
                 bias_C,
             )
@@ -534,6 +734,10 @@ class WanModel(BaseModel):
         window_size: tuple[int, int] = (-1, -1)
         qk_norm: bool = True
         cross_attn_norm: bool = True
+        # Official Wan checkpoints are bidirectional. The worldmodel fine-tune
+        # factories select DiT's frame-block-causal attention contract without
+        # changing any checkpoint parameter names.
+        attention_mask: str = "NONE"
         eps: float = 1e-6
         rope_max_seq_len: int = 1024
         # Derived configurable Linear trees let TorchTitan's training-time FP8
@@ -558,6 +762,13 @@ class WanModel(BaseModel):
                 raise ValueError(f"freq_dim must be even, got {self.freq_dim}")
             if self.text_len <= 0 or self.num_layers <= 0 or self.rope_max_seq_len <= 0:
                 raise ValueError("text_len, num_layers, and rope_max_seq_len must be positive")
+            if self.attention_mask not in {
+                "NONE",
+                "BLOCKWISE_LOWER_TRIANGLE",
+            }:
+                raise ValueError(
+                    f"unsupported Wan attention_mask {self.attention_mask!r}"
+                )
             self._sync_derived_fields()
 
         def _sync_derived_fields(self) -> None:
@@ -677,6 +888,7 @@ class WanModel(BaseModel):
         self.window_size = config.window_size
         self.qk_norm = config.qk_norm
         self.cross_attn_norm = config.cross_attn_norm
+        self.attention_mask = config.attention_mask
         self.eps = config.eps
 
         self.patch_embedding = nn.Conv3d(
@@ -721,6 +933,10 @@ class WanModel(BaseModel):
             config.eps,
             config.head,
         )
+        # This is derived solely from the runtime latent grid, is shared by all
+        # transformer blocks, and intentionally stays out of the checkpoint.
+        self._block_causal_mask: torch.Tensor | None = None
+        self._block_causal_mask_key: tuple[str, int, int] | None = None
 
         head_dim = config.dim // config.num_heads
         # Keep this as a plain tensor, matching upstream. Registering it as a
@@ -788,6 +1004,25 @@ class WanModel(BaseModel):
         context_B1C[..., 0] = 1
         return context_B1C
 
+    @torch.no_grad()
+    def _get_block_causal_mask(
+        self,
+        *,
+        seq_len: int,
+        spatial_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (str(device), seq_len, spatial_tokens)
+        if self._block_causal_mask is None or self._block_causal_mask_key != key:
+            positions_S = torch.arange(seq_len, device=device)
+            self._block_causal_mask = frame_block_causal_mask(
+                positions_S,
+                positions_S,
+                spatial_tokens,
+            ).view(1, 1, seq_len, seq_len)
+            self._block_causal_mask_key = key
+        return self._block_causal_mask
+
     def forward(
         self,
         x: Sequence[torch.Tensor],
@@ -830,52 +1065,58 @@ class WanModel(BaseModel):
         if x_BSC.size(1) != seq_len:
             raise ValueError(f"full patch sequence has length {x_BSC.size(1)}, but seq_len is {seq_len}")
 
+        frames = grid_size[0]
+        self_attention_mask = (
+            self._get_block_causal_mask(
+                seq_len=seq_len,
+                spatial_tokens=grid_size[1] * grid_size[2],
+                device=x_BSC.device,
+            )
+            if self.attention_mask == "BLOCKWISE_LOWER_TRIANGLE"
+            else None
+        )
         if t.ndim == 1:
             if t.numel() != batch_size:
                 raise ValueError(f"t batch {t.numel()} does not match x batch {batch_size}")
-            t_BS = t[:, None].expand(batch_size, seq_len)
-        elif t.shape == (batch_size, seq_len):
-            t_BS = t
+            t_BK = t[:, None]
+        elif t.shape in ((batch_size, frames), (batch_size, seq_len)):
+            t_BK = t
         else:
-            raise ValueError(f"t must have shape [{batch_size}] or [{batch_size}, {seq_len}], got {tuple(t.shape)}")
+            raise ValueError(
+                f"t must have shape [{batch_size}], [{batch_size}, {frames}], "
+                f"or [{batch_size}, {seq_len}], got {tuple(t.shape)}"
+            )
 
-        with _autocast_disabled(t_BS):
-            timestep_embedding_BSC = sinusoidal_embedding_1d(self.freq_dim, t_BS.flatten()).unflatten(
-                0, (batch_size, seq_len)
+        conditioning_len = t_BK.size(1)
+        with _autocast_disabled(t_BK):
+            timestep_embedding_BKC = sinusoidal_embedding_1d(self.freq_dim, t_BK.flatten()).unflatten(
+                0, (batch_size, conditioning_len)
             )
             time_dtype = self.time_embedding[0].weight.dtype
-            e_BSC = self.time_embedding(timestep_embedding_BSC.to(time_dtype)).float()
+            e_BKC = self.time_embedding(timestep_embedding_BKC.to(time_dtype)).float()
             projection_dtype = self.time_projection[1].weight.dtype
-            e_BS6C = self.time_projection(e_BSC.to(projection_dtype)).float().unflatten(2, (6, self.dim))
+            e_BK6C = self.time_projection(e_BKC.to(projection_dtype)).float().unflatten(2, (6, self.dim))
 
-        padded_context = []
-        for context_LC in context:
-            if context_LC.ndim != 2 or context_LC.size(1) != self.text_dim:
-                raise ValueError(f"each context must have shape [L, {self.text_dim}], got {tuple(context_LC.shape)}")
-            if context_LC.size(0) > self.text_len:
-                raise ValueError(f"context length {context_LC.size(0)} exceeds text_len {self.text_len}")
-            padded_context.append(
-                torch.cat(
-                    (
-                        context_LC,
-                        context_LC.new_zeros(self.text_len - context_LC.size(0), self.text_dim),
-                    ),
-                    dim=0,
-                )
-            )
-        context_BLC = self.text_embedding(torch.stack(padded_context))
+        compact_context_BLC, context_key_bias_BL = _compact_padded_context(
+            context,
+            text_len=self.text_len,
+            text_dim=self.text_dim,
+        )
+        context_BLC = self.text_embedding(compact_context_BLC)
 
         for block in self.blocks:
             x_BSC = block(
                 x_BSC,
-                e_BS6C,
+                e_BK6C,
                 grid_size,
                 freqs_MD,
                 context_BLC,
                 None,
+                context_key_bias_BL,
+                input_mask=self_attention_mask,
             )
 
-        output_BSC = self.head(x_BSC, e_BSC)
+        output_BSC = self.head(x_BSC, e_BKC, grid_size)
         return [sample_CFH.float() for sample_CFH in self.unpatchify(output_BSC, grid_size)]
 
     def unpatchify(
@@ -1069,7 +1310,7 @@ def _apply_wan_fsdp(
 
 def wan_ti2v_5b_config() -> WanModel.Config:
     """Return the official Wan2.2 TI2V-5B transformer configuration."""
-    return WanModel.Config()
+    return WanModel.Config(attention_mask="BLOCKWISE_LOWER_TRIANGLE")
 
 
 def wan_debug_config() -> WanModel.Config:
@@ -1085,6 +1326,7 @@ def wan_debug_config() -> WanModel.Config:
         out_dim=4,
         num_heads=4,
         num_layers=1,
+        attention_mask="BLOCKWISE_LOWER_TRIANGLE",
         rope_max_seq_len=16,
     )
 

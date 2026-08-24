@@ -190,6 +190,10 @@ def _prepare_wan_batch(
     dtype: torch.dtype,
     scheduler: RFScheduler,
     discrete_timesteps: torch.Tensor,
+    inference_prefill_frames: int,
+    future_size_frames: int,
+    no_noise_prefill_frames_prob: float,
+    fake_timesteps_prob: float,
     train: bool,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     del targets
@@ -227,20 +231,36 @@ def _prepare_wan_batch(
                 device=device,
             )
             timesteps_B = discrete_timesteps[indexes_B]
+        # Keep the RF conditioning framewise, matching the DiT path. WanModel
+        # broadcasts these values over each frame's spatial patch tokens.
+        timesteps_BF = timesteps_B[:, None].expand(batch_size, num_frames).clone()
+        mask_BFCHW = torch.ones_like(
+            latents_BFCHW,
+            device=device,
+            dtype=torch.bool,
+        )
+        fake_timesteps_BF = timesteps_BF.clone()
+        if torch.rand((), device=device) < no_noise_prefill_frames_prob:
+            end = min(inference_prefill_frames, num_frames)
+            mask_BFCHW[:, :end] = False
+            timesteps_BF[:, :end] = scheduler.no_noise_timestep
+            fake_timesteps_BF[:, :end] = scheduler.no_noise_timestep
+            start = min(future_size_frames, end)
+            if start < end and torch.rand((), device=device) < fake_timesteps_prob:
+                fake_timesteps_BF[:, start:end] = scheduler.sample_timestep(
+                    (batch_size, end - start)
+                )
+                mask_BFCHW[:, start:] = True
         noisy_latents_BFCHW = scheduler.add_noise(
             latents_BFCHW,
             noise_BFCHW,
-            timesteps_B,
+            fake_timesteps_BF,
         )
         prepared_targets = {
             # Preserve Wan's pretrained forward-flow convention. For
             # x_t=(1-t)*x_0+t*epsilon, upstream Wan predicts epsilon-x_0.
             "v": noise_BFCHW - latents_BFCHW,
-            "mask": torch.ones_like(
-                latents_BFCHW,
-                device=device,
-                dtype=torch.bool,
-            ),
+            "mask": mask_BFCHW,
         }
 
         # Production uses a cached raw UMT5 context. The null fallback keeps
@@ -263,7 +283,7 @@ def _prepare_wan_batch(
         "x": list(noisy_latents_BCFHW.unbind(0)),
         # Wan's published transformer uses [0, 1000], while RFScheduler and
         # the velocity target stay in the existing worldmodel [0, 1] domain.
-        "t": timesteps_B * 1000.0,
+        "t": timesteps_BF * 1000.0,
         "context": list(text_context_BLC.unbind(0)),
         "seq_len": seq_len,
     }, prepared_targets
@@ -298,6 +318,10 @@ def _prepare_training_batch(
             dtype=dtype,
             scheduler=scheduler,
             discrete_timesteps=discrete_timesteps,
+            inference_prefill_frames=inference_prefill_frames,
+            future_size_frames=future_size_frames,
+            no_noise_prefill_frames_prob=no_noise_prefill_frames_prob,
+            fake_timesteps_prob=fake_timesteps_prob,
             train=train,
         )
     if not isinstance(tokenizer, WorldModelTokenizer):
@@ -343,10 +367,18 @@ class WorldModelValidator(BaseValidator):
         noise_scheduler_steps: int
         no_noise_prefill_frames_prob: float
         fake_timesteps_prob: float
+        local_batch_size_override: int | None = None
 
         def __post_init__(self) -> None:
             if self.steps < 0:
                 raise ValueError("worldmodel validation steps must be >= 0")
+            if (
+                self.local_batch_size_override is not None
+                and self.local_batch_size_override <= 0
+            ):
+                raise ValueError(
+                    "worldmodel validation local_batch_size_override must be positive"
+                )
 
     def __init__(
         self,
@@ -374,7 +406,11 @@ class WorldModelValidator(BaseValidator):
         self.validation_context = validation_context
         self.metrics_processor = metrics_processor
         self.seq_len = seq_len
-        self.local_batch_size = local_batch_size
+        self.local_batch_size = (
+            config.local_batch_size_override
+            if config.local_batch_size_override is not None
+            else local_batch_size
+        )
         self.dataloader: WorldModelDataLoader | WanWorldModelDataLoader | None = None
         if self.config.steps != 0:
             self.dataloader = self.config.dataloader.build(
@@ -450,6 +486,9 @@ class WorldModelValidator(BaseValidator):
                         term_sums.get(name, torch.zeros((), device=device))
                         + term.float().sum()
                     )
+                # Do not overlap the next VAE encode with tensors retained from
+                # the preceding validation forward.
+                del model_inputs, targets, outputs, _loss_vec, terms
         finally:
             close = getattr(data_iterator, "close", None)
             if callable(close):

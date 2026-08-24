@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 from dataclasses import dataclass
 
@@ -63,6 +64,7 @@ class WanVAETokenizer(BaseTokenizer):
         self.config = config
         self._model: WanVAE | None = None
         self._model_key: tuple[torch.device, torch.dtype] | None = None
+        self._model_operation: str | None = None
         self._text_context_cpu: torch.Tensor | None = None
 
     def encode(
@@ -200,20 +202,31 @@ class WanVAETokenizer(BaseTokenizer):
         dtype: torch.dtype,
         operation: str,
     ) -> WanVAE:
+        if operation not in {"encode", "decode"}:
+            raise ValueError(f"unsupported Wan VAE operation {operation!r}")
         if not self.config.compressor_model:
             raise ValueError(f"cannot {operation} without tokenizer.compressor_model")
         device = torch.device(device)
         key = (device, dtype)
+        if self._model is not None and self._model_operation not in (None, operation):
+            previous_device = self._model_key[0] if self._model_key is not None else None
+            self._model = None
+            self._model_key = None
+            gc.collect()
+            if previous_device is not None and previous_device.type == "cuda":
+                torch.cuda.empty_cache()
         if self._model is None:
             self._model = WanVAE.from_pretrained(
                 self._checkpoint_path(),
                 device=device,
                 dtype=dtype,
+                component="encoder" if operation == "encode" else "decoder",
             )
             self._model_key = key
         elif self._model_key != key:
             self._model = self._model.to(device=device, dtype=dtype)
             self._model_key = key
+        self._model_operation = operation
         return self._model
 
     def _checkpoint_path(self) -> str:

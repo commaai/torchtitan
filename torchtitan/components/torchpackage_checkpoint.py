@@ -24,7 +24,7 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader
 
 from torchtitan.components import fs
-from torchtitan.components.checkpoint import CHECKPOINT_IO_TIMEOUT_SECONDS, CheckpointManager, MODEL
+from torchtitan.components.checkpoint import CheckpointManager, MODEL
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import init_logger, logger
 
@@ -123,14 +123,10 @@ def export_torch_package(
 
     with sl.log_trace_span("torch_package_load_dcp"):
         state_dict = recipe.build_empty_state_dict(recipe_state)
-        storage_reader = FsspecReader(
-            checkpoint_path,
-            timeout=CHECKPOINT_IO_TIMEOUT_SECONDS,
-        )
         dcp.load(
             state_dict,
-            storage_reader=storage_reader,
-            checkpoint_id=None,
+            storage_reader=FsspecReader(checkpoint_path),
+            checkpoint_id=checkpoint_path,
         )
 
     try:

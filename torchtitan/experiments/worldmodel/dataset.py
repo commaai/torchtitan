@@ -265,6 +265,10 @@ class WanWorldModelDataLoader(WanVAEDataLoader):
     class Config(WanVAEDataLoader.Config):
         context_size_frames: int = 41
         future_size_frames: int = 0
+        # Wan's VAE compresses 41 RGB frames into 11 latent frames. Keep the
+        # first 10 as the inference-style prefix and train on the real final
+        # latent (which contains the 41st RGB frame).
+        inference_prefill_frames: int = 10
         latent_channels: int = 48
         latent_size: tuple[int, int] = (16, 32)
         mock_latents: bool = False
@@ -279,6 +283,13 @@ class WanWorldModelDataLoader(WanVAEDataLoader):
             if self.clip_frames != total_frames:
                 raise ValueError(
                     "clip_frames must equal context_size_frames + future_size_frames"
+                )
+            latent_frames = 1 + (self.clip_frames - 1) // 4
+            if not 0 <= self.inference_prefill_frames < latent_frames:
+                raise ValueError(
+                    "inference_prefill_frames must leave at least one Wan latent "
+                    f"target frame; got {self.inference_prefill_frames} for "
+                    f"{latent_frames} latent frames"
                 )
             if self.latent_channels <= 0:
                 raise ValueError("latent_channels must be positive")
