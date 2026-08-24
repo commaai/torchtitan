@@ -6,15 +6,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from xx.training.lib.trainer import BaseTrainer
 
 from .loss import PathLoss
 from .onnx_checkpoint import PathOnnxCheckpointManager
-from .validate import PathValidator, segment_names_and_fidxs_from_info
+from .validate import PathValidator
 
 
 class PathTrainer(BaseTrainer):
