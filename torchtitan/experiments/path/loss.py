@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from xx.training.lib.driving import DrivingLoss, DrivingMetric
 
 import torch
 
@@ -17,12 +16,38 @@ from torchtitan.config import CompileConfig
 from torchtitan.tools.logging import logger
 
 
+def path_plan_mse(
+    pred: dict[str, torch.Tensor],
+    target: torch.Tensor,
+) -> torch.Tensor:
+    plan = pred["plan"][..., : target.shape[-1]]
+    return torch.nn.functional.mse_loss(plan.float(), target.float().detach(), reduction="sum")
+
+
+class PathMSELoss(BaseLoss):
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseLoss.Config):
+        pass
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        compile_config: CompileConfig | None = None,
+    ) -> None:
+        del config
+        self.fn = path_plan_mse
+        self._maybe_compile(compile_config)
+
+
 class PathLoss(BaseLoss):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLoss.Config):
         pass
 
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
+        from xx.training.lib.driving import DrivingLoss, DrivingMetric
+
         del config
         self.fn = None
         self.loss_fn = DrivingLoss()

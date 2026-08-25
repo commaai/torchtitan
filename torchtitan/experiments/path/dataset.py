@@ -19,6 +19,9 @@ from torchtitan.components.tokenizer import BaseTokenizer
 from .model_constants import FRAME_TYPE, N_FRAMES, SUPERCOMBO_FPS, VisionFrameType
 
 
+COMMA1M_REPO_ID = "commaai/comma1M"
+
+
 class PathDataLoader(BaseDataLoader):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
@@ -44,8 +47,6 @@ class PathDataLoader(BaseDataLoader):
         *,
         val: bool,
     ) -> Any:
-        from .comma1m_dataset import COMMA1M_REPO_ID
-
         if config.dataset == COMMA1M_REPO_ID:
             from .comma1m_dataset import Comma1MDataset
 
@@ -115,11 +116,18 @@ class PathDataLoader(BaseDataLoader):
 
     def __iter__(
         self,
-    ) -> Iterator[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]]:
+    ) -> Iterator[
+        tuple[
+            dict[str, torch.Tensor],
+            torch.Tensor | dict[str, torch.Tensor],
+        ]
+    ]:
         iterator = iter(self.loader)
         self._iterator = iterator
         try:
             for inputs, targets in iterator:
+                if self.config.dataset == COMMA1M_REPO_ID:
+                    targets = targets["plan"]
                 yield inputs, targets
         finally:
             iterator.close()

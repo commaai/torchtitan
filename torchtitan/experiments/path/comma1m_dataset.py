@@ -34,8 +34,8 @@ from openpilot.system.loggerd.config import CAMERA_FPS
 from scipy.ndimage import gaussian_filter1d
 from torch.utils.data import get_worker_info
 
+from .dataset import COMMA1M_REPO_ID as COMMA1M_REPO_ID
 
-COMMA1M_REPO_ID = "commaai/comma1M"
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
 W, H = MEDMODEL_INPUT_SIZE
 BIG_W, BIG_H = BIGMODEL_INPUT_SIZE
@@ -71,7 +71,6 @@ class Comma1MDataset:
     ) -> None:
         assert config.plan_only
         assert not config.rgb
-        assert not config.unvision
         assert config.dataset_path is not None
         assert not config.deterministic_fidxs
 
@@ -177,8 +176,8 @@ def _load_images(
     device_type = int(frame_info["device_type"].item())
     cameras = DEVICE_CAMERAS[CAMERA_BY_DEVICE_TYPE[device_type]]
 
-    fcamera_intrinsics = cameras.fcam.intrinsics
-    big_intrinsics = (cameras.ecam if big_camera == "ecamera" else cameras.fcam).intrinsics
+    fcamera_intrinsics = cameras.narrow_road.intrinsics
+    big_intrinsics = (cameras.wide_road if big_camera == "ecamera" else cameras.narrow_road).intrinsics
     med_matrices = [_transform_matrix(fcamera_intrinsics, medmodel_intrinsics, eulers) for eulers in eulers_view]
     big_matrices = [_transform_matrix(big_intrinsics, sbigmodel_intrinsics, eulers) for eulers in eulers_view]
 
