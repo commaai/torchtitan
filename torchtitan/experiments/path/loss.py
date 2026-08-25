@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from xx.training.lib.driving import DrivingLoss, DrivingMetric
+from .loss_fn import DrivingLoss, DrivingMetric
 
 import torch
 
