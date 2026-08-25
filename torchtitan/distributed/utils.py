@@ -321,7 +321,7 @@ def set_batch_invariance(enable: bool) -> None:
 
     # Set NCCL env vars for deterministic inter-GPU collectives.
     # Must be set BEFORE dist.init_process_group.
-    # Reference: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/batch_invariant.py
+    # Reference: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/determinism/batch_invariant.py
     os.environ["NCCL_LAUNCH_MODE"] = "GROUP"  # Fixed kernel launch ordering
     os.environ["NCCL_COLLNET_ENABLE"] = "0"  # Disable SHARP (non-deterministic IB HW reduce)
     os.environ["NCCL_NVLS_ENABLE"] = "0"  # Disable NVLink SHARP (non-deterministic NVSwitch HW reduce)
