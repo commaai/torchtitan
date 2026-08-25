@@ -6,18 +6,30 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability import structured_logger as sl
 from torchtitan.trainer import Trainer
 
 from .dataset import COMMA1M_IMGS_TARGET
 from .loss import PathMSELoss
+
+
+def _copy_microbatch(
+    batch: tuple[dict[str, torch.Tensor], torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    inputs, labels = batch
+    return (
+        {name: value.clone() for name, value in inputs.items()},
+        labels.clone(),
+    )
 
 
 class Comma1MPathTrainer(Trainer):
@@ -62,7 +74,24 @@ class Comma1MPathTrainer(Trainer):
 
     def train_step(self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]) -> None:
         self.path_loss.reset_component_metrics()
+        if self.gradient_accumulation_steps > 1:
+            data_iterator = map(_copy_microbatch, data_iterator)
         super().train_step(data_iterator)
+
+    def batch_generator(
+        self,
+        data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]],
+    ) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+        data_iterator = iter(data_iterable)
+        while True:
+            data_load_start = time.perf_counter()
+            try:
+                input_dict, labels = next(data_iterator)
+            except StopIteration as ex:
+                raise DataloaderExhaustedError() from ex
+            self.metrics_processor.ntokens_since_last_log += labels.shape[0]
+            self.metrics_processor.data_loading_times.append(time.perf_counter() - data_load_start)
+            yield input_dict, labels
 
     @sl.log_trace_span("post_dataloading_process")
     def post_dataloading_process(
