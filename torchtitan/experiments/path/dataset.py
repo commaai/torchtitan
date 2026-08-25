@@ -20,6 +20,7 @@ from .model_constants import FRAME_TYPE, N_FRAMES, SUPERCOMBO_FPS, VisionFrameTy
 
 
 COMMA1M_REPO_ID = "commaai/comma1M"
+COMMA1M_IMGS_TARGET = "_comma1m_imgs_target"
 
 
 class PathDataLoader(BaseDataLoader):
@@ -127,6 +128,7 @@ class PathDataLoader(BaseDataLoader):
         try:
             for inputs, targets in iterator:
                 if self.config.dataset == COMMA1M_REPO_ID:
+                    inputs[COMMA1M_IMGS_TARGET] = targets["imgs"]
                     targets = targets["plan"]
                 yield inputs, targets
         finally:

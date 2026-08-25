@@ -13,6 +13,8 @@ import torch
 from torchtitan.observability import structured_logger as sl
 from torchtitan.trainer import Trainer
 
+from .dataset import COMMA1M_IMGS_TARGET
+
 
 class Comma1MPathTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
@@ -24,9 +26,14 @@ class Comma1MPathTrainer(Trainer):
         self,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict]:
+        inputs = {name: value for name, value in input_dict.items() if name != COMMA1M_IMGS_TARGET}
+        targets = {
+            "plan": labels,
+            "imgs": input_dict[COMMA1M_IMGS_TARGET],
+        }
         self.ntokens_seen += labels.shape[0]
-        return input_dict, labels, {}
+        return inputs, targets, {}
 
     def close(self) -> None:
         self.dataloader.close()

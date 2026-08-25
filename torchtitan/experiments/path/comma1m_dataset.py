@@ -35,6 +35,7 @@ from scipy.ndimage import gaussian_filter1d
 from torch.utils.data import get_worker_info
 
 from .dataset import COMMA1M_REPO_ID as COMMA1M_REPO_ID
+from .model_constants import ModelInputs
 
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
 W, H = MEDMODEL_INPUT_SIZE
@@ -144,6 +145,25 @@ def _pack_image(rgb: np.ndarray) -> np.ndarray:
     y = yuv[:height].reshape(height // 2, 2, width // 2, 2).transpose(3, 1, 0, 2).reshape(4, height // 2, width // 2)
     uv = yuv[height:].reshape(2, height // 2, width // 2)
     return np.concatenate((y, uv))
+
+
+def _rgb_from_tensor(tensor: np.ndarray, size: tuple[int, int] = (128, 256)) -> np.ndarray:
+    height = tensor.shape[2] * 2
+    width = tensor.shape[3] * 2
+    frames = np.zeros((tensor.shape[0], height * 3 // 2, width), dtype=np.uint8)
+    frames[:, 0:height:2, 0::2] = tensor[:, 0]
+    frames[:, 1:height:2, 0::2] = tensor[:, 1]
+    frames[:, 0:height:2, 1::2] = tensor[:, 2]
+    frames[:, 1:height:2, 1::2] = tensor[:, 3]
+    frames[:, height : height + height // 4] = tensor[:, 4].reshape(-1, height // 4, width)
+    frames[:, height + height // 4 : height + height // 2] = tensor[:, 5].reshape(-1, height // 4, width)
+
+    output_height, output_width = size
+    output = np.zeros((tensor.shape[0], output_height, output_width, 3), dtype=np.uint8)
+    for index, frame in enumerate(frames):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_I420)
+        output[index] = cv2.resize(rgb, (output_width, output_height))
+    return output
 
 
 def _calibration_augmentations(rpy: np.ndarray, num_samples: int, val: bool) -> tuple[np.ndarray, np.ndarray]:
@@ -324,7 +344,7 @@ def _load_segment(
     inputs = {
         "img": images,
         "big_img": big_images,
-        "desire_pulse": np.full((len(fidxs), temporal_len, 8), -1.0, dtype=np.float32),
+        "desire_pulse": np.zeros((len(fidxs), temporal_len, 8), dtype=np.float32), # TODO: get from log
         "traffic_convention": traffic,
         "action_t": np.broadcast_to(action_t[:, None], (len(fidxs), temporal_len, 2)).copy(),
     }
@@ -334,4 +354,11 @@ def _load_segment(
         name: np.ascontiguousarray(value[valid]).reshape(valid.sum(), temporal_fidxs.shape[1], -1)
         for name, value in targets.items()
     }
+    targets["imgs"] = np.concatenate(
+        [
+            _rgb_from_tensor(inputs[ModelInputs.IMG][:, -1, -6:]),
+            _rgb_from_tensor(inputs[ModelInputs.BIG_IMG][:, -1, -6:]),
+        ],
+        axis=3,
+    )
     return inputs, targets

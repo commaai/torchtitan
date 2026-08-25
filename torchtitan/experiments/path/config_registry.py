@@ -162,22 +162,26 @@ def _comma1m_path(flavor: str) -> Comma1MPathTrainer.Config:
 
     steps = 1024 * 55
     num_nodes, local_world_size = _dp_degrees()
+    dataloader = _dataloader_config(
+        dataset=COMMA1M_REPO_ID,
+        dataset_path=os.getenv("COMMA1M_DATASET_PATH"),
+        split="train",
+        fps=SUPERCOMBO_FPS,
+        plan_only=True,
+        limit=None,
+        deterministic_fidxs=False,
+        pipeline_dir=None,
+        skip=1,
+        val_skip=1,
+    )
+    dataloader.num_writers = 1
+    dataloader.shuffle_size = 32
+    dataloader.min_mixing = 0
     return Comma1MPathTrainer.Config(
         loss=PathMSELoss.Config(),
         model_spec=model_registry(flavor),
         tokenizer=NoOpTokenizer.Config(),
-        dataloader=_dataloader_config(
-            dataset=COMMA1M_REPO_ID,
-            dataset_path=os.getenv("COMMA1M_DATASET_PATH"),
-            split="train",
-            fps=SUPERCOMBO_FPS,
-            plan_only=True,
-            limit=None,
-            deterministic_fidxs=False,
-            pipeline_dir=None,
-            skip=1,
-            val_skip=1,
-        ),
+        dataloader=dataloader,
         optimizer=_optimizer_config(),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=1024,
@@ -187,9 +191,9 @@ def _comma1m_path(flavor: str) -> Comma1MPathTrainer.Config:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=16,
+            local_batch_size=1,
             seq_len=1,
-            steps=steps,
+            steps=1,
             mixed_precision_param="bfloat16",
         ),
         parallelism=ParallelismConfig(

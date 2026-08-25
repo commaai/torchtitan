@@ -16,12 +16,27 @@ from torchtitan.config import CompileConfig
 from torchtitan.tools.logging import logger
 
 
-def path_plan_mse(
+def path_mse(
     pred: dict[str, torch.Tensor],
-    target: torch.Tensor,
+    targets: dict[str, torch.Tensor],
 ) -> torch.Tensor:
-    plan = pred["plan"][..., : target.shape[-1]]
-    return torch.nn.functional.mse_loss(plan.float(), target.float().detach(), reduction="sum")
+    target_plan = targets["plan"]
+    plan = pred["plan"][..., : target_plan.shape[-1]]
+    plan_mse = torch.nn.functional.mse_loss(
+        plan.float(),
+        target_plan.float().detach(),
+        reduction="sum",
+    )
+
+    pred_imgs = (pred["imgs"].float() / 127.5 - 1.0).clamp(-1.0, 1.0)
+    target_imgs = (targets["imgs"].permute(0, 3, 1, 2).float() / 127.5 - 1.0).clamp(-1.0, 1.0)
+    imgs_mse = torch.nn.functional.mse_loss(
+        pred_imgs,
+        target_imgs.detach(),
+        reduction="sum",
+    )
+    imgs_mse = imgs_mse * (target_plan.numel() / target_imgs.numel())
+    return plan_mse + imgs_mse
 
 
 class PathMSELoss(BaseLoss):
@@ -36,7 +51,7 @@ class PathMSELoss(BaseLoss):
         compile_config: CompileConfig | None = None,
     ) -> None:
         del config
-        self.fn = path_plan_mse
+        self.fn = path_mse
         self._maybe_compile(compile_config)
 
 
