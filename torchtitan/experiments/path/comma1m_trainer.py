@@ -6,20 +6,63 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
+from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability import structured_logger as sl
 from torchtitan.trainer import Trainer
 
 from .dataset import COMMA1M_IMGS_TARGET
+from .loss import PathMSELoss
 
 
 class Comma1MPathTrainer(Trainer):
+    path_loss: PathMSELoss
+
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
         pass
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        if not isinstance(self.loss_fn, PathMSELoss):
+            raise TypeError(f"Comma1MPathTrainer requires PathMSELoss, got {type(self.loss_fn).__name__}")
+        self.path_loss = self.loss_fn
+
+        base_log = self.metrics_processor.log
+
+        def log_with_loss_components(
+            step: int,
+            global_avg_loss: float,
+            global_max_loss: float,
+            grad_norm: float,
+            extra_metrics: dict[str, Any] | None = None,
+        ) -> None:
+            metrics = dict(extra_metrics or {})
+            loss_mesh = self.parallel_dims.get_optional_mesh("loss")
+            metrics.update(
+                {
+                    name: dist_utils.dist_sum(value, loss_mesh)
+                    for name, value in self.path_loss.get_component_metrics().items()
+                }
+            )
+            base_log(
+                step,
+                global_avg_loss,
+                global_max_loss,
+                grad_norm,
+                extra_metrics=metrics,
+            )
+
+        self.metrics_processor.log = log_with_loss_components
+
+    def train_step(self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]) -> None:
+        self.path_loss.reset_component_metrics()
+        super().train_step(data_iterator)
 
     @sl.log_trace_span("post_dataloading_process")
     def post_dataloading_process(

@@ -160,7 +160,7 @@ def _comma1m_path(flavor: str) -> Comma1MPathTrainer.Config:
     from .comma1m_trainer import Comma1MPathTrainer
     from .loss import PathMSELoss
 
-    steps = 1024 * 55
+    steps = 16
     num_nodes, local_world_size = _dp_degrees()
     dataloader = _dataloader_config(
         dataset=COMMA1M_REPO_ID,
@@ -175,25 +175,25 @@ def _comma1m_path(flavor: str) -> Comma1MPathTrainer.Config:
         val_skip=1,
     )
     dataloader.num_writers = 1
-    dataloader.shuffle_size = 32
+    dataloader.shuffle_size = 64
     dataloader.min_mixing = 0
     return Comma1MPathTrainer.Config(
         loss=PathMSELoss.Config(),
         model_spec=model_registry(flavor),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=dataloader,
-        optimizer=_optimizer_config(),
+        optimizer=_optimizer_config(lr=1e-6),
         lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=1024,
+            warmup_steps=0,
             total_steps=steps,
-            decay_ratio=0.1,
+            decay_ratio=0,
             decay_type="linear",
-            min_lr_factor=0.0,
+            min_lr_factor=0,
         ),
         training=TrainingConfig(
-            local_batch_size=1,
+            local_batch_size=8,
             seq_len=1,
-            steps=1,
+            steps=steps,
             mixed_precision_param="bfloat16",
         ),
         parallelism=ParallelismConfig(
@@ -204,12 +204,12 @@ def _comma1m_path(flavor: str) -> Comma1MPathTrainer.Config:
         checkpoint=CheckpointManager.Config(
             enable=True,
             folder="checkpoint",
-            interval=500,
+            interval=steps,
             enable_first_step_checkpoint=True,
         ),
         activation_checkpoint=FullAC.Config(),
         compile=CompileConfig(enable=True, components=["model", "loss"]),
-        metrics=MetricsProcessor.Config(log_freq=16, enable_wandb=True),
+        metrics=MetricsProcessor.Config(log_freq=1, enable_wandb=True),
         debug=DebugConfig(seed=0),
     )
 
@@ -287,8 +287,12 @@ def _checkpoint_config(
     )
 
 
-def _optimizer_config() -> OptimizersContainer.Config:
-    common = {"lr": 1e-3, "betas": (0.9, 0.95), "eps": 1e-8}
+def _optimizer_config(
+    lr: float = 1e-3,
+    betas: tuple[float, float] = (0.9, 0.95),
+    eps: float = 1e-8,
+) -> OptimizersContainer.Config:
+    common = {"lr": lr, "betas": betas, "eps": eps}
     no_decay = r"(point_policy\.hydra|temporal_policy\.temporal_hydra)\.(final_layer|scale_layer)"
     return OptimizersContainer.Config(
         implementation="fused_opt_states_bf16",
