@@ -33,6 +33,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.system.loggerd.config import CAMERA_FPS
 from scipy.ndimage import gaussian_filter1d
 from torch.utils.data import get_worker_info
+from torchtitan.observability import structured_logger as sl
 
 from .dataset import COMMA1M_REPO_ID
 from .model_constants import ModelInputs
@@ -88,6 +89,12 @@ class Comma1MDataset:
         ]
         segments = [segment for segment in segments if (hash(int(segment, 16)) % 10 == 0) == val]
         self.segments = segments[global_rank::global_world_size]
+        sl.log_trace_scalar(
+            {
+                "comma1m_segments": len(segments),
+                "local_comma1m_segments": len(self.segments),
+            }
+        )
 
     def __iter__(self):
         worker = get_worker_info()
