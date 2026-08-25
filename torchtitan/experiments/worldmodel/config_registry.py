@@ -72,7 +72,7 @@ __all__ = [
 
 def worldmodel() -> WorldModelTrainer.Config:
     local_batch_size = 16
-    validation_freq = 512
+    validation_freq = 128
     steps = validation_freq * 10
     validation_steps = 8
     compile_config = CompileConfig(enable=True, components=["model", "loss"])
@@ -92,7 +92,7 @@ def worldmodel() -> WorldModelTrainer.Config:
         dataloader=_dataloader_config(split="train"),
         optimizer=optimizer,
         lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=2 * validation_freq,
+            warmup_steps=1 * validation_freq,
             total_steps=steps,
             decay_ratio=0.1,
             decay_type="cosine",
@@ -127,7 +127,7 @@ def worldmodel() -> WorldModelTrainer.Config:
         checkpoint=WorldModelTorchPackageCheckpointManager.Config(
             enable=True,
             folder=checkpoint_folder,
-            interval=validation_freq * 5,
+            interval=validation_freq * 1,
             async_mode="async",
             keep_latest_k=0,
             enable_first_step_checkpoint=True,
@@ -221,7 +221,7 @@ def worldmodel_wan() -> WanWorldModelTrainer.Config:
         optimizer=optimizer,
         training=replace(
             base.training,
-            local_batch_size=8,
+            local_batch_size=4,
             global_batch_size=-1,
             seq_len=1,
         ),

@@ -180,6 +180,67 @@ def _prepare_worldmodel_batch(
     }, targets
 
 
+def _select_wan_sink_window(
+    latents_BFCHW: torch.Tensor,
+    *,
+    inference_prefill_frames: int,
+    train: bool,
+) -> torch.Tensor:
+    """Select ``[z0, recent context, target]`` from a continuous VAE stream."""
+    batch_size, source_frames = latents_BFCHW.shape[:2]
+    if batch_size % WanVAETokenizer.NUM_VIEWS:
+        raise ValueError(
+            "Wan sink-window selection requires paired fcam/ecam latent batches"
+        )
+    if inference_prefill_frames <= 0:
+        raise ValueError("Wan sink-window selection requires a positive prefill")
+
+    continuation_frames = inference_prefill_frames
+    max_recent_start = source_frames - continuation_frames
+    if max_recent_start < 1:
+        raise ValueError(
+            f"continuous Wan stream has {source_frames} latents, but sink plus "
+            f"{continuation_frames} continuation latents are required"
+        )
+
+    logical_batch_size = batch_size // WanVAETokenizer.NUM_VIEWS
+    if train:
+        recent_start_B = torch.randint(
+            1,
+            max_recent_start + 1,
+            (logical_batch_size,),
+            device=latents_BFCHW.device,
+        )
+    else:
+        recent_start_B = torch.full(
+            (logical_batch_size,),
+            max_recent_start,
+            device=latents_BFCHW.device,
+            dtype=torch.int64,
+        )
+    recent_start_B = recent_start_B.repeat(WanVAETokenizer.NUM_VIEWS)
+    recent_indices_BF = recent_start_B[:, None] + torch.arange(
+        continuation_frames,
+        device=latents_BFCHW.device,
+    )
+    frame_indices_BF = torch.cat(
+        (
+            torch.zeros(
+                (batch_size, 1),
+                device=latents_BFCHW.device,
+                dtype=torch.int64,
+            ),
+            recent_indices_BF,
+        ),
+        dim=1,
+    )
+    batch_indices_BF = torch.arange(
+        batch_size,
+        device=latents_BFCHW.device,
+    )[:, None]
+    return latents_BFCHW[batch_indices_BF, frame_indices_BF]
+
+
 def _prepare_wan_batch(
     *,
     model: WanModel,
@@ -202,9 +263,19 @@ def _prepare_wan_batch(
         raise ValueError(
             f"Wan latents must have shape [B, F, C, H, W], got {tuple(latents_BFCHW.shape)}"
         )
+    latents_BFCHW = _select_wan_sink_window(
+        latents_BFCHW,
+        inference_prefill_frames=inference_prefill_frames,
+        train=train,
+    )
     batch_size, num_frames, channels, height, width = latents_BFCHW.shape
     if num_frames < 1:
         raise ValueError("Wan worldmodel training requires at least one latent frame")
+    if not 0 < inference_prefill_frames < num_frames:
+        raise ValueError(
+            "Wan inference_prefill_frames must retain the sink and leave a target; "
+            f"got {inference_prefill_frames} for {num_frames} model frames"
+        )
     if channels != model.in_dim:
         raise ValueError(
             f"Wan model expects {model.in_dim} latent channels, got {channels}"
@@ -251,6 +322,12 @@ def _prepare_wan_batch(
                     (batch_size, end - start)
                 )
                 mask_BFCHW[:, start:] = True
+        # Latent zero is Wan's one-RGB-frame boundary latent and remains a
+        # persistent attention sink during rollout. It is always exact clean
+        # conditioning: never secretly noised and never a direct RF target.
+        timesteps_BF[:, 0] = scheduler.no_noise_timestep
+        fake_timesteps_BF[:, 0] = scheduler.no_noise_timestep
+        mask_BFCHW[:, 0] = False
         noisy_latents_BFCHW = scheduler.add_noise(
             latents_BFCHW,
             noise_BFCHW,
@@ -891,8 +968,12 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
                 "Wan model out_dim must match dataloader latent_channels"
             )
 
-        latent_frames = 1 + (config.dataloader.clip_frames - 1) // 4
-        latent_shape = (latent_frames, *config.dataloader.latent_size)
+        model_rgb_frames = (
+            config.dataloader.context_size_frames
+            + config.dataloader.future_size_frames
+        )
+        model_latent_frames = 1 + (model_rgb_frames - 1) // 4
+        latent_shape = (model_latent_frames, *config.dataloader.latent_size)
         if any(
             size % patch
             for size, patch in zip(latent_shape, model_config.patch_size)

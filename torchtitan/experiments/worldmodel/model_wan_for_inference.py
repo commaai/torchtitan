@@ -877,6 +877,7 @@ class WanModelForInference(WanModel):
         *,
         cache_seq_length: int,
         input_mask: torch.Tensor | None,
+        context: torch.Tensor | Sequence[torch.Tensor] | None = None,
     ) -> None:
         if latents_BFCHW.size(1) == 0:
             return
@@ -886,10 +887,9 @@ class WanModelForInference(WanModel):
         prefix_tokens = frames * height * width
         prefix_pos_P = torch.arange(prefix_tokens, device=latents_BFCHW.device)
         context_BLC, context_key_bias_BL = self._project_context_with_bias(
-            None,
+            context,
             batch_size=batch_size,
             device=latents_BFCHW.device,
-            use_packaged_context=False,
         )
         self._forward_chunk(
             latents_BFCHW,
@@ -1096,6 +1096,7 @@ class WanModelForInference(WanModel):
                 latents[:, :num_prefill_frames],
                 cache_seq_length=cache_seq_length,
                 input_mask=prefill_mask,
+                context=context,
             )
 
         scheduler = RFScheduler(

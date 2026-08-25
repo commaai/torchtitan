@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
@@ -16,7 +16,7 @@ import torch
 
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.experiments.wan_vae.dataset import WanVAEDataLoader
+from torchtitan.experiments.wan_vae.dataset import NATIVE_FPS, WanVAEDataLoader
 
 
 PLAN_SIZE = 15 * 33 * 2
@@ -243,6 +243,8 @@ class _MockWanWorldModelDataset:
 
     def __iter__(self) -> Iterator[tuple[dict[str, np.ndarray]]]:
         rng = np.random.default_rng(0)
+        # Match the real path: produce the complete continuous VAE stream and
+        # select the model-facing sink window after encoding.
         latent_frames = 1 + (self.config.clip_frames - 1) // 4
         latent_height, latent_width = self.config.latent_size
         shape = (
@@ -259,37 +261,44 @@ class _MockWanWorldModelDataset:
 
 
 class WanWorldModelDataLoader(WanVAEDataLoader):
-    """Expose the native-rate Wan VAE clips through the worldmodel batch ABI."""
+    """Expose continuous native-rate Wan clips through the worldmodel batch ABI."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(WanVAEDataLoader.Config):
+        clip_frames: int = field(init=False, default=0)
         context_size_frames: int = 41
         future_size_frames: int = 0
-        # Wan's VAE compresses 41 RGB frames into 11 latent frames. Keep the
-        # first 10 as the inference-style prefix and train on the real final
-        # latent (which contains the 41st RGB frame).
+        # Maximum source-frame distance from z0 to the causal endpoint of the
+        # first selected continuation latent.
+        max_sink_distance_frames: int = 30 * NATIVE_FPS
+        shuffle_size: int = 64
+        # The model always retains latent zero as a one-frame sink, followed by
+        # recent four-frame latent groups. Ten prefix latents leave one real
+        # four-frame target in the default 41-frame supervised span.
         inference_prefill_frames: int = 10
         latent_channels: int = 48
         latent_size: tuple[int, int] = (16, 32)
         mock_latents: bool = False
 
         def __post_init__(self) -> None:
-            WanVAEDataLoader.Config.__post_init__(self)
-            total_frames = self.context_size_frames + self.future_size_frames
+            model_rgb_frames = self.context_size_frames + self.future_size_frames
             if self.context_size_frames <= 0:
                 raise ValueError("context_size_frames must be positive")
             if self.future_size_frames < 0:
                 raise ValueError("future_size_frames must be non-negative")
-            if self.clip_frames != total_frames:
+            if self.max_sink_distance_frames < 4 or self.max_sink_distance_frames % 4:
+                raise ValueError("max_sink_distance_frames must be a positive multiple of 4")
+            if model_rgb_frames < 1 or (model_rgb_frames - 1) % 4:
+                raise ValueError("context_size_frames + future_size_frames must equal 1 + 4*n")
+            self.clip_frames = self.max_sink_distance_frames + model_rgb_frames - 4
+            WanVAEDataLoader.Config.__post_init__(self)
+            model_latent_frames = 1 + (model_rgb_frames - 1) // 4
+            if self.inference_prefill_frames != model_latent_frames - 1:
                 raise ValueError(
-                    "clip_frames must equal context_size_frames + future_size_frames"
-                )
-            latent_frames = 1 + (self.clip_frames - 1) // 4
-            if not 0 <= self.inference_prefill_frames < latent_frames:
-                raise ValueError(
-                    "inference_prefill_frames must leave at least one Wan latent "
-                    f"target frame; got {self.inference_prefill_frames} for "
-                    f"{latent_frames} latent frames"
+                    "inference_prefill_frames must retain the Wan sink and leave "
+                    "exactly one latent target; "
+                    f"got {self.inference_prefill_frames} for "
+                    f"{model_latent_frames} model latent frames"
                 )
             if self.latent_channels <= 0:
                 raise ValueError("latent_channels must be positive")

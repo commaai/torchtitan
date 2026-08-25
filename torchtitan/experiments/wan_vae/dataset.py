@@ -120,7 +120,9 @@ def get_data_from_segment(
     at the same source frame index. Camera-native intrinsics scaled to the Wan
     input size and zero calibration make the warp a whole-frame resize with no
     crop. ``frame_skip=1`` is deliberate: Wan's temporal compression consumes
-    native 20-fps frames.
+    native 20-fps frames. The returned source clip is always temporally
+    continuous; world-model sink-window selection happens only after VAE
+    encoding.
     """
 
     from xx.common.column_store import ColumnStoreReader
@@ -140,18 +142,17 @@ def get_data_from_segment(
         clips_per_segment=config.clips_per_segment,
         val=val,
     )
-    clips: list[np.ndarray] = []
-    for start in starts.tolist():
-        clips.append(
-            decode_synchronized_clip(
-                target,
-                pipeline_dir=config.pipeline_dir,
-                start_fidx=start,
-                clip_frames=config.clip_frames,
-                image_size=config.image_size,
-                local_rank=local_rank,
-            )
+    clips = [
+        decode_synchronized_clip(
+            target,
+            pipeline_dir=config.pipeline_dir,
+            start_fidx=start,
+            clip_frames=config.clip_frames,
+            image_size=config.image_size,
+            local_rank=local_rank,
         )
+        for start in starts.tolist()
+    ]
 
     videos = np.stack(clips, axis=0)
     # Store the clip only once in Gigashuffle. WanVAEDataLoader exposes the same
