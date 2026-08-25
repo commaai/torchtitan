@@ -38,7 +38,7 @@ from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 
 
-# B: batch, T: temporal steps, D: model width, A: action components.
+# B: batch, T: temporal steps, S: spatial tokens, D: model width, A: action components.
 ACTION_HEAD_NAME = "action"
 Q_HEAD_NAME = "q"
 
@@ -76,10 +76,10 @@ class Critic(Module):
         self.q_hydra = config.q_hydra.build()
 
     def forward(self, inputs: TemporalInputs, action: torch.Tensor) -> torch.Tensor:
-        features_BTD = inputs[ModelInputs.FEATURES]
-        dtype = features_BTD.dtype
+        features_BTSD = inputs[ModelInputs.FEATURES]
+        dtype = features_BTSD.dtype
         critic_features_BD = self.temporal_summarizer(
-            features_BTD[:, self.history_idxs],
+            features_BTSD[:, self.history_idxs],
             inputs[ModelInputs.DESIRE].to(dtype),
             inputs[ModelInputs.TRAFFIC][:, -1].to(dtype),
             inputs[ModelInputs.ACTION_T][:, -1].to(dtype),
@@ -97,7 +97,7 @@ def actor_config() -> TemporalPolicy.Config:
 
 
 def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
-    dim = actor.temporal_summarizer.pos_embedding.embedding_dim
+    dim = actor.temporal_summarizer.temporal_pos_embedding.embedding_dim
     hidden = 256 * math.ceil(2 * dim / 256)
     post_action_mlp = PathMLP.Config(
         norm=LayerNorm.Config(normalized_shape=dim),
@@ -199,7 +199,8 @@ class RLDrivingModel(BaseModel):
             ModelInputs.FEATURES: (
                 batch_size,
                 temporal_len,
-                summarizer.pos_embedding.embedding_dim,
+                summarizer.spatial_size,
+                summarizer.temporal_pos_embedding.embedding_dim,
             ),
             ModelInputs.DESIRE: (batch_size, temporal_len, desire_dim),
             ModelInputs.TRAFFIC: (

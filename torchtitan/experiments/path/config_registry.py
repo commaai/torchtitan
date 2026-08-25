@@ -11,7 +11,7 @@ from dataclasses import replace
 from functools import partial
 from typing import Literal
 
-from xx.datasets.constants import BASE_DIR_GT, DEFAULT_TEST_5K_LIST_TAGGED, DEFAULT_TRAIN_LIST
+from xx.comma_data.constants import BASE_DIR_GT, DEFAULT_TEST_5K_LIST_TAGGED, DEFAULT_TRAIN_LIST
 
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
@@ -127,7 +127,6 @@ def _path(flavor: str) -> PathTrainer.Config:
             base_folder=checkpoint_base_folder,
             interval=validation_freq,
         ),
-        fps=fps,
         activation_checkpoint=FullAC.Config(),
         compile=CompileConfig(enable=True, components=["model"]),
         metrics=MetricsProcessor.Config(log_freq=16, enable_reporterv2=True, save_freq=validation_freq),
@@ -214,7 +213,7 @@ def _checkpoint_config(folder: str, base_folder: str, interval: int) -> PathOnnx
     input_shapes = [
         [1, *frame_constants["frame_shapes"][ModelInputs.IMG]],
         [1, *frame_constants["frame_shapes"][ModelInputs.BIG_IMG]],
-        [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.FEATURES][0]],
+        [1, temporal_len, *TEMPORAL_INPUTS[ModelInputs.FEATURES]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.DESIRE][0]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.TRAFFIC][0]],
         [1, temporal_len, TEMPORAL_INPUTS[ModelInputs.ACTION_T][0]],

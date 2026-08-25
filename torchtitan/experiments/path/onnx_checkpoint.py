@@ -29,7 +29,8 @@ class _VisionOnnxModel(nn.Module):
 
     def forward(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         features = self.vision(inputs)
-        outputs = self.point_policy(features) | {"vision_features": features}
+        point_features = features.float().mean(dim=1).to(features.dtype)
+        outputs = self.point_policy(point_features) | {"vision_features": features}
         return {name: value.float() for name, value in outputs.items()}
 
 
