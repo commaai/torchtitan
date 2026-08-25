@@ -19,6 +19,10 @@ from torchtitan.components.tokenizer import BaseTokenizer
 from .model_constants import FRAME_TYPE, N_FRAMES, SUPERCOMBO_FPS, VisionFrameType
 
 
+COMMA1M_REPO_ID = "commaai/comma1M"
+COMMA1M_IMGS_TARGET = "_comma1m_imgs_target"
+
+
 class PathDataLoader(BaseDataLoader):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
@@ -44,6 +48,11 @@ class PathDataLoader(BaseDataLoader):
         *,
         val: bool,
     ) -> Any:
+        if config.dataset == COMMA1M_REPO_ID:
+            from .comma1m_dataset import Comma1MDataset
+
+            return Comma1MDataset(config, val, self.local_rank, self.dp_rank, self.dp_world_size)
+
         if config.pipeline_dir is None:
             raise ValueError("pipeline_dir is required for internal PATH datasets")
 
@@ -108,11 +117,14 @@ class PathDataLoader(BaseDataLoader):
 
     def __iter__(
         self,
-    ) -> Iterator[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]]:
+    ) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor | dict[str, torch.Tensor],]]:
         iterator = iter(self.loader)
         self._iterator = iterator
         try:
             for inputs, targets in iterator:
+                if self.config.dataset == COMMA1M_REPO_ID:
+                    inputs[COMMA1M_IMGS_TARGET] = targets["imgs"]
+                    targets = targets["plan"]
                 yield inputs, targets
         finally:
             iterator.close()

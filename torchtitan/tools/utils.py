@@ -93,11 +93,7 @@ def get_peak_flops(device_name: str) -> float:
         # Run the lspci command and capture the output
         result = subprocess.run(["lspci"], stdout=subprocess.PIPE, text=True)
         # Filter the output for lines containing both "NVIDIA" and "H100"
-        filtered_lines = [
-            line
-            for line in result.stdout.splitlines()
-            if "NVIDIA" in line and "H100" in line
-        ]
+        filtered_lines = [line for line in result.stdout.splitlines() if "NVIDIA" in line and "H100" in line]
         # Join all filtered lines into a single string
         device_name = " ".join(filtered_lines) or device_name
     except FileNotFoundError as e:
@@ -138,7 +134,7 @@ def get_peak_flops(device_name: str) -> float:
         # GB300 data from https://www.nvidia.com/en-us/data-center/dgx-gb300
         return 2.5e15
     elif "B300" in device_name or "B200" in device_name:
-        # data from https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
+        # Data from https://www.nvidia.com/en-us/data-center/hgx/
         # Checked after GB300 to avoid false match on "GB300"
         return 2.25e15
     elif "MI355X" in device_name:
@@ -178,18 +174,19 @@ def get_peak_flops(device_name: str) -> float:
             # https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/neuron-core-v4.html
             return 79e12 * 2
         else:
-            logger.warning(
-                f"Unknown neuron device: {neuron_device_name}, fallback to trn2/trn3"
-            )
+            logger.warning(f"Unknown neuron device: {neuron_device_name}, fallback to trn2/trn3")
             return 79e12 * 2
     elif "5090" in device_name:
-        # FP16/FP16 data from https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
+        # FP16/FP16 data:
+        # https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
         return 419.0e12
     elif "4090" in device_name:
-        # FP16/FP16 data from https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
+        # FP16/FP16 data:
+        # https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
         return 330.3e12
     elif "3090" in device_name:
-        # FP16/FP16 data from https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
+        # FP16/FP16 data:
+        # https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
         return 142.4e12
     else:  # for other GPU types, assume A100
         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
