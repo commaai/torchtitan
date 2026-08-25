@@ -117,12 +117,7 @@ class PathDataLoader(BaseDataLoader):
 
     def __iter__(
         self,
-    ) -> Iterator[
-        tuple[
-            dict[str, torch.Tensor],
-            torch.Tensor | dict[str, torch.Tensor],
-        ]
-    ]:
+    ) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor | dict[str, torch.Tensor],]]:
         iterator = iter(self.loader)
         self._iterator = iterator
         try:

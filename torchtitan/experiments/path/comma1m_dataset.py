@@ -34,8 +34,10 @@ from openpilot.system.loggerd.config import CAMERA_FPS
 from scipy.ndimage import gaussian_filter1d
 from torch.utils.data import get_worker_info
 
-from .dataset import COMMA1M_REPO_ID as COMMA1M_REPO_ID
+from .dataset import COMMA1M_REPO_ID
 from .model_constants import ModelInputs
+
+__all__ = ["COMMA1M_REPO_ID"]
 
 T_IDXS = np.asarray(ModelConstants.T_IDXS)
 W, H = MEDMODEL_INPUT_SIZE
@@ -344,7 +346,7 @@ def _load_segment(
     inputs = {
         "img": images,
         "big_img": big_images,
-        "desire_pulse": np.zeros((len(fidxs), temporal_len, 8), dtype=np.float32), # TODO: get from log
+        "desire_pulse": np.zeros((len(fidxs), temporal_len, 8), dtype=np.float32),  # TODO: get from log
         "traffic_convention": traffic,
         "action_t": np.broadcast_to(action_t[:, None], (len(fidxs), temporal_len, 2)).copy(),
     }

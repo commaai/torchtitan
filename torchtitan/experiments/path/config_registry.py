@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from functools import partial
-from typing import TYPE_CHECKING, Literal
+from typing import Literal, TYPE_CHECKING
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
