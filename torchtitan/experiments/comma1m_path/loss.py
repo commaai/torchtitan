@@ -96,4 +96,3 @@ class PathMSELoss(BaseLoss):
             accumulated = self._component_metrics.get(name)
             self._component_metrics[name] = value if accumulated is None else accumulated + value
         return loss
-
