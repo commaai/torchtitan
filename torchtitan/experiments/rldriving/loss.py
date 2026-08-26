@@ -50,7 +50,6 @@ def _critic_loss(
     action_reward_B = targets["action_reward"]
     rollout_action_BA = action_reward_B[:, 0:2]
     reward_B = action_reward_B[:, 2]
-    done_B = action_reward_B[:, 3]
 
     q1_rollout_B, q2_rollout_B = online_critic(
         inputs=current_inputs,
@@ -67,10 +66,10 @@ def _critic_loss(
             action=next_action_BA,
         )
         bootstrap_B = torch.minimum(q1_target_B, q2_target_B)
-        target_B = reward_B + gamma * (1.0 - done_B) * bootstrap_B
+        target_B = reward_B + gamma * bootstrap_B
         q_target_abs_gap_B = torch.abs(q1_target_B - q2_target_B)
         q_rollout_abs_gap_B = torch.abs(q1_rollout_B - q2_rollout_B)
-        q_target_clip_correction_B = gamma * (1.0 - done_B) * 0.5 * q_target_abs_gap_B
+        q_target_clip_correction_B = gamma * 0.5 * q_target_abs_gap_B
 
     critic_loss_B = 0.5 * (
         F.mse_loss(q1_rollout_B, target_B, reduction="none") + F.mse_loss(q2_rollout_B, target_B, reduction="none")
@@ -80,7 +79,6 @@ def _critic_loss(
         "q1_rollout": q1_rollout_B.detach(),
         "q2_rollout": q2_rollout_B.detach(),
         "reward": reward_B.detach(),
-        "done": done_B.detach(),
         "q_rollout_abs_gap": q_rollout_abs_gap_B.detach(),
         "q_target_abs_gap": q_target_abs_gap_B.detach(),
         "q_target_clip_correction": q_target_clip_correction_B.detach(),
@@ -110,13 +108,12 @@ def _actor_loss(
     actor_pi_B = -q1_new_B
     actor_q_abs_gap_B = torch.abs(q1_new_B - q2_new_B)
 
-    not_done_B = 1.0 - targets["action_reward"][:, 3]
     curvature_B = action_pred_BA[:, 0] / targets["speed"].squeeze(-1).square()
-    curvature_loss_B = not_done_B * curv_cost * curvature_B.square()
+    curvature_loss_B = curv_cost * curvature_B.square()
 
     command_jerk_BA = (next_actor_outputs[ACTION_OUTPUT][:, :2] - action_pred_BA[:, :2]).abs() * fps
-    smooth_lat_B = not_done_B * smooth_lat_cost * command_jerk_BA[:, 0].square()
-    smooth_long_B = not_done_B * smooth_long_cost * command_jerk_BA[:, 1].square()
+    smooth_lat_B = smooth_lat_cost * command_jerk_BA[:, 0].square()
+    smooth_long_B = smooth_long_cost * command_jerk_BA[:, 1].square()
     smooth_B = smooth_lat_B + smooth_long_B
     actor_loss_B = actor_pi_B + curvature_loss_B + smooth_B
 
@@ -130,10 +127,10 @@ def _actor_loss(
         "actor_loss": actor_loss_B.detach(),
         "actor_pi": actor_pi_B.detach(),
         "actor_q_abs_gap": actor_q_abs_gap_B.detach(),
-        "actor_curv": (not_done_B * curvature_B).detach(),
+        "actor_curv": curvature_B.detach(),
         "actor_curv_loss": curvature_loss_B.detach(),
-        "actor_cmd_lat_jerk": (not_done_B * command_jerk_BA[:, 0]).detach(),
-        "actor_cmd_long_jerk": (not_done_B * command_jerk_BA[:, 1]).detach(),
+        "actor_cmd_lat_jerk": command_jerk_BA[:, 0].detach(),
+        "actor_cmd_long_jerk": command_jerk_BA[:, 1].detach(),
         "actor_smooth_lat_loss": smooth_lat_B.detach(),
         "actor_smooth_long_loss": smooth_long_B.detach(),
         "actor_smooth_loss": smooth_B.detach(),
