@@ -36,8 +36,9 @@ from torch.utils.data import get_worker_info
 
 from torchtitan.observability import structured_logger as sl
 
-from .dataset import COMMA1M_REPO_ID
-from .model_constants import ModelInputs
+from torchtitan.experiments.path.model_constants import ModelInputs
+
+COMMA1M_REPO_ID = "commaai/comma1M"
 
 __all__ = ["COMMA1M_REPO_ID"]
 
