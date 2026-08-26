@@ -5,12 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 from types import MethodType
-from xx.ml_tools.constants.model import ModelInputs, SPATIAL_SIZE
-
 import torch
 
 from torchtitan.experiments.path.model import PathSelfAttention
 from torchtitan.experiments.path.model_config import model_config
+from torchtitan.experiments.path.model_constants import ModelInputs, SPATIAL_SIZE
 from .model import actor_config
 
 

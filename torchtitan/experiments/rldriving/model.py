@@ -11,8 +11,6 @@ import math
 from dataclasses import dataclass
 from typing import Any, cast
 
-from xx.ml_tools.constants.model import ACTION_LEN, ModelInputs
-
 import torch
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict, StateDictOptions
@@ -32,6 +30,7 @@ from torchtitan.experiments.path.model import (
     TemporalSummarizer,
 )
 from torchtitan.experiments.path.model_config import TEMPORAL_HEADS, temporal_policy_config
+from torchtitan.experiments.path.model_constants import ACTION_LEN, ModelInputs
 from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module
