@@ -13,6 +13,7 @@ _supported_experiments = frozenset(
         "autoparallel.llama3",
         "autoparallel.local_map_deepseek_v3",
         "path",
+        "comma1m_path",
         "rldriving",
         "worldmodel",
         "torchft.llama3",

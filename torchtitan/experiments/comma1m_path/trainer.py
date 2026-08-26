@@ -18,7 +18,7 @@ from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability import structured_logger as sl
 from torchtitan.trainer import Trainer
 
-from .dataset import COMMA1M_IMGS_TARGET
+from .dataloader import COMMA1M_IMGS_TARGET
 from .loss import PathMSELoss
 
 
