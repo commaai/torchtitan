@@ -16,9 +16,9 @@ from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfi
 from torchtitan.components.tokenizer import NoOpTokenizer
 from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
-from torchtitan.experiments.path.model import parallelize_path
-from torchtitan.experiments.path.model_config import model_config as _model_config
-from torchtitan.experiments.path.model_constants import SUPERCOMBO_FPS
+from xx.training.path.model import parallelize_path
+from xx.training.path.model_config import model_config as _model_config
+from xx.training.path.model_constants import SUPERCOMBO_FPS
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .dataloader import Comma1MDataLoader

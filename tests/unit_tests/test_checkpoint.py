@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
 from torch.utils.data import DataLoader
-from torchtitan.components import fs
+from xx.training.lib.torchtitan import fs
 from torchtitan.components.checkpoint import CheckpointManager, MODEL, ModelWrapper
 
 

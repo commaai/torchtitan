@@ -17,7 +17,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.report_runner import ReportRunner, ReportSpec
+from xx.training.lib.torchtitan.report_runner import ReportRunner, ReportSpec
 from torchtitan.components.validate import BaseValidator
 
 

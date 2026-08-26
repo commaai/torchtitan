@@ -19,8 +19,8 @@ from typing import Any
 import torch
 from torch.package import PackageExporter
 
-from torchtitan.components import fs
-from torchtitan.components.torchpackage_checkpoint import (
+from xx.training.lib.torchtitan import fs
+from xx.training.lib.torchtitan.torchpackage_checkpoint import (
     export_torch_package as export_recipe_torch_package,
     load_recipe_state,
     TorchPackageCheckpointManager,

@@ -32,7 +32,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.checkpoint.storage import StorageWriter
 from torch.distributed.tensor import DTensor
 
-from torchtitan.components import fs
+from xx.training.lib.torchtitan import fs
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer

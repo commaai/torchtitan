@@ -7,9 +7,9 @@
 from types import MethodType
 import torch
 
-from torchtitan.experiments.path.model import PathSelfAttention
-from torchtitan.experiments.path.model_config import model_config
-from torchtitan.experiments.path.model_constants import ModelInputs, SPATIAL_SIZE
+from xx.training.path.model import PathSelfAttention
+from xx.training.path.model_config import model_config
+from xx.training.path.model_constants import ModelInputs, SPATIAL_SIZE
 from .model import actor_config
 
 

@@ -21,7 +21,7 @@ from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP,
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
-from torchtitan.experiments.path.model import (
+from xx.training.path.model import (
     Hydra,
     LinearEncoder,
     PathHead,
@@ -29,8 +29,8 @@ from torchtitan.experiments.path.model import (
     TemporalPolicy,
     TemporalSummarizer,
 )
-from torchtitan.experiments.path.model_config import TEMPORAL_HEADS, temporal_policy_config
-from torchtitan.experiments.path.model_constants import ACTION_LEN, ModelInputs
+from xx.training.path.model_config import TEMPORAL_HEADS, temporal_policy_config
+from xx.training.path.model_constants import ACTION_LEN, ModelInputs
 from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module

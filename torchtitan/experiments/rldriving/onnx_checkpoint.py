@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from torchtitan.components.checkpoint import OPTIMIZER
-from torchtitan.components.onnx_checkpoint import OnnxCheckpointManager
+from xx.training.lib.torchtitan.onnx_checkpoint import OnnxCheckpointManager
 
 from .model import ACTION_HEAD_NAME, RLDrivingModel
 

@@ -30,7 +30,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.components.unique_counter import StringUniqueCounter
+from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger

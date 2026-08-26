@@ -22,7 +22,7 @@ import torch.nn as nn
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.components.unique_counter import StringUniqueCounter
+from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
 from torchtitan.components.validate import BaseValidator
 from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
