@@ -10,6 +10,8 @@ import random
 from collections import defaultdict
 from typing import Any
 
+from xx.training.path.model_constants import ModelInputs
+
 import cv2
 import fsspec
 import numpy as np
@@ -33,8 +35,6 @@ from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.system.loggerd.config import CAMERA_FPS
 from scipy.ndimage import gaussian_filter1d
 from torch.utils.data import get_worker_info
-
-from torchtitan.experiments.path.model_constants import ModelInputs
 
 from torchtitan.observability import structured_logger as sl
 

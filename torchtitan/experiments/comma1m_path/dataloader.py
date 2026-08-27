@@ -10,12 +10,12 @@ import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Literal
+from xx.training.path.model_constants import FRAME_TYPE, N_FRAMES, SUPERCOMBO_FPS, VisionFrameType
 
 import torch
 
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.tokenizer import BaseTokenizer
-from torchtitan.experiments.path.model_constants import FRAME_TYPE, N_FRAMES, SUPERCOMBO_FPS, VisionFrameType
 
 from .dataset import Comma1MDataset
 
