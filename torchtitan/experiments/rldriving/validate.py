@@ -11,13 +11,13 @@ from dataclasses import dataclass, field
 from typing import Any
 from xx.release_tests.lib.base_report import ReportFormat
 from xx.training.lib.checkpoint import wait_for_checkpoint
+from xx.training.lib.torchtitan.report_runner import ReportRunner, ReportSpec
 from xx.training.rldriving.test import MODEL_REPORTS, SCALAR_REPORTS
 
 import torch.distributed as dist
 import torch.nn as nn
 
 from torchtitan.components.metrics import MetricsProcessor
-from xx.training.lib.torchtitan.report_runner import ReportRunner, ReportSpec
 from torchtitan.components.validate import BaseValidator
 
 

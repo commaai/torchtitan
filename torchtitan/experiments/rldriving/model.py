@@ -10,6 +10,9 @@ import copy
 import math
 from dataclasses import dataclass
 from typing import Any, cast
+from xx.training.path.model import Hydra, LinearEncoder, PathHead, PathMLP, TemporalPolicy, TemporalSummarizer
+from xx.training.path.model_config import TEMPORAL_HEADS, temporal_policy_config
+from xx.training.path.model_constants import ACTION_LEN, ModelInputs
 
 import torch
 import torch.nn as nn
@@ -21,16 +24,6 @@ from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP,
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
-from xx.training.path.model import (
-    Hydra,
-    LinearEncoder,
-    PathHead,
-    PathMLP,
-    TemporalPolicy,
-    TemporalSummarizer,
-)
-from xx.training.path.model_config import TEMPORAL_HEADS, temporal_policy_config
-from xx.training.path.model_constants import ACTION_LEN, ModelInputs
 from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module

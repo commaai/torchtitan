@@ -17,6 +17,7 @@ from typing import Any, cast, Literal
 from xx.common.helpers import parse_info
 from xx.ml_tools.constants.model import TEMPORAL_INPUTS
 from xx.training.lib.checkpoint import Checkpoint
+from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
 from xx.training.rldriving.dataloader import RolloutContext
 
 import torch
@@ -30,7 +31,6 @@ from torch.optim.lr_scheduler import LambdaLR
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
-from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger

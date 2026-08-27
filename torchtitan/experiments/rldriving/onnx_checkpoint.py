@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import cast
+from xx.training.lib.torchtitan.onnx_checkpoint import OnnxCheckpointManager
 
 import torch
 import torch.nn as nn
 
 from torchtitan.components.checkpoint import OPTIMIZER
-from xx.training.lib.torchtitan.onnx_checkpoint import OnnxCheckpointManager
 
 from .model import ACTION_HEAD_NAME, RLDrivingModel
 

@@ -5,11 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 from types import MethodType
-import torch
 
 from xx.training.path.model import PathSelfAttention
 from xx.training.path.model_config import model_config
 from xx.training.path.model_constants import ModelInputs, SPATIAL_SIZE
+
+import torch
+
 from .model import actor_config
 
 
