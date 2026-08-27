@@ -216,6 +216,20 @@ def _comma1m_path(flavor: str, *, pretrained: bool = True) -> Comma1MPathTrainer
     )
 
 
+def _comma1m_ci_path(flavor: str) -> Comma1MPathTrainer.Config:
+    config = _comma1m_path(flavor, pretrained=False)
+    config.training.steps = 1
+    config.training.local_batch_size = 1
+    config.training.dtype = "bfloat16"
+    config.lr_scheduler.total_steps = 1
+    config.dataloader.limit = 1
+    config.checkpoint.enable = False
+    config.compile.enable = False
+    config.metrics.enable_wandb = False
+    config.activation_checkpoint = None
+    return config
+
+
 def _dataloader_config(
     *,
     dataset: str,
@@ -314,7 +328,7 @@ def _optimizer_config(
 
 
 convnext_atto = partial(_path, "convnext_atto")
-convnext_pico_comma1m_ci = partial(_comma1m_path, "convnext_pico", pretrained=False)
+convnext_pico_comma1m_ci = partial(_comma1m_ci_path, "convnext_pico")
 convnext_xxlarge_comma1m = partial(_comma1m_path, "convnext_xxlarge")
 convnext_femto = partial(_path, "convnext_femto")
 convnext_pico = partial(_path, "convnext_pico")
