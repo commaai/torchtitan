@@ -173,7 +173,11 @@ def _wan_validator_config(
     config: WorldModelValidator.Config,
     **changes: object,
 ) -> WanWorldModelValidator.Config:
-    values = {item.name: getattr(config, item.name) for item in fields(WanWorldModelValidator.Config) if item.init}
+    values = {
+        item.name: getattr(config, item.name)
+        for item in fields(WanWorldModelValidator.Config)
+        if item.init and hasattr(config, item.name)
+    }
     values.update(changes)
     return WanWorldModelValidator.Config(**values)
 
@@ -182,7 +186,11 @@ def _wan_trainer_config(
     config: WorldModelTrainer.Config,
     **changes: object,
 ) -> WanWorldModelTrainer.Config:
-    values = {item.name: getattr(config, item.name) for item in fields(WanWorldModelTrainer.Config) if item.init}
+    values = {
+        item.name: getattr(config, item.name)
+        for item in fields(WanWorldModelTrainer.Config)
+        if item.init and hasattr(config, item.name)
+    }
     values.update(changes)
     return WanWorldModelTrainer.Config(**values)
 
@@ -202,10 +210,7 @@ def worldmodel_wan() -> WanWorldModelTrainer.Config:
     )
     checkpoint_dir = _wan_checkpoint_dir()
     train_dataloader = _wan_dataloader_config(split="train")
-    validation_dataloader = _wan_dataloader_config(
-        split="val",
-        fill_once=True,
-    )
+    validation_dataloader = _wan_dataloader_config(split="val")
     return _wan_trainer_config(
         base,
         hf_assets_path=checkpoint_dir,
@@ -242,8 +247,10 @@ def worldmodel_wan() -> WanWorldModelTrainer.Config:
         float8=WorldModelFloat8Config(enable=True),
         activation_checkpoint=FullAC.Config(),
         pose_dropout=0.0,
-        no_noise_prefill_frames_prob=0.5,
-        fake_timesteps_prob=0.5,
+        no_noise_prefill_frames_prob=0.0,
+        fake_timesteps_prob=0.0,
+        context_timestep_augmentation_prob=0.5,
+        context_timestep_augmentation_max=0.5,
     )
 
 
@@ -257,10 +264,6 @@ def worldmodel_wan_debug() -> WanWorldModelTrainer.Config:
         image_size=(64, 64),
         latent_channels=4,
         latent_size=(4, 4),
-        shuffle_size=4,
-        min_mixing=1.0,
-        num_writers=1,
-        num_readers=1,
         mock_data=True,
         mock_segment_batch_size=1,
         mock_latents=True,
@@ -308,7 +311,7 @@ def worldmodel_wan_debug() -> WanWorldModelTrainer.Config:
             base.validator,
             enable=False,
             steps=0,
-            dataloader=replace(dataloader, split="val", fill_once=True),
+            dataloader=replace(dataloader, split="val"),
         ),
         float8=WorldModelFloat8Config(enable=False),
         debug=DebugConfig(seed=0),

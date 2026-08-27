@@ -45,6 +45,7 @@ from .torchpackage_checkpoint import (
 ValidationContext = Callable[[], AbstractContextManager[None]]
 TrainingModel = WorldModel | WanModel
 TrainingTokenizer = WorldModelTokenizer | WanVAETokenizer
+WAN_WINDOWS_PER_SOURCE_STEP = 2
 
 
 @dataclass(kw_only=True, slots=True)
@@ -184,9 +185,8 @@ def _select_wan_sink_window(
     latents_BFCHW: torch.Tensor,
     *,
     inference_prefill_frames: int,
-    train: bool,
 ) -> torch.Tensor:
-    """Select ``[z0, recent context, target]`` from a continuous VAE stream."""
+    """Select the maximum-distance Wan window for validation and direct calls."""
     batch_size, source_frames = latents_BFCHW.shape[:2]
     if batch_size % WanVAETokenizer.NUM_VIEWS:
         raise ValueError(
@@ -203,22 +203,12 @@ def _select_wan_sink_window(
             f"{continuation_frames} continuation latents are required"
         )
 
-    logical_batch_size = batch_size // WanVAETokenizer.NUM_VIEWS
-    if train:
-        recent_start_B = torch.randint(
-            1,
-            max_recent_start + 1,
-            (logical_batch_size,),
-            device=latents_BFCHW.device,
-        )
-    else:
-        recent_start_B = torch.full(
-            (logical_batch_size,),
-            max_recent_start,
-            device=latents_BFCHW.device,
-            dtype=torch.int64,
-        )
-    recent_start_B = recent_start_B.repeat(WanVAETokenizer.NUM_VIEWS)
+    recent_start_B = torch.full(
+        (batch_size,),
+        max_recent_start,
+        device=latents_BFCHW.device,
+        dtype=torch.int64,
+    )
     recent_indices_BF = recent_start_B[:, None] + torch.arange(
         continuation_frames,
         device=latents_BFCHW.device,
@@ -241,6 +231,74 @@ def _select_wan_sink_window(
     return latents_BFCHW[batch_indices_BF, frame_indices_BF]
 
 
+def _iter_wan_sink_window_batches(
+    latents_BFCHW: torch.Tensor,
+    *,
+    inference_prefill_frames: int,
+) -> Iterator[torch.Tensor]:
+    """Yield every sink window once in fixed-size shuffled training batches."""
+    if latents_BFCHW.ndim != 5:
+        raise ValueError(
+            f"Wan sink-window batching requires [B, F, C, H, W] latents, got {tuple(latents_BFCHW.shape)}"
+        )
+    batch_size, source_frames = latents_BFCHW.shape[:2]
+    if batch_size % WanVAETokenizer.NUM_VIEWS:
+        raise ValueError(
+            "Wan sink-window batching requires paired fcam/ecam latent batches"
+        )
+    if inference_prefill_frames <= 0:
+        raise ValueError("Wan sink-window batching requires a positive prefill")
+
+    continuation_frames = inference_prefill_frames
+    max_recent_start = source_frames - continuation_frames
+    if max_recent_start < 1:
+        raise ValueError(
+            f"continuous Wan stream has {source_frames} latents, but sink plus "
+            f"{continuation_frames} continuation latents are required"
+        )
+    logical_batch_size = batch_size // WanVAETokenizer.NUM_VIEWS
+    shuffled_starts_BS = torch.stack(
+        [
+            torch.randperm(max_recent_start, device=latents_BFCHW.device) + 1
+            for _ in range(logical_batch_size)
+        ]
+    )
+    # The tokenizer orders its batch as all fcam samples followed by all ecam
+    # samples. Reuse each clip's shuffled window order for its paired view.
+    shuffled_starts_BS = shuffled_starts_BS.repeat(
+        WanVAETokenizer.NUM_VIEWS,
+        1,
+    )
+    continuation_offsets_F = torch.arange(
+        continuation_frames,
+        device=latents_BFCHW.device,
+    )
+    batch_indices_B = torch.arange(batch_size, device=latents_BFCHW.device)
+
+    for offset in range(0, max_recent_start, WAN_WINDOWS_PER_SOURCE_STEP):
+        recent_starts_BK = shuffled_starts_BS[
+            :, offset : offset + WAN_WINDOWS_PER_SOURCE_STEP
+        ]
+        windows_per_source = recent_starts_BK.shape[1]
+        recent_indices_BKF = recent_starts_BK[:, :, None] + continuation_offsets_F
+        frame_indices_BKF = torch.cat(
+            (
+                torch.zeros(
+                    (batch_size, windows_per_source, 1),
+                    device=latents_BFCHW.device,
+                    dtype=torch.int64,
+                ),
+                recent_indices_BKF,
+            ),
+            dim=2,
+        )
+        windows_BKFCHW = latents_BFCHW[
+            batch_indices_B[:, None, None],
+            frame_indices_BKF,
+        ]
+        yield windows_BKFCHW.flatten(0, 1).contiguous()
+
+
 def _prepare_wan_batch(
     *,
     model: WanModel,
@@ -252,9 +310,8 @@ def _prepare_wan_batch(
     scheduler: RFScheduler,
     discrete_timesteps: torch.Tensor,
     inference_prefill_frames: int,
-    future_size_frames: int,
-    no_noise_prefill_frames_prob: float,
-    fake_timesteps_prob: float,
+    context_timestep_augmentation_prob: float,
+    context_timestep_augmentation_max: float,
     train: bool,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     del targets
@@ -266,7 +323,6 @@ def _prepare_wan_batch(
     latents_BFCHW = _select_wan_sink_window(
         latents_BFCHW,
         inference_prefill_frames=inference_prefill_frames,
-        train=train,
     )
     batch_size, num_frames, channels, height, width = latents_BFCHW.shape
     if num_frames < 1:
@@ -310,28 +366,40 @@ def _prepare_wan_batch(
             device=device,
             dtype=torch.bool,
         )
-        fake_timesteps_BF = timesteps_BF.clone()
-        if torch.rand((), device=device) < no_noise_prefill_frames_prob:
+        noise_timesteps_BF = timesteps_BF.clone()
+        if (
+            train
+            and torch.rand((), device=device)
+            < context_timestep_augmentation_prob
+        ):
             end = min(inference_prefill_frames, num_frames)
             mask_BFCHW[:, :end] = False
             timesteps_BF[:, :end] = scheduler.no_noise_timestep
-            fake_timesteps_BF[:, :end] = scheduler.no_noise_timestep
-            start = min(future_size_frames, end)
-            if start < end and torch.rand((), device=device) < fake_timesteps_prob:
-                fake_timesteps_BF[:, start:end] = scheduler.sample_timestep(
-                    (batch_size, end - start)
+            noise_timesteps_BF[:, :end] = scheduler.no_noise_timestep
+            # Generated-context errors grow over an autoregressive rollout but
+            # are not a deterministic ramp. Draw independent uniform noise
+            # levels and sort them so later context latents are stochastically
+            # at least as corrupted as earlier ones. The model-visible
+            # timestep remains zero, matching inference's clean-prefix cache.
+            stochastic_context_frames = max(0, end - 1)
+            if stochastic_context_frames:
+                context_timesteps_BF = torch.rand(
+                    (batch_size, stochastic_context_frames),
+                    device=device,
                 )
-                mask_BFCHW[:, start:] = True
+                context_timesteps_BF.mul_(context_timestep_augmentation_max)
+                context_timesteps_BF = context_timesteps_BF.sort(dim=1).values
+                noise_timesteps_BF[:, 1:end] = context_timesteps_BF
         # Latent zero is Wan's one-RGB-frame boundary latent and remains a
         # persistent attention sink during rollout. It is always exact clean
         # conditioning: never secretly noised and never a direct RF target.
         timesteps_BF[:, 0] = scheduler.no_noise_timestep
-        fake_timesteps_BF[:, 0] = scheduler.no_noise_timestep
+        noise_timesteps_BF[:, 0] = scheduler.no_noise_timestep
         mask_BFCHW[:, 0] = False
         noisy_latents_BFCHW = scheduler.add_noise(
             latents_BFCHW,
             noise_BFCHW,
-            fake_timesteps_BF,
+            noise_timesteps_BF,
         )
         prepared_targets = {
             # Preserve Wan's pretrained forward-flow convention. For
@@ -382,6 +450,8 @@ def _prepare_training_batch(
     no_noise_prefill_frames_prob: float,
     fake_timesteps_prob: float,
     train: bool,
+    context_timestep_augmentation_prob: float = 0.0,
+    context_timestep_augmentation_max: float = 0.0,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     if isinstance(model, WanModel):
         if not isinstance(tokenizer, WanVAETokenizer):
@@ -396,9 +466,8 @@ def _prepare_training_batch(
             scheduler=scheduler,
             discrete_timesteps=discrete_timesteps,
             inference_prefill_frames=inference_prefill_frames,
-            future_size_frames=future_size_frames,
-            no_noise_prefill_frames_prob=no_noise_prefill_frames_prob,
-            fake_timesteps_prob=fake_timesteps_prob,
+            context_timestep_augmentation_prob=context_timestep_augmentation_prob,
+            context_timestep_augmentation_max=context_timestep_augmentation_max,
             train=train,
         )
     if not isinstance(tokenizer, WorldModelTokenizer):
@@ -554,6 +623,8 @@ class WorldModelValidator(BaseValidator):
                     no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
                     fake_timesteps_prob=self.config.fake_timesteps_prob,
                     train=False,
+                    context_timestep_augmentation_prob=0.0,
+                    context_timestep_augmentation_max=0.0,
                 )
                 with self.validation_context():
                     outputs = _loss_outputs(model(**model_inputs))
@@ -727,6 +798,16 @@ class WorldModelTrainer(Trainer):
                 no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
                 fake_timesteps_prob=self.config.fake_timesteps_prob,
                 train=True,
+                context_timestep_augmentation_prob=getattr(
+                    self.config,
+                    "context_timestep_augmentation_prob",
+                    0.0,
+                ),
+                context_timestep_augmentation_max=getattr(
+                    self.config,
+                    "context_timestep_augmentation_max",
+                    0.0,
+                ),
             )
         prepared_batch_size = (
             model_inputs["x"].shape[0]
@@ -903,6 +984,63 @@ class WanWorldModelTrainer(WorldModelTrainer):
         dataloader: WanWorldModelDataLoader.Config
         tokenizer: WanVAETokenizer.Config
         validator: WanWorldModelValidator.Config
+        context_timestep_augmentation_prob: float = 0.5
+        context_timestep_augmentation_max: float = 0.5
+
+    def batch_generator(
+        self,
+        data_iterable: Iterable[
+            tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]
+        ],
+    ) -> Iterator[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]]:
+        """Encode a continuous stream once, then drain every temporal window."""
+        data_iterator = iter(data_iterable)
+        tokenizer = cast(WanVAETokenizer, self.tokenizer)
+        inference_prefill_frames = self.config.dataloader.inference_prefill_frames
+
+        while True:
+            data_load_start = time.perf_counter()
+            try:
+                input_dict, targets = next(data_iterator)
+            except StopIteration as ex:
+                raise DataloaderExhaustedError() from ex
+            source_data_loading_time = time.perf_counter() - data_load_start
+            if targets:
+                raise ValueError(
+                    "Wan continuous-window training does not use dataset targets"
+                )
+
+            with sl.log_trace_span("wan_encode_continuous_stream"):
+                encoded_BFCHW = tokenizer.encode(
+                    input_dict,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                # A complete 10-second stream is only about 23 MiB for the
+                # default paired local batch in bf16. Keep it on CPU while its
+                # shuffled windows are consumed so model activation memory is
+                # independent of the source-stream length.
+                source_latents_BFCHW = encoded_BFCHW.detach().to(device="cpu")
+            del encoded_BFCHW, input_dict, targets
+
+            for windowed_latents_BFCHW in _iter_wan_sink_window_batches(
+                source_latents_BFCHW,
+                inference_prefill_frames=inference_prefill_frames,
+            ):
+                # Metrics are cleared independently of the source-stream queue.
+                # Attribute the source load to its first window and record zero
+                # for every remaining window so every optimizer step has a
+                # well-defined data-loading sample.
+                self.metrics_processor.data_loading_times.append(
+                    source_data_loading_time
+                )
+                source_data_loading_time = 0.0
+                windowed_inputs = {"latents": windowed_latents_BFCHW}
+                self.metrics_processor.ntokens_since_last_log += (
+                    _model_batch_size(windowed_inputs, tokenizer)
+                    * self.config.training.seq_len
+                )
+                yield windowed_inputs, {}
 
 
 def _floating_model_dtype(model: torch.nn.Module) -> torch.dtype:
@@ -966,6 +1104,24 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
         if model_config.out_dim != config.dataloader.latent_channels:
             raise ValueError(
                 "Wan model out_dim must match dataloader latent_channels"
+            )
+        context_timestep_augmentation_prob = getattr(
+            config,
+            "context_timestep_augmentation_prob",
+            0.0,
+        )
+        if not 0.0 <= context_timestep_augmentation_prob <= 1.0:
+            raise ValueError(
+                "Wan context_timestep_augmentation_prob must be in [0, 1]"
+            )
+        context_timestep_augmentation_max = getattr(
+            config,
+            "context_timestep_augmentation_max",
+            0.0,
+        )
+        if not 0.0 <= context_timestep_augmentation_max <= 1.0:
+            raise ValueError(
+                "Wan context_timestep_augmentation_max must be in [0, 1]"
             )
 
         model_rgb_frames = (

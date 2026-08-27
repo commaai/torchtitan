@@ -270,8 +270,7 @@ class WanWorldModelDataLoader(WanVAEDataLoader):
         future_size_frames: int = 0
         # Maximum source-frame distance from z0 to the causal endpoint of the
         # first selected continuation latent.
-        max_sink_distance_frames: int = 30 * NATIVE_FPS
-        shuffle_size: int = 64
+        max_sink_distance_frames: int = 10 * NATIVE_FPS
         # The model always retains latent zero as a one-frame sink, followed by
         # recent four-frame latent groups. Ten prefix latents leave one real
         # four-frame target in the default 41-frame supervised span.
@@ -333,9 +332,16 @@ class WanWorldModelDataLoader(WanVAEDataLoader):
         iterator = iter(self.loader)
         self._iterator = iterator
         try:
-            for (inputs,) in iterator:
+            for inputs in iterator:
                 if "latents" in inputs:
-                    yield {"latents": inputs["latents"]}, {}
+                    latents_BVFCHW = inputs["latents"]
+                    if latents_BVFCHW.ndim != 6 or latents_BVFCHW.shape[1] != 2:
+                        raise ValueError(
+                            "mock Wan latents must have shape [B, 2, F, C, H, W], "
+                            f"got {tuple(latents_BVFCHW.shape)}"
+                        )
+                    latents = latents_BVFCHW.permute(1, 0, 2, 3, 4, 5).flatten(0, 1)
+                    yield {"latents": latents}, {}
                     continue
 
                 videos_BVCTHW = inputs["input"]

@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, IterableDataset
 
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.tokenizer import BaseTokenizer
@@ -155,8 +156,8 @@ def get_data_from_segment(
     ]
 
     videos = np.stack(clips, axis=0)
-    # Store the clip only once in Gigashuffle. WanVAEDataLoader exposes the same
-    # tensor as the reconstruction target after reading the batch.
+    # Store the clip only once. WanVAEDataLoader exposes the same tensor as the
+    # reconstruction target after batching.
     return ({"input": videos},)
 
 
@@ -180,6 +181,41 @@ class _MockWanClipDataset:
                 yield ({"input": videos},)
 
 
+class _WanSampleDataset(IterableDataset):
+    """Flatten segment-level arrays into logical Wan examples."""
+
+    def __init__(self, source: Any) -> None:
+        super().__init__()
+        self.source = source
+
+    def __iter__(self) -> Iterator[dict[str, np.ndarray]]:
+        for (inputs,) in self.source:
+            if "latents" in inputs:
+                latents = inputs["latents"]
+                if latents.shape[0] % len(CAMERA_NAMES):
+                    raise ValueError(
+                        "mock Wan latents must contain paired fcam/ecam views"
+                    )
+                logical_batch_size = latents.shape[0] // len(CAMERA_NAMES)
+                for index in range(logical_batch_size):
+                    yield {
+                        "latents": np.stack(
+                            (
+                                latents[index],
+                                latents[logical_batch_size + index],
+                            ),
+                            axis=0,
+                        )
+                    }
+                continue
+
+            batch_size = next(iter(inputs.values())).shape[0]
+            if any(value.shape[0] != batch_size for value in inputs.values()):
+                raise ValueError("Wan dataset fields must share a leading batch size")
+            for index in range(batch_size):
+                yield {key: value[index] for key, value in inputs.items()}
+
+
 class WanVAEDataLoader(BaseDataLoader):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseDataLoader.Config):
@@ -190,11 +226,6 @@ class WanVAEDataLoader(BaseDataLoader):
         clip_frames: int = DEFAULT_CLIP_FRAMES
         fps: int = NATIVE_FPS
         clips_per_segment: int = 1
-        shuffle_size: int = 512
-        min_mixing: float = 0.5
-        num_writers: int = 2
-        num_readers: int = 2
-        fill_once: bool = False
         limit: int | None = None
         mock_data: bool = False
         mock_segment_batch_size: int = 1
@@ -208,8 +239,6 @@ class WanVAEDataLoader(BaseDataLoader):
                 raise ValueError("image dimensions must be positive multiples of 16")
             if self.clips_per_segment <= 0:
                 raise ValueError("clips_per_segment must be positive")
-            if self.shuffle_size <= 0:
-                raise ValueError("shuffle_size must be positive")
 
     def __init__(
         self,
@@ -224,40 +253,33 @@ class WanVAEDataLoader(BaseDataLoader):
         validation_steps: int = 1,
         **kwargs: Any,
     ) -> None:
-        del tokenizer, seq_len, snapshot_every_n_steps, kwargs
-        from gigashuffle import DataloaderConfig, MultiprocessShuffledDataloader
+        del (
+            tokenizer,
+            seq_len,
+            snapshot_every_n_steps,
+            validation_steps,
+            kwargs,
+        )
 
         self.config = config
         self.local_batch_size = local_batch_size
         self.dp_world_size = dp_world_size
         self.dp_rank = dp_rank
         self.local_rank = int(os.environ.get("LOCAL_RANK", dp_rank))
-        self.local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", dp_world_size))
-        node_rank = int(os.environ.get("GROUP_RANK", dp_rank // max(1, self.local_world_size)))
-        run_id = os.environ.get("REPORTERV2_TRAINING_ID") or "wan-vae"
         val = config.split == "val"
-        shuffle_size = local_batch_size * validation_steps * self.local_world_size if val else config.shuffle_size
         self.dataset = self._build_dataset(
             config,
             val=val,
             global_rank=dp_rank,
             global_world_size=dp_world_size,
         )
-        self.loader = MultiprocessShuffledDataloader(
-            self.dataset,
-            DataloaderConfig(
-                bs=local_batch_size,
-                shuffle_size=shuffle_size,
-                min_mixing=1 if val else config.min_mixing,
-                num_writers=1 if val else config.num_writers,
-                num_readers=1 if val else config.num_readers,
-                fill_once=config.fill_once or val,
-                local_rank=self.local_rank,
-                global_rank=dp_rank,
-                local_world_size=self.local_world_size,
-                global_world_size=dp_world_size,
-                queue_name=f"{run_id}-{config.split}-node{node_rank}",
-            ),
+        self.loader = DataLoader(
+            _WanSampleDataset(self.dataset),
+            batch_size=local_batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=True,
         )
         self._iterator: Any | None = None
 
@@ -308,7 +330,7 @@ class WanVAEDataLoader(BaseDataLoader):
         iterator = iter(self.loader)
         self._iterator = iterator
         try:
-            for (inputs,) in iterator:
+            for inputs in iterator:
                 yield inputs, inputs["input"]
         finally:
             close = getattr(iterator, "close", None)
@@ -323,9 +345,6 @@ class WanVAEDataLoader(BaseDataLoader):
             if callable(close):
                 close()
             self._iterator = None
-        shutdown = getattr(self.loader, "_shutdown_workers", None)
-        if callable(shutdown):
-            shutdown()
 
     def state_dict(self) -> dict[str, int]:
         return {}

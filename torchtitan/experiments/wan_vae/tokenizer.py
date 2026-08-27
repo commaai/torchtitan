@@ -82,27 +82,29 @@ class WanVAETokenizer(BaseTokenizer):
         big_imgs = inputs["big_imgs"]
         self._validate_image_pair(imgs, big_imgs)
 
-        # [2, B, T, H, W, 3] -> [B, 2, 3, T, H, W]
-        videos = einops.rearrange(
-            [imgs, big_imgs],
-            "v b t h w c -> b v c t h w",
-            v=self.NUM_VIEWS,
-        ).to(device=device, dtype=dtype)
-        videos = videos.div(255.0).mul(2).sub(1).clamp(-1, 1)
-
+        encoded: list[torch.Tensor] = []
         with torch.inference_mode():
-            latents = model.encode_views(
-                videos,
-                chunk_size=4,
-                output_dtype=None,
-            )
+            # Encode one (sample, view) video at a time. The complete temporal
+            # sequence remains causal and continuous, while only one full-size
+            # video and its patchified copy reside on CUDA at once.
+            for view_batch in (imgs, big_imgs):
+                for video_THWC in view_batch.unbind(0):
+                    video_BCTHW = einops.rearrange(
+                        video_THWC,
+                        "t h w c -> 1 c t h w",
+                    ).to(device=device, dtype=dtype, copy=True)
+                    video_BCTHW.div_(255.0).mul_(2).sub_(1).clamp_(-1, 1)
+                    encoded.append(
+                        model.encode(
+                            video_BCTHW,
+                            chunk_size=4,
+                            output_dtype=None,
+                        )
+                    )
 
         # Keep the world-model tokenizer ABI at [B, T, C, H, W], stacking all
         # fcam samples before all ecam samples in the batch dimension.
-        return einops.rearrange(
-            latents,
-            "b v c t h w -> (v b) t c h w",
-        ).to(dtype=dtype)
+        return torch.cat(encoded, dim=0).permute(0, 2, 1, 3, 4).to(dtype=dtype)
 
     def decode(
         self,
