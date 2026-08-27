@@ -27,11 +27,11 @@ from .loss import PathMSELoss
 from .trainer import Comma1MPathTrainer
 
 
-def model_registry(flavor: str) -> ModelSpec:
+def model_registry(flavor: str, pretrained: bool = True) -> ModelSpec:
     return ModelSpec(
         name="path",
         flavor=flavor,
-        model=_model_config(flavor),
+        model=_model_config(flavor, pretrained=pretrained),
         parallelize_fn=parallelize_path,
         pipelining_fn=None,
         post_optimizer_build_fn=None,
@@ -70,7 +70,7 @@ def _optimizer_config(
     )
 
 
-def _comma1m_path(flavor: str) -> Comma1MPathTrainer.Config:
+def _comma1m_path(flavor: str, pretrained: bool = True) -> Comma1MPathTrainer.Config:
     steps = 16
     num_nodes, local_world_size = _dp_degrees()
     dataloader = Comma1MDataLoader.Config(
@@ -90,7 +90,7 @@ def _comma1m_path(flavor: str) -> Comma1MPathTrainer.Config:
     dataloader.min_mixing = 0
     return Comma1MPathTrainer.Config(
         loss=PathMSELoss.Config(),
-        model_spec=model_registry(flavor),
+        model_spec=model_registry(flavor, pretrained=pretrained),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=dataloader,
         optimizer=_optimizer_config(lr=1e-6),
@@ -125,5 +125,5 @@ def _comma1m_path(flavor: str) -> Comma1MPathTrainer.Config:
     )
 
 
-convnext_atto = partial(_comma1m_path, "convnext_atto")
+convnext_atto_ci = partial(_comma1m_path, "convnext_atto", pretrained=False)
 convnext_xxlarge = partial(_comma1m_path, "convnext_xxlarge")
