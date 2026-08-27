@@ -19,7 +19,7 @@ from typing import Any
 import torch
 from torch.package import PackageExporter
 
-from xx.training.lib.torchtitan import fs
+from torchtitan.components import fs
 from xx.training.lib.torchtitan.torchpackage_checkpoint import (
     export_torch_package as export_recipe_torch_package,
     load_recipe_state,
