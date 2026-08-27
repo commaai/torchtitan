@@ -10,7 +10,6 @@ import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Literal
-from xx.training.path.model_constants import FRAME_TYPE, N_FRAMES, SUPERCOMBO_FPS, VisionFrameType
 
 import torch
 
@@ -36,8 +35,8 @@ class Comma1MDataLoader(BaseDataLoader):
         plan_only: bool = False
         limit: int | None = 2_500_000
         deterministic_fidxs: bool = False
-        n_frames: int = N_FRAMES
-        rgb: bool = FRAME_TYPE is VisionFrameType.RGB
+        n_frames: int = 2
+        rgb: bool = False
         skip: int = 1
         val_skip: int = 1
 

@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import os
 from functools import partial
+# only dependencies are the model config, they should be open again.
 from xx.training.path.model import parallelize_path
 from xx.training.path.model_config import model_config as _model_config
-from xx.training.path.model_constants import SUPERCOMBO_FPS
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer

@@ -10,8 +10,6 @@ import random
 from collections import defaultdict
 from typing import Any
 
-from xx.training.path.model_constants import ModelInputs
-
 import cv2
 import fsspec
 import numpy as np
@@ -367,8 +365,8 @@ def _load_segment(
     }
     targets["imgs"] = np.concatenate(
         [
-            _rgb_from_tensor(inputs[ModelInputs.IMG][:, -1, -6:]),
-            _rgb_from_tensor(inputs[ModelInputs.BIG_IMG][:, -1, -6:]),
+            _rgb_from_tensor(inputs["img"][:, -1, -6:]),
+            _rgb_from_tensor(inputs["big_img"][:, -1, -6:]),
         ],
         axis=3,
     )
