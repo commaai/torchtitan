@@ -37,11 +37,13 @@ if TYPE_CHECKING:
     from .trainer import PathTrainer
 
 
-def model_registry(flavor: str) -> ModelSpec:
+def model_registry(flavor: str, *, pretrained: bool = True) -> ModelSpec:
+    model = _model_config(flavor)
+    model.vision.pretrained = pretrained
     return ModelSpec(
         name="path",
         flavor=flavor,
-        model=_model_config(flavor),
+        model=model,
         parallelize_fn=parallelize_path,
         pipelining_fn=None,
         post_optimizer_build_fn=None,
@@ -156,7 +158,7 @@ def _path(flavor: str) -> PathTrainer.Config:
     )
 
 
-def _comma1m_path(flavor: str) -> Comma1MPathTrainer.Config:
+def _comma1m_path(flavor: str, *, pretrained: bool = True) -> Comma1MPathTrainer.Config:
     from .comma1m_trainer import Comma1MPathTrainer
     from .loss import PathMSELoss
 
@@ -179,7 +181,7 @@ def _comma1m_path(flavor: str) -> Comma1MPathTrainer.Config:
     dataloader.min_mixing = 0
     return Comma1MPathTrainer.Config(
         loss=PathMSELoss.Config(),
-        model_spec=model_registry(flavor),
+        model_spec=model_registry(flavor, pretrained=pretrained),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=dataloader,
         optimizer=_optimizer_config(lr=1e-6),
@@ -312,7 +314,7 @@ def _optimizer_config(
 
 
 convnext_atto = partial(_path, "convnext_atto")
-convnext_atto_comma1m = partial(_comma1m_path, "convnext_atto")
+convnext_pico_comma1m_ci = partial(_comma1m_path, "convnext_pico", pretrained=False)
 convnext_xxlarge_comma1m = partial(_comma1m_path, "convnext_xxlarge")
 convnext_femto = partial(_path, "convnext_femto")
 convnext_pico = partial(_path, "convnext_pico")
