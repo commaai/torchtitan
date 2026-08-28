@@ -10,7 +10,7 @@ from typing import Any
 
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
-from .model_wan import WanModel
+from .model import WanModel
 
 
 class WanStateDictAdapter(StateDictAdapter):

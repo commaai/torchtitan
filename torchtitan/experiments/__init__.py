@@ -15,6 +15,7 @@ _supported_experiments = frozenset(
         "path",
         "rldriving",
         "worldmodel",
+        "wanworldmodel",
         "torchft.llama3",
         "rl",
         # RL examples own a per-example config_registry under rl/examples/<name>;

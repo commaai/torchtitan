@@ -28,24 +28,17 @@ from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.observability import structured_logger as sl
 from torchtitan.trainer import Trainer
-from torchtitan.experiments.wan_vae.tokenizer import WanVAETokenizer
-
-from .dataset import WanWorldModelDataLoader, WorldModelDataLoader
+from .dataset import WorldModelDataLoader
 from .loss import WorldModelLoss
 from .model import WorldModel
-from .model_wan import WanModel
 from .schedulers import RFScheduler
 from .tokenizer import WorldModelTokenizer
-from .torchpackage_checkpoint import (
-    WanTorchPackageConfig,
-    WorldModelTorchPackageCheckpointManager,
-)
+from .torchpackage_checkpoint import WorldModelTorchPackageCheckpointManager
 
 
 ValidationContext = Callable[[], AbstractContextManager[None]]
-TrainingModel = WorldModel | WanModel
-TrainingTokenizer = WorldModelTokenizer | WanVAETokenizer
-WAN_WINDOWS_PER_SOURCE_STEP = 2
+TrainingModel = WorldModel
+TrainingTokenizer = WorldModelTokenizer
 
 
 @dataclass(kw_only=True, slots=True)
@@ -62,14 +55,8 @@ def _model_batch_size(
     inputs: dict[str, torch.Tensor],
     tokenizer: BaseTokenizer,
 ) -> int:
-    batch_size = _batch_size(inputs)
-    if (
-        isinstance(tokenizer, WanVAETokenizer)
-        and "imgs" in inputs
-        and "big_imgs" in inputs
-    ):
-        return WanVAETokenizer.NUM_VIEWS * batch_size
-    return batch_size
+    del tokenizer
+    return _batch_size(inputs)
 
 
 def _copy_microbatch(
@@ -181,259 +168,6 @@ def _prepare_worldmodel_batch(
     }, targets
 
 
-def _select_wan_sink_window(
-    latents_BFCHW: torch.Tensor,
-    *,
-    inference_prefill_frames: int,
-) -> torch.Tensor:
-    """Select the maximum-distance Wan window for validation and direct calls."""
-    batch_size, source_frames = latents_BFCHW.shape[:2]
-    if batch_size % WanVAETokenizer.NUM_VIEWS:
-        raise ValueError(
-            "Wan sink-window selection requires paired fcam/ecam latent batches"
-        )
-    if inference_prefill_frames <= 0:
-        raise ValueError("Wan sink-window selection requires a positive prefill")
-
-    continuation_frames = inference_prefill_frames
-    max_recent_start = source_frames - continuation_frames
-    if max_recent_start < 1:
-        raise ValueError(
-            f"continuous Wan stream has {source_frames} latents, but sink plus "
-            f"{continuation_frames} continuation latents are required"
-        )
-
-    recent_start_B = torch.full(
-        (batch_size,),
-        max_recent_start,
-        device=latents_BFCHW.device,
-        dtype=torch.int64,
-    )
-    recent_indices_BF = recent_start_B[:, None] + torch.arange(
-        continuation_frames,
-        device=latents_BFCHW.device,
-    )
-    frame_indices_BF = torch.cat(
-        (
-            torch.zeros(
-                (batch_size, 1),
-                device=latents_BFCHW.device,
-                dtype=torch.int64,
-            ),
-            recent_indices_BF,
-        ),
-        dim=1,
-    )
-    batch_indices_BF = torch.arange(
-        batch_size,
-        device=latents_BFCHW.device,
-    )[:, None]
-    return latents_BFCHW[batch_indices_BF, frame_indices_BF]
-
-
-def _iter_wan_sink_window_batches(
-    latents_BFCHW: torch.Tensor,
-    *,
-    inference_prefill_frames: int,
-) -> Iterator[torch.Tensor]:
-    """Yield every sink window once in fixed-size shuffled training batches."""
-    if latents_BFCHW.ndim != 5:
-        raise ValueError(
-            f"Wan sink-window batching requires [B, F, C, H, W] latents, got {tuple(latents_BFCHW.shape)}"
-        )
-    batch_size, source_frames = latents_BFCHW.shape[:2]
-    if batch_size % WanVAETokenizer.NUM_VIEWS:
-        raise ValueError(
-            "Wan sink-window batching requires paired fcam/ecam latent batches"
-        )
-    if inference_prefill_frames <= 0:
-        raise ValueError("Wan sink-window batching requires a positive prefill")
-
-    continuation_frames = inference_prefill_frames
-    max_recent_start = source_frames - continuation_frames
-    if max_recent_start < 1:
-        raise ValueError(
-            f"continuous Wan stream has {source_frames} latents, but sink plus "
-            f"{continuation_frames} continuation latents are required"
-        )
-    logical_batch_size = batch_size // WanVAETokenizer.NUM_VIEWS
-    shuffled_starts_BS = torch.stack(
-        [
-            torch.randperm(max_recent_start, device=latents_BFCHW.device) + 1
-            for _ in range(logical_batch_size)
-        ]
-    )
-    # The tokenizer orders its batch as all fcam samples followed by all ecam
-    # samples. Reuse each clip's shuffled window order for its paired view.
-    shuffled_starts_BS = shuffled_starts_BS.repeat(
-        WanVAETokenizer.NUM_VIEWS,
-        1,
-    )
-    continuation_offsets_F = torch.arange(
-        continuation_frames,
-        device=latents_BFCHW.device,
-    )
-    batch_indices_B = torch.arange(batch_size, device=latents_BFCHW.device)
-
-    for offset in range(0, max_recent_start, WAN_WINDOWS_PER_SOURCE_STEP):
-        recent_starts_BK = shuffled_starts_BS[
-            :, offset : offset + WAN_WINDOWS_PER_SOURCE_STEP
-        ]
-        windows_per_source = recent_starts_BK.shape[1]
-        recent_indices_BKF = recent_starts_BK[:, :, None] + continuation_offsets_F
-        frame_indices_BKF = torch.cat(
-            (
-                torch.zeros(
-                    (batch_size, windows_per_source, 1),
-                    device=latents_BFCHW.device,
-                    dtype=torch.int64,
-                ),
-                recent_indices_BKF,
-            ),
-            dim=2,
-        )
-        windows_BKFCHW = latents_BFCHW[
-            batch_indices_B[:, None, None],
-            frame_indices_BKF,
-        ]
-        yield windows_BKFCHW.flatten(0, 1).contiguous()
-
-
-def _prepare_wan_batch(
-    *,
-    model: WanModel,
-    tokenizer: WanVAETokenizer,
-    input_dict: dict[str, torch.Tensor],
-    targets: dict[str, torch.Tensor],
-    device: torch.device,
-    dtype: torch.dtype,
-    scheduler: RFScheduler,
-    discrete_timesteps: torch.Tensor,
-    inference_prefill_frames: int,
-    context_timestep_augmentation_prob: float,
-    context_timestep_augmentation_max: float,
-    train: bool,
-) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
-    del targets
-    latents_BFCHW = tokenizer.encode(input_dict, device=device, dtype=dtype)
-    if latents_BFCHW.ndim != 5:
-        raise ValueError(
-            f"Wan latents must have shape [B, F, C, H, W], got {tuple(latents_BFCHW.shape)}"
-        )
-    latents_BFCHW = _select_wan_sink_window(
-        latents_BFCHW,
-        inference_prefill_frames=inference_prefill_frames,
-    )
-    batch_size, num_frames, channels, height, width = latents_BFCHW.shape
-    if num_frames < 1:
-        raise ValueError("Wan worldmodel training requires at least one latent frame")
-    if not 0 < inference_prefill_frames < num_frames:
-        raise ValueError(
-            "Wan inference_prefill_frames must retain the sink and leave a target; "
-            f"got {inference_prefill_frames} for {num_frames} model frames"
-        )
-    if channels != model.in_dim:
-        raise ValueError(
-            f"Wan model expects {model.in_dim} latent channels, got {channels}"
-        )
-
-    latent_shape = (num_frames, height, width)
-    if any(size % patch for size, patch in zip(latent_shape, model.patch_size)):
-        raise ValueError(
-            f"Wan latent shape {latent_shape} must be divisible by patch size {model.patch_size}"
-        )
-    seq_len = 1
-    for size, patch in zip(latent_shape, model.patch_size):
-        seq_len *= size // patch
-
-    with torch.no_grad():
-        noise_BFCHW = torch.randn_like(latents_BFCHW)
-        if train:
-            timesteps_B = scheduler.sample_timestep((batch_size,))
-        else:
-            indexes_B = torch.randint(
-                0,
-                discrete_timesteps.numel(),
-                (batch_size,),
-                device=device,
-            )
-            timesteps_B = discrete_timesteps[indexes_B]
-        # Keep the RF conditioning framewise, matching the DiT path. WanModel
-        # broadcasts these values over each frame's spatial patch tokens.
-        timesteps_BF = timesteps_B[:, None].expand(batch_size, num_frames).clone()
-        mask_BFCHW = torch.ones_like(
-            latents_BFCHW,
-            device=device,
-            dtype=torch.bool,
-        )
-        noise_timesteps_BF = timesteps_BF.clone()
-        if (
-            train
-            and torch.rand((), device=device)
-            < context_timestep_augmentation_prob
-        ):
-            end = min(inference_prefill_frames, num_frames)
-            mask_BFCHW[:, :end] = False
-            timesteps_BF[:, :end] = scheduler.no_noise_timestep
-            noise_timesteps_BF[:, :end] = scheduler.no_noise_timestep
-            # Generated-context errors grow over an autoregressive rollout but
-            # are not a deterministic ramp. Draw independent uniform noise
-            # levels and sort them so later context latents are stochastically
-            # at least as corrupted as earlier ones. The model-visible
-            # timestep remains zero, matching inference's clean-prefix cache.
-            stochastic_context_frames = max(0, end - 1)
-            if stochastic_context_frames:
-                context_timesteps_BF = torch.rand(
-                    (batch_size, stochastic_context_frames),
-                    device=device,
-                )
-                context_timesteps_BF.mul_(context_timestep_augmentation_max)
-                context_timesteps_BF = context_timesteps_BF.sort(dim=1).values
-                noise_timesteps_BF[:, 1:end] = context_timesteps_BF
-        # Latent zero is Wan's one-RGB-frame boundary latent and remains a
-        # persistent attention sink during rollout. It is always exact clean
-        # conditioning: never secretly noised and never a direct RF target.
-        timesteps_BF[:, 0] = scheduler.no_noise_timestep
-        noise_timesteps_BF[:, 0] = scheduler.no_noise_timestep
-        mask_BFCHW[:, 0] = False
-        noisy_latents_BFCHW = scheduler.add_noise(
-            latents_BFCHW,
-            noise_BFCHW,
-            noise_timesteps_BF,
-        )
-        prepared_targets = {
-            # Preserve Wan's pretrained forward-flow convention. For
-            # x_t=(1-t)*x_0+t*epsilon, upstream Wan predicts epsilon-x_0.
-            "v": noise_BFCHW - latents_BFCHW,
-            "mask": mask_BFCHW,
-        }
-
-        # Production uses a cached raw UMT5 context. The null fallback keeps
-        # the reduced CPU smoke recipe independent of the 11B text encoder.
-        text_context_BLC = tokenizer.fixed_text_context(
-            batch_size,
-            expected_dim=model.text_dim,
-            device=device,
-            dtype=dtype,
-        )
-        if text_context_BLC is None:
-            text_context_BLC = model.get_null_text_embedding(
-                batch_size,
-                device=device,
-                dtype=dtype,
-            )
-
-    noisy_latents_BCFHW = noisy_latents_BFCHW.permute(0, 2, 1, 3, 4)
-    return {
-        "x": list(noisy_latents_BCFHW.unbind(0)),
-        # Wan's published transformer uses [0, 1000], while RFScheduler and
-        # the velocity target stay in the existing worldmodel [0, 1] domain.
-        "t": timesteps_BF * 1000.0,
-        "context": list(text_context_BLC.unbind(0)),
-        "seq_len": seq_len,
-    }, prepared_targets
-
-
 def _prepare_training_batch(
     *,
     model: TrainingModel,
@@ -450,28 +184,7 @@ def _prepare_training_batch(
     no_noise_prefill_frames_prob: float,
     fake_timesteps_prob: float,
     train: bool,
-    context_timestep_augmentation_prob: float = 0.0,
-    context_timestep_augmentation_max: float = 0.0,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
-    if isinstance(model, WanModel):
-        if not isinstance(tokenizer, WanVAETokenizer):
-            raise TypeError("Wan training requires WanVAETokenizer")
-        return _prepare_wan_batch(
-            model=model,
-            tokenizer=tokenizer,
-            input_dict=input_dict,
-            targets=targets,
-            device=device,
-            dtype=dtype,
-            scheduler=scheduler,
-            discrete_timesteps=discrete_timesteps,
-            inference_prefill_frames=inference_prefill_frames,
-            context_timestep_augmentation_prob=context_timestep_augmentation_prob,
-            context_timestep_augmentation_max=context_timestep_augmentation_max,
-            train=train,
-        )
-    if not isinstance(tokenizer, WorldModelTokenizer):
-        raise TypeError("DiT worldmodel training requires WorldModelTokenizer")
     return _prepare_worldmodel_batch(
         model=model,
         tokenizer=tokenizer,
@@ -491,16 +204,9 @@ def _prepare_training_batch(
 
 
 def _loss_outputs(outputs: Any) -> dict[str, torch.Tensor]:
-    if isinstance(outputs, dict):
-        return outputs
-    if not isinstance(outputs, list) or not outputs:
-        raise TypeError(
-            f"unsupported worldmodel output type {type(outputs).__name__}"
-        )
-    if any(sample_CFH.ndim != 4 for sample_CFH in outputs):
-        raise ValueError("Wan outputs must contain [C, F, H, W] tensors")
-    sample_BCFHW = torch.stack(outputs)
-    return {"sample": sample_BCFHW.permute(0, 2, 1, 3, 4)}
+    if not isinstance(outputs, dict):
+        raise TypeError(f"unsupported worldmodel output type {type(outputs).__name__}")
+    return outputs
 
 
 class WorldModelValidator(BaseValidator):
@@ -557,7 +263,7 @@ class WorldModelValidator(BaseValidator):
             if config.local_batch_size_override is not None
             else local_batch_size
         )
-        self.dataloader: WorldModelDataLoader | WanWorldModelDataLoader | None = None
+        self.dataloader: WorldModelDataLoader | None = None
         if self.config.steps != 0:
             self.dataloader = self.config.dataloader.build(
                 dp_world_size=self.dp_world_size,
@@ -571,6 +277,41 @@ class WorldModelValidator(BaseValidator):
         self.unique_segment_counter = StringUniqueCounter(
             f"unique_ids:{training_id}:worldmodel:validation"
         )
+
+    def _model_batch_size(self, inputs: dict[str, torch.Tensor]) -> int:
+        return _model_batch_size(inputs, self.tokenizer)
+
+    def _prepare_batch(
+        self,
+        *,
+        model: WorldModel,
+        input_dict: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype,
+        scheduler: RFScheduler,
+        discrete_timesteps: torch.Tensor,
+        train: bool,
+    ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+        return _prepare_training_batch(
+            model=model,
+            tokenizer=self.tokenizer,
+            input_dict=input_dict,
+            targets=targets,
+            device=device,
+            dtype=dtype,
+            scheduler=scheduler,
+            discrete_timesteps=discrete_timesteps,
+            pose_dropout=self.config.pose_dropout,
+            inference_prefill_frames=self.config.dataloader.inference_prefill_frames,
+            future_size_frames=self.config.dataloader.future_size_frames,
+            no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
+            fake_timesteps_prob=self.config.fake_timesteps_prob,
+            train=train,
+        )
+
+    def _normalize_outputs(self, outputs: Any) -> dict[str, torch.Tensor]:
+        return _loss_outputs(outputs)
 
     @torch.no_grad()
     def validate(self, model_parts: list[nn.Module], step: int) -> None:
@@ -591,7 +332,7 @@ class WorldModelValidator(BaseValidator):
             for num_steps, (input_dict, targets) in enumerate(data_iterator):
                 if num_steps >= self.config.steps:
                     break
-                batch_size = _model_batch_size(input_dict, self.tokenizer)
+                batch_size = self._model_batch_size(input_dict)
                 samples += batch_size
                 self.metrics_processor.ntokens_since_last_log += (
                     batch_size * self.seq_len
@@ -600,34 +341,18 @@ class WorldModelValidator(BaseValidator):
                     self.unique_segment_counter.update(
                         _segment_names_from_info(input_dict["info"])
                     )
-                model_inputs, targets = _prepare_training_batch(
+                model_inputs, targets = self._prepare_batch(
                     model=model,
-                    tokenizer=self.tokenizer,
                     input_dict=input_dict,
                     targets=targets,
                     device=device,
                     dtype=dtype,
                     scheduler=scheduler,
                     discrete_timesteps=discrete_timesteps,
-                    pose_dropout=self.config.pose_dropout,
-                    inference_prefill_frames=getattr(
-                        self.config.dataloader,
-                        "inference_prefill_frames",
-                        0,
-                    ),
-                    future_size_frames=getattr(
-                        self.config.dataloader,
-                        "future_size_frames",
-                        0,
-                    ),
-                    no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
-                    fake_timesteps_prob=self.config.fake_timesteps_prob,
                     train=False,
-                    context_timestep_augmentation_prob=0.0,
-                    context_timestep_augmentation_max=0.0,
                 )
                 with self.validation_context():
-                    outputs = _loss_outputs(model(**model_inputs))
+                    outputs = self._normalize_outputs(model(**model_inputs))
                     _loss_vec, terms = self.loss_fn(outputs, targets)
                 for name, term in terms.items():
                     term_sums[name] = (
@@ -682,12 +407,6 @@ class WorldModelValidator(BaseValidator):
             self.dataloader.close()
 
 
-class WanWorldModelValidator(WorldModelValidator):
-    @dataclass(kw_only=True, slots=True)
-    class Config(WorldModelValidator.Config):
-        dataloader: WanWorldModelDataLoader.Config
-
-
 class WorldModelTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
@@ -707,29 +426,13 @@ class WorldModelTrainer(Trainer):
             _validate_worldmodel_config(self)
 
     def __init__(self, config: Config):
-        self.package_config = copy.deepcopy(config.model_spec.model)
+        package_config = copy.deepcopy(config.model_spec.model)
         if config.float8.enable:
-            _apply_worldmodel_float8(config, config.model_spec.model)
+            self._apply_float8(config, config.model_spec.model)
 
         super().__init__(config)
         self.tokenizer = cast(TrainingTokenizer, self.tokenizer)
-        if isinstance(self.package_config, WanModel.Config):
-            wan_tokenizer = cast(WanVAETokenizer, self.tokenizer)
-            text_context_BLC = wan_tokenizer.fixed_text_context(
-                1,
-                expected_dim=self.package_config.text_dim,
-                device=torch.device("cpu"),
-                dtype=torch.bfloat16,
-            )
-            self.package_config = WanTorchPackageConfig(
-                model_config=self.package_config,
-                text_context_LC=(
-                    text_context_BLC[0].clone()
-                    if text_context_BLC is not None
-                    else None
-                ),
-                text_prompt=wan_tokenizer.config.text_prompt,
-            )
+        self.package_config = self._build_package_config(package_config)
         for model_part in self.model_parts:
             model_part.package_config = self.package_config
         self.dtype = TORCH_DTYPE_MAP[config.training.mixed_precision_param]
@@ -742,6 +445,44 @@ class WorldModelTrainer(Trainer):
         self.unique_segment_counter = StringUniqueCounter(
             f"unique_ids:{training_id}:worldmodel:train"
         )
+
+    @staticmethod
+    def _apply_float8(config: Config, model_config: WorldModel.Config) -> None:
+        _apply_worldmodel_float8(config, model_config)
+
+    def _build_package_config(self, model_config: WorldModel.Config) -> Any:
+        return model_config
+
+    def _model_batch_size(self, inputs: dict[str, torch.Tensor]) -> int:
+        return _model_batch_size(inputs, self.tokenizer)
+
+    def _prepare_batch(
+        self,
+        *,
+        model: WorldModel,
+        input_dict: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor],
+        train: bool,
+    ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+        return _prepare_training_batch(
+            model=model,
+            tokenizer=self.tokenizer,
+            input_dict=input_dict,
+            targets=targets,
+            device=self.device,
+            dtype=self.dtype,
+            scheduler=self.train_noise_scheduler,
+            discrete_timesteps=self.discrete_timesteps,
+            pose_dropout=self.config.pose_dropout,
+            inference_prefill_frames=self.config.dataloader.inference_prefill_frames,
+            future_size_frames=self.config.dataloader.future_size_frames,
+            no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
+            fake_timesteps_prob=self.config.fake_timesteps_prob,
+            train=train,
+        )
+
+    def _normalize_outputs(self, outputs: Any) -> dict[str, torch.Tensor]:
+        return _loss_outputs(outputs)
 
     def batch_generator(
         self,
@@ -757,7 +498,7 @@ class WorldModelTrainer(Trainer):
             except StopIteration as ex:
                 raise DataloaderExhaustedError() from ex
             self.metrics_processor.ntokens_since_last_log += (
-                _model_batch_size(input_dict, self.tokenizer)
+                self._model_batch_size(input_dict)
                 * self.config.training.seq_len
             )
             self.metrics_processor.data_loading_times.append(
@@ -775,39 +516,11 @@ class WorldModelTrainer(Trainer):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         model = cast(TrainingModel, self.model_parts[0])
         with sl.log_trace_span("worldmodel_prepare_batch"):
-            model_inputs, targets = _prepare_training_batch(
+            model_inputs, targets = self._prepare_batch(
                 model=model,
-                tokenizer=self.tokenizer,
                 input_dict=input_dict,
                 targets=targets,
-                device=self.device,
-                dtype=self.dtype,
-                scheduler=self.train_noise_scheduler,
-                discrete_timesteps=self.discrete_timesteps,
-                pose_dropout=self.config.pose_dropout,
-                inference_prefill_frames=getattr(
-                    self.config.dataloader,
-                    "inference_prefill_frames",
-                    0,
-                ),
-                future_size_frames=getattr(
-                    self.config.dataloader,
-                    "future_size_frames",
-                    0,
-                ),
-                no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
-                fake_timesteps_prob=self.config.fake_timesteps_prob,
                 train=True,
-                context_timestep_augmentation_prob=getattr(
-                    self.config,
-                    "context_timestep_augmentation_prob",
-                    0.0,
-                ),
-                context_timestep_augmentation_max=getattr(
-                    self.config,
-                    "context_timestep_augmentation_max",
-                    0.0,
-                ),
             )
         prepared_batch_size = (
             model_inputs["x"].shape[0]
@@ -816,7 +529,7 @@ class WorldModelTrainer(Trainer):
         )
         self.ntokens_seen += prepared_batch_size * self.config.training.seq_len
         with self.train_context():
-            outputs = _loss_outputs(model(**model_inputs))
+            outputs = self._normalize_outputs(model(**model_inputs))
             loss_vec, terms = self.loss_fn(outputs, targets)
             loss = loss_vec.sum() / local_samples
             del outputs, loss_vec
@@ -840,7 +553,7 @@ class WorldModelTrainer(Trainer):
         for _ in range(self.gradient_accumulation_steps):
             with sl.log_trace_span("fetching_batch"):
                 input_dict, targets = next(data_iterator)
-            local_samples += _model_batch_size(input_dict, self.tokenizer)
+            local_samples += self._model_batch_size(input_dict)
             if "info" in input_dict:
                 step_segment_names.update(_segment_names_from_info(input_dict["info"]))
             if self.gradient_accumulation_steps > 1:
@@ -978,71 +691,6 @@ class WorldModelTrainer(Trainer):
             )
 
 
-class WanWorldModelTrainer(WorldModelTrainer):
-    @dataclass(kw_only=True, slots=True)
-    class Config(WorldModelTrainer.Config):
-        dataloader: WanWorldModelDataLoader.Config
-        tokenizer: WanVAETokenizer.Config
-        validator: WanWorldModelValidator.Config
-        context_timestep_augmentation_prob: float = 0.5
-        context_timestep_augmentation_max: float = 0.5
-
-    def batch_generator(
-        self,
-        data_iterable: Iterable[
-            tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]
-        ],
-    ) -> Iterator[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]]:
-        """Encode a continuous stream once, then drain every temporal window."""
-        data_iterator = iter(data_iterable)
-        tokenizer = cast(WanVAETokenizer, self.tokenizer)
-        inference_prefill_frames = self.config.dataloader.inference_prefill_frames
-
-        while True:
-            data_load_start = time.perf_counter()
-            try:
-                input_dict, targets = next(data_iterator)
-            except StopIteration as ex:
-                raise DataloaderExhaustedError() from ex
-            source_data_loading_time = time.perf_counter() - data_load_start
-            if targets:
-                raise ValueError(
-                    "Wan continuous-window training does not use dataset targets"
-                )
-
-            with sl.log_trace_span("wan_encode_continuous_stream"):
-                encoded_BFCHW = tokenizer.encode(
-                    input_dict,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                # A complete 10-second stream is only about 23 MiB for the
-                # default paired local batch in bf16. Keep it on CPU while its
-                # shuffled windows are consumed so model activation memory is
-                # independent of the source-stream length.
-                source_latents_BFCHW = encoded_BFCHW.detach().to(device="cpu")
-            del encoded_BFCHW, input_dict, targets
-
-            for windowed_latents_BFCHW in _iter_wan_sink_window_batches(
-                source_latents_BFCHW,
-                inference_prefill_frames=inference_prefill_frames,
-            ):
-                # Metrics are cleared independently of the source-stream queue.
-                # Attribute the source load to its first window and record zero
-                # for every remaining window so every optimizer step has a
-                # well-defined data-loading sample.
-                self.metrics_processor.data_loading_times.append(
-                    source_data_loading_time
-                )
-                source_data_loading_time = 0.0
-                windowed_inputs = {"latents": windowed_latents_BFCHW}
-                self.metrics_processor.ntokens_since_last_log += (
-                    _model_batch_size(windowed_inputs, tokenizer)
-                    * self.config.training.seq_len
-                )
-                yield windowed_inputs, {}
-
-
 def _floating_model_dtype(model: torch.nn.Module) -> torch.dtype:
     for param in model.parameters():
         if param.is_floating_point():
@@ -1052,19 +700,14 @@ def _floating_model_dtype(model: torch.nn.Module) -> torch.dtype:
 
 def _apply_worldmodel_float8(
     config: WorldModelTrainer.Config,
-    model_config: WorldModel.Config | WanModel.Config,
+    model_config: WorldModel.Config,
 ) -> None:
-    from .model_config import _blocks_only_float8, _wan_blocks_only_float8
+    from .model_config import _blocks_only_float8
 
     model_compile_enabled = (
         config.compile.enable and "model" in config.compile.components
     )
-    converter_config = (
-        _wan_blocks_only_float8
-        if isinstance(model_config, WanModel.Config)
-        else _blocks_only_float8
-    )
-    converter = converter_config(
+    converter = _blocks_only_float8(
         model_compile_enabled=model_compile_enabled,
         emulate=config.float8.emulate,
     )
@@ -1083,71 +726,8 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
     ):
         raise ValueError("worldmodel supports FSDP/HSDP only")
 
-    if isinstance(model_config, WanModel.Config):
-        if not isinstance(config.dataloader, WanWorldModelDataLoader.Config):
-            raise TypeError(
-                "Wan worldmodel requires WanWorldModelDataLoader.Config"
-            )
-        if not isinstance(config.tokenizer, WanVAETokenizer.Config):
-            raise TypeError("Wan worldmodel requires WanVAETokenizer.Config")
-        if (
-            not config.dataloader.mock_latents
-            and not config.tokenizer.compressor_model
-        ):
-            raise ValueError("Wan image training requires a pretrained VAE checkpoint")
-        if config.tokenizer.image_size != config.dataloader.image_size:
-            raise ValueError("Wan tokenizer and dataloader image_size must match")
-        if model_config.in_dim != config.dataloader.latent_channels:
-            raise ValueError(
-                "Wan model in_dim must match dataloader latent_channels"
-            )
-        if model_config.out_dim != config.dataloader.latent_channels:
-            raise ValueError(
-                "Wan model out_dim must match dataloader latent_channels"
-            )
-        context_timestep_augmentation_prob = getattr(
-            config,
-            "context_timestep_augmentation_prob",
-            0.0,
-        )
-        if not 0.0 <= context_timestep_augmentation_prob <= 1.0:
-            raise ValueError(
-                "Wan context_timestep_augmentation_prob must be in [0, 1]"
-            )
-        context_timestep_augmentation_max = getattr(
-            config,
-            "context_timestep_augmentation_max",
-            0.0,
-        )
-        if not 0.0 <= context_timestep_augmentation_max <= 1.0:
-            raise ValueError(
-                "Wan context_timestep_augmentation_max must be in [0, 1]"
-            )
-
-        model_rgb_frames = (
-            config.dataloader.context_size_frames
-            + config.dataloader.future_size_frames
-        )
-        model_latent_frames = 1 + (model_rgb_frames - 1) // 4
-        latent_shape = (model_latent_frames, *config.dataloader.latent_size)
-        if any(
-            size % patch
-            for size, patch in zip(latent_shape, model_config.patch_size)
-        ):
-            raise ValueError(
-                f"Wan latent shape {latent_shape} must be divisible by patch size {model_config.patch_size}"
-            )
-        seq_len = 1
-        for size, patch in zip(latent_shape, model_config.patch_size):
-            seq_len *= size // patch
-        model_config._sync_derived_fields()
-        config.training.seq_len = seq_len
-        return
-
     if not isinstance(model_config, WorldModel.Config):
-        raise TypeError(
-            "worldmodel model_spec must contain WorldModel.Config or WanModel.Config"
-        )
+        raise TypeError("worldmodel model_spec must contain WorldModel.Config")
     if not isinstance(config.dataloader, WorldModelDataLoader.Config):
         raise TypeError("DiT worldmodel requires WorldModelDataLoader.Config")
     if not isinstance(config.tokenizer, WorldModelTokenizer.Config):

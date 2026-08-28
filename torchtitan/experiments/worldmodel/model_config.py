@@ -16,8 +16,6 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.models.utils import validate_converter_order
 
 from .model import parallelize_worldmodel, TransformerConfig, WorldModel
-from .model_wan import parallelize_wan, wan_debug_config, wan_ti2v_5b_config
-from .wan_state_dict_adapter import WanStateDictAdapter
 
 
 COMPRESSOR_MODEL = "c04337f8-b83f-4e34-b07a-5f7396978d67"
@@ -34,44 +32,30 @@ WORLD_MODEL_FLOAT8_FILTER_FQNS = [
     "final_layer",
     "plan_head",
 ]
-WAN_FLOAT8_FILTER_FQNS = [
-    "text_embedding",
-    "time_embedding",
-    "time_projection",
-    "head",
-]
 
 
 def model_registry(
     flavor: str,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
-    wan_configs = {
-        "wan_ti2v_5b": wan_ti2v_5b_config,
-        "wan_debug": wan_debug_config,
-    }
-    if flavor in wan_configs:
-        config = wan_configs[flavor]()
-        model_name = "wan"
-        parallelize_fn = parallelize_wan
-        state_dict_adapter = WanStateDictAdapter
-    else:
+    try:
         config = _worldmodel_configs()[flavor]()
-        model_name = "worldmodel"
-        parallelize_fn = parallelize_worldmodel
-        state_dict_adapter = None
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported worldmodel flavor {flavor!r}; choose from {sorted(_worldmodel_configs())}"
+        ) from exc
     if converters is not None:
         validate_converter_order(converters)
         for converter in converters:
             converter.build().convert(config)
     return ModelSpec(
-        name=model_name,
+        name="worldmodel",
         flavor=flavor,
         model=config,
-        parallelize_fn=parallelize_fn,
+        parallelize_fn=parallelize_worldmodel,
         pipelining_fn=None,
         post_optimizer_build_fn=register_float8_precompute_scale_hook,
-        state_dict_adapter=state_dict_adapter,
+        state_dict_adapter=None,
     )
 
 
@@ -159,17 +143,6 @@ def _blocks_only_float8(*, model_compile_enabled: bool, emulate: bool = False) -
     return Float8LinearConverter.Config(
         recipe_name="tensorwise",
         filter_fqns=WORLD_MODEL_FLOAT8_FILTER_FQNS,
-        emulate=emulate,
-        enable_fsdp_float8_all_gather=True,
-        precompute_float8_dynamic_scale_for_fsdp=True,
-        model_compile_enabled=model_compile_enabled,
-    )
-
-
-def _wan_blocks_only_float8(*, model_compile_enabled: bool, emulate: bool = False) -> Float8LinearConverter.Config:
-    return Float8LinearConverter.Config(
-        recipe_name="tensorwise",
-        filter_fqns=WAN_FLOAT8_FILTER_FQNS,
         emulate=emulate,
         enable_fsdp_float8_all_gather=True,
         precompute_float8_dynamic_scale_for_fsdp=True,

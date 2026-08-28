@@ -23,7 +23,7 @@ from torchtitan.experiments.worldmodel.model_for_inference import (
     KVCacheDType,
     WeightFormat,
 )
-from torchtitan.experiments.worldmodel.model_wan import (
+from torchtitan.experiments.wanworldmodel.model import (
     _autocast_disabled,
     _compact_padded_context,
     _gate_wan,
