@@ -28,11 +28,24 @@ LossResult = tuple[torch.Tensor, dict[str, torch.Tensor]]
 ACTION_OUTPUT = "action"
 
 
+def _sample_fixed_noise_policy(
+    action_pred_BA: torch.Tensor,
+    action_noise_A: torch.Tensor,
+) -> torch.Tensor:
+    action_mean_BA = action_pred_BA[:, :2]
+    return action_mean_BA + torch.randn_like(action_mean_BA) * action_noise_A
+
+
 def _critic_loss(
     *,
+    next_actor_outputs: ActorOutputs,
     targets: Targets,
     online_critic: nn.Module,
+    target_critic: nn.Module,
     current_inputs: ModelInputs,
+    next_inputs: ModelInputs,
+    action_noise_A: torch.Tensor,
+    gamma: float,
 ) -> LossResult:
     action_reward_B = targets["action_reward"]
     rollout_action_BA = action_reward_B[:, 0:2]
@@ -43,11 +56,24 @@ def _critic_loss(
         action=rollout_action_BA,
     )
 
-    q_rollout_abs_gap_B = torch.abs(q1_rollout_B - q2_rollout_B)
+    with torch.no_grad():
+        next_action_BA = _sample_fixed_noise_policy(
+            next_actor_outputs[ACTION_OUTPUT],
+            action_noise_A,
+        )
+        q1_target_B, q2_target_B = target_critic(
+            inputs=next_inputs,
+            action=next_action_BA,
+        )
+        bootstrap_B = torch.minimum(q1_target_B, q2_target_B)
+        # Rollouts are continuing tasks: every transition bootstraps, with no terminal mask.
+        target_B = reward_B + gamma * bootstrap_B
+        q_target_abs_gap_B = torch.abs(q1_target_B - q2_target_B)
+        q_rollout_abs_gap_B = torch.abs(q1_rollout_B - q2_rollout_B)
+        q_target_clip_correction_B = gamma * 0.5 * q_target_abs_gap_B
 
-    # Intentionally train on immediate reward only; there is no next-state Q bootstrap term.
     critic_loss_B = 0.5 * (
-        F.mse_loss(q1_rollout_B, reward_B, reduction="none") + F.mse_loss(q2_rollout_B, reward_B, reduction="none")
+        F.mse_loss(q1_rollout_B, target_B, reduction="none") + F.mse_loss(q2_rollout_B, target_B, reduction="none")
     )
     metrics = {
         "critic_loss": critic_loss_B.detach(),
@@ -55,6 +81,8 @@ def _critic_loss(
         "q2_rollout": q2_rollout_B.detach(),
         "reward": reward_B.detach(),
         "q_rollout_abs_gap": q_rollout_abs_gap_B.detach(),
+        "q_target_abs_gap": q_target_abs_gap_B.detach(),
+        "q_target_clip_correction": q_target_clip_correction_B.detach(),
     }
     return critic_loss_B, metrics
 
@@ -117,6 +145,8 @@ def _actor_loss(
 class RLDrivingLoss(BaseLoss):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLoss.Config):
+        action_noise: tuple[float, float]
+        gamma: float
         fps: float
         smooth_lat_cost: float = 0.0
         smooth_long_cost: float = 0.0
@@ -130,6 +160,8 @@ class RLDrivingLoss(BaseLoss):
         *,
         compile_config: CompileConfig | None = None,
     ) -> None:
+        self.action_noise_A = torch.tensor(config.action_noise)
+        self.gamma = config.gamma
         self.fps = config.fps
         self.smooth_lat_cost = config.smooth_lat_cost
         self.smooth_long_cost = config.smooth_long_cost
@@ -152,17 +184,29 @@ class RLDrivingLoss(BaseLoss):
 
         self.fn = cast(Callable[..., torch.Tensor], self.actor_fn)
 
+    def to(self, device: torch.device) -> RLDrivingLoss:
+        self.action_noise_A = self.action_noise_A.to(device)
+        return self
+
     def critic_loss(
         self,
         *,
+        next_actor_outputs: ActorOutputs,
         targets: Targets,
         online_critic: nn.Module,
+        target_critic: nn.Module,
         current_inputs: ModelInputs,
+        next_inputs: ModelInputs,
     ) -> LossResult:
         return self.critic_fn(
+            next_actor_outputs=next_actor_outputs,
             targets=targets,
             online_critic=online_critic,
+            target_critic=target_critic,
             current_inputs=current_inputs,
+            next_inputs=next_inputs,
+            action_noise_A=self.action_noise_A,
+            gamma=self.gamma,
         )
 
     def actor_loss(

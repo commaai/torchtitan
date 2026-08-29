@@ -74,6 +74,8 @@ def rldriving() -> RLDrivingTrainer.Config:
     return RLDrivingTrainer.Config(
         model_spec=model_spec,
         loss=RLDrivingLoss.Config(
+            action_noise=(0.25, 0.25),
+            gamma=0.95,
             fps=fps,
             smooth_lat_cost=0.1,
             smooth_long_cost=0.1,
