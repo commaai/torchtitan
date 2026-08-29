@@ -174,7 +174,6 @@ class RLDrivingTrainer(Trainer):
             )
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:rldriving:train")
-        self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
         dcp.load(
             {"temporal_policy": self.model.actor},
@@ -247,21 +246,16 @@ class RLDrivingTrainer(Trainer):
 
         self.optimizers.zero_grad()
         with self.train_context():
-            with torch.no_grad():
-                next_actor_outputs = self.model.target_forward(next_inputs)
             critic_loss_B, critic_metrics = self.loss_fn.critic_loss(
-                next_actor_outputs=next_actor_outputs,
                 targets=targets,
                 online_critic=self.model.critic,
-                target_critic=self.model.target_critic,
                 current_inputs=current_inputs,
-                next_inputs=next_inputs,
             )
             critic_loss = critic_loss_B.sum() / local_samples
             critic_loss.backward()
         critic_loss = critic_loss.detach()
         self._accumulate_metrics(metric_sums, critic_metrics)
-        del next_actor_outputs, critic_loss_B, critic_metrics
+        del critic_loss_B, critic_metrics
         critic_grad_norm = self._clip_phase_grad_norm(self.model.critic)
         self.lr_schedulers.step_phase("critic")
         self.optimizers.zero_grad()
