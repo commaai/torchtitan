@@ -9,7 +9,7 @@ import unittest
 import torch
 import torch.nn as nn
 
-from torchtitan.experiments.rldriving.loss import _critic_loss
+from torchtitan.experiments.rldriving.loss import _actor_loss, _critic_loss
 
 
 class _FixedCritic(nn.Module):
@@ -24,14 +24,15 @@ class _FixedCritic(nn.Module):
 
 
 class TestRLDrivingLoss(unittest.TestCase):
-    def test_critic_loss_always_bootstraps_without_done(self):
+    def test_critic_loss_only_bootstraps_from_valid_next_observation(self):
         targets = {
             "action_reward": torch.tensor(
                 [
                     [0.1, 0.2, 3.0],
                     [0.3, 0.4, 5.0],
                 ]
-            )
+            ),
+            "next_observation_valid": torch.tensor([[1.0], [0.0]]),
         }
 
         loss, metrics = _critic_loss(
@@ -51,10 +52,10 @@ class TestRLDrivingLoss(unittest.TestCase):
             gamma=0.5,
         )
 
-        torch.testing.assert_close(loss, torch.tensor([14.5, 109.0]))
+        torch.testing.assert_close(loss, torch.tensor([14.5, 9.0]))
         torch.testing.assert_close(metrics["q_rollout_abs_gap"], torch.tensor([3.0, 6.0]))
         torch.testing.assert_close(metrics["q_target_abs_gap"], torch.tensor([4.0, 10.0]))
-        torch.testing.assert_close(metrics["q_target_clip_correction"], torch.tensor([1.0, 2.5]))
+        torch.testing.assert_close(metrics["q_target_clip_correction"], torch.tensor([1.0, 0.0]))
         self.assertEqual(
             set(metrics),
             {
@@ -62,11 +63,38 @@ class TestRLDrivingLoss(unittest.TestCase):
                 "q1_rollout",
                 "q2_rollout",
                 "reward",
+                "next_observation_valid",
                 "q_rollout_abs_gap",
                 "q_target_abs_gap",
                 "q_target_clip_correction",
             },
         )
+
+    def test_actor_smoothness_only_uses_valid_next_observation(self):
+        targets = {
+            "speed": torch.full((2, 1), 2.0),
+            "next_observation_valid": torch.tensor([[1.0], [0.0]]),
+        }
+        actor_outputs = {"action": torch.tensor([[4.0, 1.0], [4.0, 1.0]])}
+        next_actor_outputs = {"action": torch.tensor([[5.0, 3.0], [8.0, 5.0]])}
+
+        loss, metrics = _actor_loss(
+            actor_outputs=actor_outputs,
+            next_actor_outputs=next_actor_outputs,
+            online_critic=_FixedCritic(torch.zeros(2), torch.zeros(2)),
+            current_inputs={},
+            targets=targets,
+            fps=1.0,
+            smooth_lat_cost=2.0,
+            smooth_long_cost=3.0,
+            curv_cost=0.0,
+            action_bound=100.0,
+            action_bound_loss_weight=0.0,
+        )
+
+        torch.testing.assert_close(loss, torch.tensor([14.0, 0.0]))
+        torch.testing.assert_close(metrics["actor_cmd_lat_jerk"], torch.tensor([1.0, 0.0]))
+        torch.testing.assert_close(metrics["actor_cmd_long_jerk"], torch.tensor([2.0, 0.0]))
 
 
 if __name__ == "__main__":
