@@ -28,6 +28,7 @@ from torchtitan.experiments.wanworldmodel.model import (
     _compact_padded_context,
     _gate_wan,
     _modulate_wan,
+    _normalize_frame_indices,
     frame_block_causal_mask,
     sinusoidal_embedding_1d,
     WanAttentionBlock,
@@ -39,6 +40,28 @@ from torchtitan.experiments.worldmodel.schedulers import RFScheduler
 
 
 PACKAGED_TEXT_CONTEXT_BUFFER = "packaged_text_context"
+WAN_INFERENCE_SAMPLERS = ("ode", "sde")
+DEFAULT_WAN_INFERENCE_STEPS = 15
+DEFAULT_WAN_INFERENCE_SCHEDULE = "linear"
+DEFAULT_WAN_INFERENCE_SHIFT = 1.0
+
+
+def _frame_indices_to_semantic_positions(
+    frame_indices_BF: torch.Tensor,
+    spatial_grid: tuple[int, int],
+) -> torch.Tensor:
+    """Expand latent-frame coordinates to Wan's flattened 3D token positions."""
+    height, width = spatial_grid
+    spatial_tokens = height * width
+    spatial_positions_S = torch.arange(
+        spatial_tokens,
+        device=frame_indices_BF.device,
+        dtype=torch.int64,
+    )
+    return (
+        frame_indices_BF[:, :, None] * spatial_tokens
+        + spatial_positions_S.view(1, 1, -1)
+    ).flatten(1)
 
 
 def _rope_apply_positions(
@@ -50,29 +73,53 @@ def _rope_apply_positions(
     """Apply Wan 3D RoPE at arbitrary flattened semantic positions."""
     height, width = spatial_grid
     spatial_tokens = height * width
-    if semantic_pos_S.ndim != 1 or semantic_pos_S.numel() != x_BSND.size(1):
-        raise ValueError(f"semantic_pos must have shape [{x_BSND.size(1)}], got {tuple(semantic_pos_S.shape)}")
+    if semantic_pos_S.ndim == 1:
+        if semantic_pos_S.numel() != x_BSND.size(1):
+            raise ValueError(
+                f"semantic_pos must have shape [{x_BSND.size(1)}], got "
+                f"{tuple(semantic_pos_S.shape)}"
+            )
+        positions_BS = semantic_pos_S.view(1, -1)
+    elif semantic_pos_S.shape == x_BSND.shape[:2]:
+        positions_BS = semantic_pos_S
+    else:
+        raise ValueError(
+            "semantic_pos must have shape "
+            f"[{x_BSND.size(1)}] or [{x_BSND.size(0)}, {x_BSND.size(1)}], "
+            f"got {tuple(semantic_pos_S.shape)}"
+        )
 
-    positions_S = semantic_pos_S.to(device=x_BSND.device, dtype=torch.long)
-    frames_S = torch.div(positions_S, spatial_tokens, rounding_mode="floor")
-    spatial_pos_S = positions_S.remainder(spatial_tokens)
-    heights_S = torch.div(spatial_pos_S, width, rounding_mode="floor")
-    widths_S = spatial_pos_S.remainder(width)
+    positions_BS = positions_BS.to(device=x_BSND.device, dtype=torch.long)
+    frames_BS = torch.div(positions_BS, spatial_tokens, rounding_mode="floor")
+    spatial_pos_BS = positions_BS.remainder(spatial_tokens)
+    heights_BS = torch.div(spatial_pos_BS, width, rounding_mode="floor")
+    widths_BS = spatial_pos_BS.remainder(width)
     complex_dim = x_BSND.size(3) // 2
     temporal_freqs, height_freqs, width_freqs = freqs_MD.split(
         (complex_dim - 2 * (complex_dim // 3), complex_dim // 3, complex_dim // 3),
         dim=1,
     )
-    position_freqs_SD = torch.cat(
+    position_freqs_BSD = torch.cat(
         (
-            temporal_freqs[frames_S],
-            height_freqs[heights_S],
-            width_freqs[widths_S],
+            temporal_freqs.index_select(0, frames_BS.flatten()).unflatten(
+                0,
+                frames_BS.shape,
+            ),
+            height_freqs.index_select(0, heights_BS.flatten()).unflatten(
+                0,
+                heights_BS.shape,
+            ),
+            width_freqs.index_select(0, widths_BS.flatten()).unflatten(
+                0,
+                widths_BS.shape,
+            ),
         ),
-        dim=1,
+        dim=2,
     )
     x_BSND_complex = torch.view_as_complex(x_BSND.to(torch.float64).reshape(*x_BSND.shape[:-1], -1, 2))
-    rotated_BSND = torch.view_as_real(x_BSND_complex * position_freqs_SD.view(1, x_BSND.size(1), 1, -1)).flatten(3)
+    rotated_BSND = torch.view_as_real(
+        x_BSND_complex * position_freqs_BSD.unsqueeze(2)
+    ).flatten(3)
     return rotated_BSND.float()
 
 
@@ -172,6 +219,7 @@ class WanInferenceSelfAttention(WanSelfAttention):
         grid_size: tuple[int, int, int],
         freqs_MD: torch.Tensor,
         *,
+        frame_indices_BF: torch.Tensor | None = None,
         semantic_pos_S: torch.Tensor | None = None,
         spatial_grid: tuple[int, int] | None = None,
         cache_pos_S: torch.Tensor | None = None,
@@ -185,7 +233,12 @@ class WanInferenceSelfAttention(WanSelfAttention):
                 x_BSC,
                 grid_size,
                 freqs_MD,
+                frame_indices_BF=frame_indices_BF,
                 input_mask=input_mask,
+            )
+        if frame_indices_BF is not None:
+            raise ValueError(
+                "use either frame_indices_BF or semantic_pos_S, not both"
             )
         if spatial_grid is None:
             raise ValueError("spatial_grid is required with semantic positions")
@@ -266,6 +319,7 @@ class WanInferenceAttentionBlock(WanAttentionBlock):
         context_lens_B: torch.Tensor | None,
         context_key_bias_BL: torch.Tensor | None = None,
         *,
+        frame_indices_BF: torch.Tensor | None = None,
         semantic_pos_S: torch.Tensor | None = None,
         spatial_grid: tuple[int, int] | None = None,
         cache_pos_S: torch.Tensor | None = None,
@@ -277,7 +331,6 @@ class WanInferenceAttentionBlock(WanAttentionBlock):
             semantic_pos_S is None
             and context_BLC is not None
             and cache_pos_S is None
-            and input_mask is None
             and cross_attention_mask is None
         ):
             return super().forward(
@@ -288,6 +341,12 @@ class WanInferenceAttentionBlock(WanAttentionBlock):
                 context_BLC,
                 context_lens_B,
                 context_key_bias_BL,
+                frame_indices_BF=frame_indices_BF,
+                input_mask=input_mask,
+            )
+        if frame_indices_BF is not None:
+            raise ValueError(
+                "use either frame_indices_BF or semantic_pos_S, not both"
             )
 
         if e_BK6C.dtype != torch.float32:
@@ -345,6 +404,10 @@ class WanModelForInference(WanModel):
         config: WanModel.Config,
         *,
         default_kv_cache_dtype: KVCacheDType = FP8_KV_CACHE_DTYPE,
+        default_inference_sampler: str = "ode",
+        default_inference_steps: int = DEFAULT_WAN_INFERENCE_STEPS,
+        default_inference_schedule: str = DEFAULT_WAN_INFERENCE_SCHEDULE,
+        default_inference_shift: float = DEFAULT_WAN_INFERENCE_SHIFT,
     ):
         super().__init__(config)
         self.attention_mask = "BLOCKWISE_LOWER_TRIANGLE"
@@ -356,6 +419,27 @@ class WanModelForInference(WanModel):
             block.cross_attn.__class__ = WanInferenceCrossAttention
             block.self_attn.kv_cache = None
         self.default_kv_cache_dtype = default_kv_cache_dtype
+        if default_inference_sampler not in WAN_INFERENCE_SAMPLERS:
+            raise ValueError(
+                f"unknown Wan inference sampler {default_inference_sampler!r}; "
+                f"expected one of {WAN_INFERENCE_SAMPLERS}"
+            )
+        if default_inference_steps <= 0:
+            raise ValueError(
+                "default Wan inference steps must be positive, got "
+                f"{default_inference_steps}"
+            )
+        if not default_inference_schedule:
+            raise ValueError("default Wan inference schedule cannot be empty")
+        if default_inference_shift <= 0:
+            raise ValueError(
+                "default Wan inference shift must be positive, got "
+                f"{default_inference_shift}"
+            )
+        self.default_inference_sampler = default_inference_sampler
+        self.default_inference_steps = default_inference_steps
+        self.default_inference_schedule = default_inference_schedule
+        self.default_inference_shift = default_inference_shift
         self.max_batch_size = -1
         self.max_seq_length = -1
         self.cache_dtype: torch.dtype | None = None
@@ -618,8 +702,16 @@ class WanModelForInference(WanModel):
         x_BSC, grid_size = self._patchify(latents_BFCHW)
         batch_size, seq_len = x_BSC.shape[:2]
         frames, height, width = grid_size
-        if semantic_pos_S.numel() != seq_len:
-            raise ValueError(f"semantic_pos has {semantic_pos_S.numel()} entries for {seq_len} tokens")
+        if semantic_pos_S.ndim == 1:
+            valid_semantic_shape = semantic_pos_S.shape == (seq_len,)
+        else:
+            valid_semantic_shape = semantic_pos_S.shape == (batch_size, seq_len)
+        if not valid_semantic_shape:
+            raise ValueError(
+                "semantic_pos must have shape "
+                f"[{seq_len}] or [{batch_size}, {seq_len}], got "
+                f"{tuple(semantic_pos_S.shape)}"
+            )
         t_BK = self._compact_timesteps(
             timesteps,
             batch_size=batch_size,
@@ -668,21 +760,32 @@ class WanModelForInference(WanModel):
         latents_BFCHW: torch.Tensor,
         timesteps_BF: torch.Tensor,
         context: torch.Tensor | Sequence[torch.Tensor] | None = None,
+        frame_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the fine-tuning path with frame-block-causal attention."""
         batch_size, frames = latents_BFCHW.shape[:2]
         height = latents_BFCHW.size(3) // self.patch_size[1]
         width = latents_BFCHW.size(4) // self.patch_size[2]
         spatial_tokens = height * width
-        semantic_pos_S = torch.arange(
+        compact_pos_S = torch.arange(
             frames * spatial_tokens,
             device=latents_BFCHW.device,
         )
+        frame_indices_BF = _normalize_frame_indices(
+            frame_indices,
+            batch_size=batch_size,
+            frames=frames,
+            device=latents_BFCHW.device,
+        )
+        semantic_pos_BS = _frame_indices_to_semantic_positions(
+            frame_indices_BF,
+            (height, width),
+        )
         input_mask = frame_block_causal_mask(
-            semantic_pos_S,
-            semantic_pos_S,
+            compact_pos_S,
+            compact_pos_S,
             spatial_tokens,
-        ).view(1, 1, semantic_pos_S.numel(), semantic_pos_S.numel())
+        ).view(1, 1, compact_pos_S.numel(), compact_pos_S.numel())
         context_BLC, context_key_bias_BL = self._project_context_with_bias(
             context,
             batch_size=batch_size,
@@ -691,7 +794,7 @@ class WanModelForInference(WanModel):
         return self._forward_chunk(
             latents_BFCHW,
             timesteps_BF,
-            semantic_pos_S=semantic_pos_S,
+            semantic_pos_S=semantic_pos_BS,
             input_mask=input_mask,
             context_BLC=context_BLC,
             context_key_bias_BL=context_key_bias_BL,
@@ -878,6 +981,7 @@ class WanModelForInference(WanModel):
         cache_seq_length: int,
         input_mask: torch.Tensor | None,
         context: torch.Tensor | Sequence[torch.Tensor] | None = None,
+        frame_indices: torch.Tensor | None = None,
     ) -> None:
         if latents_BFCHW.size(1) == 0:
             return
@@ -886,6 +990,16 @@ class WanModelForInference(WanModel):
         width = latents_BFCHW.size(4) // self.patch_size[2]
         prefix_tokens = frames * height * width
         prefix_pos_P = torch.arange(prefix_tokens, device=latents_BFCHW.device)
+        frame_indices_BF = _normalize_frame_indices(
+            frame_indices,
+            batch_size=batch_size,
+            frames=frames,
+            device=latents_BFCHW.device,
+        )
+        semantic_pos_BP = _frame_indices_to_semantic_positions(
+            frame_indices_BF,
+            (height, width),
+        )
         context_BLC, context_key_bias_BL = self._project_context_with_bias(
             context,
             batch_size=batch_size,
@@ -898,7 +1012,7 @@ class WanModelForInference(WanModel):
                 device=latents_BFCHW.device,
                 dtype=torch.float32,
             ),
-            semantic_pos_S=prefix_pos_P,
+            semantic_pos_S=semantic_pos_BP,
             input_mask=input_mask,
             context_BLC=context_BLC,
             context_key_bias_BL=context_key_bias_BL,
@@ -915,6 +1029,7 @@ class WanModelForInference(WanModel):
         num_prefill_frames: int,
         input_mask: torch.Tensor | None,
         context: torch.Tensor | Sequence[torch.Tensor] | None = None,
+        frame_indices: torch.Tensor | None = None,
         cfg: float = 0.0,
     ) -> torch.Tensor:
         batch_size, frames = latents_BFCHW.shape[:2]
@@ -925,11 +1040,18 @@ class WanModelForInference(WanModel):
         decode_tokens = frames * spatial_tokens
         branches = 2 if cfg > 0.0 else 1
         cache_seq_length = prefix_tokens + branches * decode_tokens
-        semantic_pos_S = torch.arange(
-            prefix_tokens,
-            prefix_tokens + decode_tokens,
+        frame_indices_BF = _normalize_frame_indices(
+            frame_indices,
+            batch_size=batch_size,
+            frames=frames,
             device=latents_BFCHW.device,
-        ).repeat(branches)
+        )
+        if frame_indices is None:
+            frame_indices_BF = frame_indices_BF + num_prefill_frames
+        semantic_pos_BS = _frame_indices_to_semantic_positions(
+            frame_indices_BF,
+            (height, width),
+        ).repeat(1, branches)
         cache_pos_S = torch.arange(
             prefix_tokens,
             cache_seq_length,
@@ -965,7 +1087,7 @@ class WanModelForInference(WanModel):
         output_BFCHW = self._forward_chunk(
             packed_latents_BFCHW,
             packed_timesteps,
-            semantic_pos_S=semantic_pos_S,
+            semantic_pos_S=semantic_pos_BS,
             input_mask=input_mask,
             context_BLC=context_BLC,
             context_key_bias_BL=context_key_bias_BL,
@@ -989,10 +1111,18 @@ class WanModelForInference(WanModel):
         steps: int,
         timestep_scale: float = 1000.0,
         context: torch.Tensor | Sequence[torch.Tensor] | None = None,
+        frame_indices: torch.Tensor | None = None,
         cfg: float = 0.0,
+        inference_sampler: str = "ode",
+        generator: torch.Generator | None = None,
         return_trajectory: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor | None]:
         """Denoise a suffix while overwriting only its physical cache slots."""
+        if inference_sampler not in WAN_INFERENCE_SAMPLERS:
+            raise ValueError(
+                f"unknown Wan inference sampler {inference_sampler!r}; "
+                f"expected one of {WAN_INFERENCE_SAMPLERS}"
+            )
         batch_size = x_BFCHW.size(0)
         device = x_BFCHW.device
         dtype = x_BFCHW.dtype
@@ -1018,17 +1148,42 @@ class WanModelForInference(WanModel):
                     num_prefill_frames=num_prefill_frames,
                     input_mask=input_mask,
                     context=context,
+                    frame_indices=frame_indices,
                     cfg=cfg,
                 )
             model_output = {"sample": velocity_BFCHW}
-            # Wan predicts the forward flow epsilon-x_0. RFScheduler.step is
-            # shared with the legacy world model and integrates x_0-epsilon,
-            # so convert conventions exactly once at this boundary.
-            x_BFCHW = scheduler.step(
-                -velocity_BFCHW,
-                step_idx,
-                x_BFCHW,
-            ).to(dtype)
+            if inference_sampler == "ode":
+                # Wan predicts the forward flow epsilon-x_0. RFScheduler.step
+                # integrates x_0-epsilon, so convert conventions exactly once
+                # at this boundary.
+                x_BFCHW = scheduler.step(
+                    -velocity_BFCHW,
+                    step_idx,
+                    x_BFCHW,
+                ).to(dtype)
+            else:
+                # Self-Forcing trains on this random-exit SDE trajectory, not
+                # the deterministic RF/ODE trajectory above. Each evaluation
+                # predicts x_0, then the next point is sampled from the forward
+                # process at the next discrete timestep.
+                timestep = scheduler.timesteps[step_idx]
+                predicted_x0_BFCHW = (
+                    x_BFCHW - timestep * velocity_BFCHW
+                ).to(dtype)
+                if step_idx == steps - 1:
+                    x_BFCHW = predicted_x0_BFCHW
+                else:
+                    next_timestep = scheduler.timesteps[step_idx + 1]
+                    noise_BFCHW = torch.randn(
+                        predicted_x0_BFCHW.shape,
+                        device=device,
+                        dtype=dtype,
+                        generator=generator,
+                    )
+                    x_BFCHW = (
+                        (1 - next_timestep) * predicted_x0_BFCHW
+                        + next_timestep * noise_BFCHW
+                    ).to(dtype)
             if trajectory is not None:
                 trajectory.append(x_BFCHW.clone())
         return (
@@ -1042,14 +1197,17 @@ class WanModelForInference(WanModel):
         self,
         latents: torch.Tensor,
         *,
-        steps: int = 15,
+        steps: int | None = None,
         num_prefill_frames: int = 1,
         dtype: torch.dtype = torch.bfloat16,
-        inference_schedule: str = "linear",
-        shift: float = 1.0,
+        inference_schedule: str | None = None,
+        shift: float | None = None,
         timestep_scale: float = 1000.0,
         context: torch.Tensor | Sequence[torch.Tensor] | None = None,
+        frame_indices: torch.Tensor | None = None,
         cfg: float = 0.0,
+        inference_sampler: str | None = None,
+        generator: torch.Generator | None = None,
         return_trajectory: bool = False,
         kv_cache_dtype: KVCacheDType | None = None,
         **scheduler_kwargs: Any,
@@ -1059,6 +1217,29 @@ class WanModelForInference(WanModel):
         batch_size, frames = latents.shape[:2]
         if not 0 <= num_prefill_frames < frames:
             raise ValueError(f"num_prefill_frames={num_prefill_frames} must be in [0, {frames - 1}]")
+        steps = self.default_inference_steps if steps is None else steps
+        inference_schedule = (
+            self.default_inference_schedule
+            if inference_schedule is None
+            else inference_schedule
+        )
+        shift = self.default_inference_shift if shift is None else shift
+        inference_sampler = (
+            self.default_inference_sampler
+            if inference_sampler is None
+            else inference_sampler
+        )
+        if inference_sampler not in WAN_INFERENCE_SAMPLERS:
+            raise ValueError(
+                f"unknown Wan inference sampler {inference_sampler!r}; "
+                f"expected one of {WAN_INFERENCE_SAMPLERS}"
+            )
+        frame_indices_BF = _normalize_frame_indices(
+            frame_indices,
+            batch_size=batch_size,
+            frames=frames,
+            device=latents.device,
+        )
         if steps <= 0:
             return {"latents": latents[:, num_prefill_frames:].to(dtype=dtype)}
 
@@ -1097,6 +1278,7 @@ class WanModelForInference(WanModel):
                 cache_seq_length=cache_seq_length,
                 input_mask=prefill_mask,
                 context=context,
+                frame_indices=frame_indices_BF[:, :num_prefill_frames],
             )
 
         scheduler = RFScheduler(
@@ -1119,7 +1301,10 @@ class WanModelForInference(WanModel):
             steps=steps,
             timestep_scale=timestep_scale,
             context=context,
+            frame_indices=frame_indices_BF[:, num_prefill_frames:],
             cfg=cfg,
+            inference_sampler=inference_sampler,
+            generator=generator,
             return_trajectory=return_trajectory,
         )
 
@@ -1184,10 +1369,14 @@ KVCache = WanKVCache
 
 __all__ = [
     "BF16_KV_CACHE_DTYPE",
+    "DEFAULT_WAN_INFERENCE_SCHEDULE",
+    "DEFAULT_WAN_INFERENCE_SHIFT",
+    "DEFAULT_WAN_INFERENCE_STEPS",
     "FP8_KV_CACHE_DTYPE",
     "KVCacheDType",
     "KVCache",
     "WanKVCache",
     "WanModelForInference",
+    "WAN_INFERENCE_SAMPLERS",
     "frame_block_causal_mask",
 ]

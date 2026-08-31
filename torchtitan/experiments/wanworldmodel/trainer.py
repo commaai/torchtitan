@@ -49,7 +49,8 @@ def _select_wan_sink_window(
     latents_BFCHW: torch.Tensor,
     *,
     inference_prefill_frames: int,
-) -> torch.Tensor:
+    source_frame_indices_BF: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Select the maximum-distance Wan window for validation and direct calls."""
     batch_size, source_frames = latents_BFCHW.shape[:2]
     if batch_size % WanVAETokenizer.NUM_VIEWS:
@@ -75,7 +76,7 @@ def _select_wan_sink_window(
         continuation_frames,
         device=latents_BFCHW.device,
     )
-    frame_indices_BF = torch.cat(
+    local_frame_indices_BF = torch.cat(
         (
             torch.zeros(
                 (batch_size, 1),
@@ -90,14 +91,33 @@ def _select_wan_sink_window(
         batch_size,
         device=latents_BFCHW.device,
     )[:, None]
-    return latents_BFCHW[batch_indices_BF, frame_indices_BF]
+    if source_frame_indices_BF is None:
+        source_frame_indices_BF = torch.arange(
+            source_frames,
+            device=latents_BFCHW.device,
+            dtype=torch.int64,
+        ).expand(batch_size, -1)
+    elif source_frame_indices_BF.shape != (batch_size, source_frames):
+        raise ValueError(
+            "source frame indices must have shape "
+            f"[{batch_size}, {source_frames}], got {tuple(source_frame_indices_BF.shape)}"
+        )
+    else:
+        source_frame_indices_BF = source_frame_indices_BF.to(
+            device=latents_BFCHW.device,
+            dtype=torch.int64,
+        )
+    return (
+        latents_BFCHW[batch_indices_BF, local_frame_indices_BF],
+        source_frame_indices_BF[batch_indices_BF, local_frame_indices_BF],
+    )
 
 
 def _iter_wan_sink_window_batches(
     latents_BFCHW: torch.Tensor,
     *,
     inference_prefill_frames: int,
-) -> Iterator[torch.Tensor]:
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield every sink window once in fixed-size shuffled training batches."""
     if latents_BFCHW.ndim != 5:
         raise ValueError(f"Wan sink-window batching requires [B, F, C, H, W] latents, got {tuple(latents_BFCHW.shape)}")
@@ -149,7 +169,10 @@ def _iter_wan_sink_window_batches(
             batch_indices_B[:, None, None],
             frame_indices_BKF,
         ]
-        yield windows_BKFCHW.flatten(0, 1).contiguous()
+        yield (
+            windows_BKFCHW.flatten(0, 1).contiguous(),
+            frame_indices_BKF.flatten(0, 1).contiguous(),
+        )
 
 
 def _prepare_wan_batch(
@@ -172,9 +195,10 @@ def _prepare_wan_batch(
     latents_BFCHW = tokenizer.encode(input_dict, device=device, dtype=dtype)
     if latents_BFCHW.ndim != 5:
         raise ValueError(f"Wan latents must have shape [B, F, C, H, W], got {tuple(latents_BFCHW.shape)}")
-    latents_BFCHW = _select_wan_sink_window(
+    latents_BFCHW, frame_indices_BF = _select_wan_sink_window(
         latents_BFCHW,
         inference_prefill_frames=inference_prefill_frames,
+        source_frame_indices_BF=input_dict.get("frame_indices"),
     )
     batch_size, num_frames, channels, height, width = latents_BFCHW.shape
     if not 0 < inference_prefill_frames < num_frames:
@@ -257,6 +281,7 @@ def _prepare_wan_batch(
         "t": timesteps_BF * 1000.0,
         "context": list(text_context_BLC.unbind(0)),
         "seq_len": seq_len,
+        "frame_indices": frame_indices_BF,
     }, prepared_targets
 
 
@@ -406,13 +431,16 @@ class WanWorldModelTrainer(WorldModelTrainer):
                 source_latents_BFCHW = encoded_BFCHW.detach().to(device="cpu")
             del encoded_BFCHW, input_dict, targets
 
-            for windowed_latents_BFCHW in _iter_wan_sink_window_batches(
+            for windowed_latents_BFCHW, frame_indices_BF in _iter_wan_sink_window_batches(
                 source_latents_BFCHW,
                 inference_prefill_frames=inference_prefill_frames,
             ):
                 self.metrics_processor.data_loading_times.append(source_data_loading_time)
                 source_data_loading_time = 0.0
-                windowed_inputs = {"latents": windowed_latents_BFCHW}
+                windowed_inputs = {
+                    "latents": windowed_latents_BFCHW,
+                    "frame_indices": frame_indices_BF,
+                }
                 self.metrics_processor.ntokens_since_last_log += (
                     self._model_batch_size(windowed_inputs) * self.config.training.seq_len
                 )
@@ -458,4 +486,11 @@ def _validate_wanworldmodel_config(config: WanWorldModelTrainer.Config) -> None:
     for size, patch in zip(latent_shape, model_config.patch_size):
         seq_len *= size // patch
     model_config._sync_derived_fields()
+    source_latent_frames = 1 + (config.dataloader.clip_frames - 1) // 4
+    if source_latent_frames > model_config.rope_max_seq_len:
+        raise ValueError(
+            "Wan continuous stream requires temporal RoPE positions through "
+            f"{source_latent_frames - 1}, but rope_max_seq_len is "
+            f"{model_config.rope_max_seq_len}"
+        )
     config.training.seq_len = seq_len

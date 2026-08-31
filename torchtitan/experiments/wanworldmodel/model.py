@@ -192,10 +192,33 @@ def _build_rope_freqs(
     )
 
 
+def _normalize_frame_indices(
+    frame_indices: torch.Tensor | None,
+    *,
+    batch_size: int,
+    frames: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return one latent-frame RoPE coordinate per sample and model frame."""
+    if frame_indices is None:
+        return torch.arange(
+            frames,
+            device=device,
+            dtype=torch.int64,
+        ).expand(batch_size, -1)
+    if frame_indices.shape != (batch_size, frames):
+        raise ValueError(
+            "frame_indices must have shape "
+            f"[{batch_size}, {frames}], got {tuple(frame_indices.shape)}"
+        )
+    return frame_indices.to(device=device, dtype=torch.int64)
+
+
 def rope_apply(
     x_BSND: torch.Tensor,
     grid_size: tuple[int, int, int],
     freqs_MD: torch.Tensor,
+    frame_indices_BF: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply Wan's factorized 3D RoPE to a full, uniform token block."""
     seq_len = x_BSND.size(1)
@@ -208,6 +231,37 @@ def rope_apply(
         (complex_dim - 2 * (complex_dim // 3), complex_dim // 3, complex_dim // 3),
         dim=1,
     )
+    if frame_indices_BF is not None:
+        if frame_indices_BF.shape != (x_BSND.size(0), frames):
+            raise ValueError(
+                "frame_indices must have shape "
+                f"[{x_BSND.size(0)}, {frames}], got {tuple(frame_indices_BF.shape)}"
+            )
+        # ``index_select`` rejects both negative and out-of-table positions
+        # without a host synchronization. Keep the sparse temporal coordinates
+        # batched while broadcasting the ordinary spatial coordinates.
+        temporal_position_freqs_BFD = temporal_freqs.index_select(
+            0,
+            frame_indices_BF.to(device=x_BSND.device, dtype=torch.int64).flatten(),
+        ).unflatten(0, (x_BSND.size(0), frames))
+        x_BFHWND = torch.view_as_complex(
+            x_BSND.to(torch.float64).reshape(*x_BSND.shape[:-1], -1, 2)
+        ).view(x_BSND.size(0), frames, height, width, x_BSND.size(2), -1)
+        temporal_dim = temporal_freqs.size(1)
+        height_dim = height_freqs.size(1)
+        rotated_BFHWND = torch.cat(
+            (
+                x_BFHWND[..., :temporal_dim]
+                * temporal_position_freqs_BFD[:, :, None, None, None, :],
+                x_BFHWND[..., temporal_dim : temporal_dim + height_dim]
+                * height_freqs[:height].view(1, 1, height, 1, 1, -1),
+                x_BFHWND[..., temporal_dim + height_dim :]
+                * width_freqs[:width].view(1, 1, 1, width, 1, -1),
+            ),
+            dim=-1,
+        ).reshape(*x_BSND.shape[:-1], -1)
+        return torch.view_as_real(rotated_BFHWND).flatten(3).float()
+
     position_freqs_SD = torch.cat(
         (
             temporal_freqs[:frames].view(frames, 1, 1, -1).expand(frames, height, width, -1),
@@ -392,7 +446,12 @@ def _compact_padded_context(
         lengths.append(context_length)
         compressed_lengths.append(context_length + int(context_length < text_len))
 
-    compressed_len = max(compressed_lengths)
+    # Cross-attention K/V weight gradients flatten ``[B, L]`` into the GEMM
+    # reduction dimension.  Keep L independently aligned for FP8 training;
+    # otherwise a valid short prompt can fail based only on local batch size
+    # (for example, two views times 12 compact tokens gives K=24).  The added
+    # zero tokens remain exactly inert through the ``-inf`` key bias below.
+    compressed_len = (max(compressed_lengths) + 15) // 16 * 16
     context_BLC = context[0].new_zeros((len(context), compressed_len, text_dim))
     key_bias_BL = torch.full(
         (len(context), compressed_len),
@@ -408,7 +467,7 @@ def _compact_padded_context(
             # context_BLC[:, context_length] is the single retained raw zero token.
             key_bias_BL[batch_idx, context_length] = math.log(padding_count)
 
-    if all(context_length == text_len for context_length in lengths):
+    if compressed_len == text_len and all(context_length == text_len for context_length in lengths):
         return context_BLC, None
     return context_BLC, key_bias_BL
 
@@ -528,6 +587,7 @@ class WanSelfAttention(nn.Module):
         grid_size: tuple[int, int, int],
         freqs_MD: torch.Tensor,
         *,
+        frame_indices_BF: torch.Tensor | None = None,
         input_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len = x_BSC.shape[:2]
@@ -535,8 +595,18 @@ class WanSelfAttention(nn.Module):
         k_BSND = self.norm_k(self.k(x_BSC)).view(batch_size, seq_len, self.num_heads, self.head_dim)
         v_BSND = self.v(x_BSC).view(batch_size, seq_len, self.num_heads, self.head_dim)
 
-        q_BSND = rope_apply(q_BSND, grid_size, freqs_MD).to(v_BSND.dtype)
-        k_BSND = rope_apply(k_BSND, grid_size, freqs_MD).to(v_BSND.dtype)
+        q_BSND = rope_apply(
+            q_BSND,
+            grid_size,
+            freqs_MD,
+            frame_indices_BF,
+        ).to(v_BSND.dtype)
+        k_BSND = rope_apply(
+            k_BSND,
+            grid_size,
+            freqs_MD,
+            frame_indices_BF,
+        ).to(v_BSND.dtype)
         output_BSND = _scaled_dot_product_attention(
             q_BSND,
             k_BSND,
@@ -629,6 +699,7 @@ class WanAttentionBlock(nn.Module):
         context_lens_B: torch.Tensor | None,
         context_key_bias_BL: torch.Tensor | None = None,
         *,
+        frame_indices_BF: torch.Tensor | None = None,
         input_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if e_BK6C.dtype != torch.float32:
@@ -647,6 +718,7 @@ class WanAttentionBlock(nn.Module):
             attention_input_BSC.to(self.self_attn.q.weight.dtype),
             grid_size,
             freqs_MD,
+            frame_indices_BF=frame_indices_BF,
             input_mask=input_mask,
         )
         with _autocast_disabled(x_BSC):
@@ -1030,6 +1102,7 @@ class WanModel(BaseModel):
         context: Sequence[torch.Tensor],
         seq_len: int,
         y: Sequence[torch.Tensor] | None = None,
+        frame_indices: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         """Run the upstream-compatible list-based Wan transformer forward."""
         batch_size = len(x)
@@ -1066,6 +1139,16 @@ class WanModel(BaseModel):
             raise ValueError(f"full patch sequence has length {x_BSC.size(1)}, but seq_len is {seq_len}")
 
         frames = grid_size[0]
+        frame_indices_BF = (
+            _normalize_frame_indices(
+                frame_indices,
+                batch_size=batch_size,
+                frames=frames,
+                device=x_BSC.device,
+            )
+            if frame_indices is not None
+            else None
+        )
         self_attention_mask = (
             self._get_block_causal_mask(
                 seq_len=seq_len,
@@ -1113,6 +1196,7 @@ class WanModel(BaseModel):
                 context_BLC,
                 None,
                 context_key_bias_BL,
+                frame_indices_BF=frame_indices_BF,
                 input_mask=self_attention_mask,
             )
 
@@ -1327,7 +1411,9 @@ def wan_debug_config() -> WanModel.Config:
         num_heads=4,
         num_layers=1,
         attention_mask="BLOCKWISE_LOWER_TRIANGLE",
-        rope_max_seq_len=16,
+        # The debug dataloader keeps the production ten-second sink gap, whose
+        # source and Self-Forcing rollout positions extend through z60.
+        rope_max_seq_len=64,
     )
 
 

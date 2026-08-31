@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
@@ -278,6 +279,7 @@ def _forward_BFCHW(
     latents_BFCHW: torch.Tensor,
     timesteps_BF: torch.Tensor,
     text_context_BLC: torch.Tensor,
+    frame_indices_BF: torch.Tensor,
 ) -> torch.Tensor:
     latents_BCFHW = latents_BFCHW.permute(0, 2, 1, 3, 4)
     outputs = model(
@@ -285,6 +287,7 @@ def _forward_BFCHW(
         timesteps_BF * 1000.0,
         list(text_context_BLC.unbind(0)),
         _seq_len(model, latents_BFCHW),
+        frame_indices=frame_indices_BF,
     )
     if not isinstance(outputs, list) or len(outputs) != latents_BFCHW.size(0):
         raise TypeError("Wan Self-Forcing forward must return one tensor per sample")
@@ -295,20 +298,40 @@ def generate_next_latent(
     *,
     model: WanModel,
     context_BFCHW: torch.Tensor,
+    context_frame_indices_BF: torch.Tensor,
+    target_frame_indices_B1: torch.Tensor,
     text_context_BLC: torch.Tensor,
     scheduler: RFScheduler,
-    retain_final_step_graph: bool,
+    exit_step_index: int,
+    retain_exit_step_graph: bool,
 ) -> torch.Tensor:
-    """Run the exact autoregressive one-latent RF solver used at inference."""
+    """Predict one clean latent with the standard random-exit SDE estimator."""
     batch_size = context_BFCHW.size(0)
+    if context_frame_indices_BF.shape != context_BFCHW.shape[:2]:
+        raise ValueError(
+            "context frame indices must have shape "
+            f"{tuple(context_BFCHW.shape[:2])}, got "
+            f"{tuple(context_frame_indices_BF.shape)}"
+        )
+    if target_frame_indices_B1.shape != (batch_size, 1):
+        raise ValueError(
+            f"target frame indices must have shape [{batch_size}, 1], got {tuple(target_frame_indices_B1.shape)}"
+        )
+    model_frame_indices_BF = torch.cat(
+        (context_frame_indices_BF, target_frame_indices_B1),
+        dim=1,
+    )
+    num_denoising_steps = scheduler.timesteps.numel() - 1
+    if not 0 <= exit_step_index < num_denoising_steps:
+        raise ValueError(f"exit_step_index={exit_step_index} must be in [0, {num_denoising_steps - 1}]")
     candidate_B1CHW = torch.randn(
         (batch_size, 1, *context_BFCHW.shape[2:]),
         device=context_BFCHW.device,
         dtype=context_BFCHW.dtype,
     )
-    for step_index, timestep in enumerate(scheduler.timesteps[:-1]):
-        keep_graph = retain_final_step_graph and step_index == scheduler.timesteps.numel() - 2
-        with torch.set_grad_enabled(keep_graph):
+    for step_index, timestep in enumerate(scheduler.timesteps[: exit_step_index + 1]):
+        is_exit_step = step_index == exit_step_index
+        with torch.set_grad_enabled(retain_exit_step_graph and is_exit_step):
             model_input_BFCHW = torch.cat(
                 (context_BFCHW, candidate_B1CHW),
                 dim=1,
@@ -324,13 +347,46 @@ def generate_next_latent(
                 model_input_BFCHW,
                 timesteps_BF,
                 text_context_BLC,
+                model_frame_indices_BF,
             )
-            candidate_B1CHW = scheduler.step(
-                -velocity_BFCHW[:, -1:],
-                step_index,
-                candidate_B1CHW,
-            ).to(dtype=context_BFCHW.dtype)
-    return candidate_B1CHW
+            predicted_x0_B1CHW = (candidate_B1CHW - timestep * velocity_BFCHW[:, -1:]).to(dtype=context_BFCHW.dtype)
+        if is_exit_step:
+            return predicted_x0_B1CHW
+
+        # Standard Self-Forcing uses an SDE transition between student
+        # evaluations. The preceding prediction is detached by the no-grad
+        # context, while the next exit prediction is the only differentiable
+        # model call.
+        next_timestep = scheduler.timesteps[step_index + 1]
+        candidate_B1CHW = (
+            (1 - next_timestep) * predicted_x0_B1CHW + next_timestep * torch.randn_like(predicted_x0_B1CHW)
+        ).to(dtype=context_BFCHW.dtype)
+
+    raise AssertionError("Self-Forcing rollout did not reach its exit step")
+
+
+def sample_self_forcing_exit_step(
+    scheduler: RFScheduler,
+    *,
+    device: torch.device,
+) -> int:
+    """Sample one exit shared by all blocks, batches, and distributed ranks."""
+    num_denoising_steps = scheduler.timesteps.numel() - 1
+    if num_denoising_steps <= 0:
+        raise ValueError("Self-Forcing scheduler must contain a denoising step")
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
+        exit_step = torch.randint(
+            num_denoising_steps,
+            (1,),
+            device=device,
+            dtype=torch.int64,
+        )
+    else:
+        exit_step = torch.empty((1,), device=device, dtype=torch.int64)
+    if dist.is_available() and dist.is_initialized():
+        dist.broadcast(exit_step, src=0)
+    return int(exit_step.item())
 
 
 def slide_self_forcing_context(
@@ -357,61 +413,144 @@ def slide_self_forcing_context(
     )
 
 
+def slide_self_forcing_frame_indices(
+    context_frame_indices_BF: torch.Tensor,
+    generated_frame_indices_B1: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the latent context eviction rule to temporal RoPE coordinates."""
+    if context_frame_indices_BF.ndim != 2 or context_frame_indices_BF.size(1) != 10:
+        raise ValueError("Self-Forcing frame indices must contain z0 plus nine recent positions")
+    expected_shape = (context_frame_indices_BF.size(0), 1)
+    if generated_frame_indices_B1.shape != expected_shape:
+        raise ValueError(
+            f"generated frame indices must have shape {expected_shape}, got {tuple(generated_frame_indices_B1.shape)}"
+        )
+    return torch.cat(
+        (
+            context_frame_indices_BF[:, :1],
+            context_frame_indices_BF[:, 2:],
+            generated_frame_indices_B1,
+        ),
+        dim=1,
+    )
+
+
 @dataclass(slots=True)
-class SelfForcingLosses:
-    loss_B: torch.Tensor
+class SelfForcingGeneratorLosses:
     dmd_loss_B: torch.Tensor
-    fake_score_loss_B: torch.Tensor
     dmd_gradient_norm_B: torch.Tensor
+    dmd_normalizer_B: torch.Tensor
+    rollout_exit_timestep_B: torch.Tensor
 
 
-def self_forcing_losses(
+@dataclass(slots=True)
+class SelfForcingCriticLosses:
+    fake_score_loss_B: torch.Tensor
+    rollout_exit_timestep_B: torch.Tensor
+
+
+@dataclass(slots=True)
+class _SelfForcingRollout:
+    generated_window_BFCHW: torch.Tensor
+    generated_window_frame_indices_BF: torch.Tensor
+    generated_2_B1CHW: torch.Tensor
+
+
+def _normalized_dmd_gradient(
+    *,
+    generated_B1CHW: torch.Tensor,
+    fake_x0_B1CHW: torch.Tensor,
+    real_x0_B1CHW: torch.Tensor,
+    normalizer_min: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the DMD gradient normalized by generator-to-teacher error."""
+    raw_gradient_B1CHW = (fake_x0_B1CHW - real_x0_B1CHW).detach()
+    normalizer_B = (
+        (generated_B1CHW.detach() - real_x0_B1CHW).float().abs().mean(dim=(1, 2, 3, 4)).clamp_min(normalizer_min)
+    )
+    gradient_B1CHW = torch.nan_to_num(raw_gradient_B1CHW / normalizer_B[:, None, None, None, None])
+    raw_gradient_norm_B = raw_gradient_B1CHW.float().square().mean(dim=(1, 2, 3, 4)).sqrt()
+    return gradient_B1CHW, raw_gradient_norm_B, normalizer_B
+
+
+def _self_forcing_rollout(
     *,
     model: WanSelfForcingModel,
     latents_BFCHW: torch.Tensor,
+    frame_indices_BF: torch.Tensor,
     text_context_BLC: torch.Tensor,
     rollout_scheduler: RFScheduler,
-    score_timesteps_B: torch.Tensor,
-    dmd_normalizer_min: float,
-    fake_score_loss_weight: float,
-) -> SelfForcingLosses:
-    """Generate two chunks and compute DMD plus fake-score RF losses."""
+    rollout_exit_step_index: int,
+    retain_generator_graph: bool,
+) -> _SelfForcingRollout:
+    """Generate two autoregressive chunks from one real context window."""
     if latents_BFCHW.ndim != 5:
         raise ValueError(f"Self-Forcing latents must have shape [B, F, C, H, W], got {tuple(latents_BFCHW.shape)}")
     if latents_BFCHW.size(1) != 11:
         raise ValueError(
             f"Minimal Self-Forcing requires [z0, nine history latents, target] (11 total), got {latents_BFCHW.size(1)}"
         )
-    if score_timesteps_B.shape != (latents_BFCHW.size(0),):
-        raise ValueError("Self-Forcing score timesteps must contain one value per sample")
-    if dmd_normalizer_min <= 0:
-        raise ValueError("Self-Forcing dmd_normalizer_min must be positive")
-
+    if frame_indices_BF.shape != latents_BFCHW.shape[:2]:
+        raise ValueError(
+            "Self-Forcing frame indices must have shape "
+            f"{tuple(latents_BFCHW.shape[:2])}, got "
+            f"{tuple(frame_indices_BF.shape)}"
+        )
     initial_context_BFCHW = latents_BFCHW[:, :10]
+    initial_context_frame_indices_BF = frame_indices_BF[:, :10]
+    generated_1_frame_indices_B1 = frame_indices_BF[:, 10:]
     generated_1_B1CHW = generate_next_latent(
         model=model,
         context_BFCHW=initial_context_BFCHW,
+        context_frame_indices_BF=initial_context_frame_indices_BF,
+        target_frame_indices_B1=generated_1_frame_indices_B1,
         text_context_BLC=text_context_BLC,
         scheduler=rollout_scheduler,
-        retain_final_step_graph=False,
+        exit_step_index=rollout_exit_step_index,
+        retain_exit_step_graph=False,
     ).detach()
     rolling_context_BFCHW = slide_self_forcing_context(
         initial_context_BFCHW,
         generated_1_B1CHW,
     )
+    rolling_context_frame_indices_BF = slide_self_forcing_frame_indices(
+        initial_context_frame_indices_BF,
+        generated_1_frame_indices_B1,
+    )
+    generated_2_frame_indices_B1 = generated_1_frame_indices_B1 + 1
     generated_2_B1CHW = generate_next_latent(
         model=model,
         context_BFCHW=rolling_context_BFCHW,
+        context_frame_indices_BF=rolling_context_frame_indices_BF,
+        target_frame_indices_B1=generated_2_frame_indices_B1,
         text_context_BLC=text_context_BLC,
         scheduler=rollout_scheduler,
-        retain_final_step_graph=True,
+        exit_step_index=rollout_exit_step_index,
+        retain_exit_step_graph=retain_generator_graph,
     )
     generated_window_BFCHW = torch.cat(
         (rolling_context_BFCHW, generated_2_B1CHW),
         dim=1,
     )
+    generated_window_frame_indices_BF = torch.cat(
+        (rolling_context_frame_indices_BF, generated_2_frame_indices_B1),
+        dim=1,
+    )
+    return _SelfForcingRollout(
+        generated_window_BFCHW=generated_window_BFCHW,
+        generated_window_frame_indices_BF=generated_window_frame_indices_BF,
+        generated_2_B1CHW=generated_2_B1CHW,
+    )
 
-    detached_window_BFCHW = generated_window_BFCHW.detach()
+
+def _noisy_score_window(
+    rollout: _SelfForcingRollout,
+    score_timesteps_B: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    detached_window_BFCHW = rollout.generated_window_BFCHW.detach()
+    if score_timesteps_B.shape != (detached_window_BFCHW.size(0),):
+        raise ValueError("Self-Forcing score timesteps must contain one value per sample")
+
     score_noise_BFCHW = torch.randn_like(detached_window_BFCHW)
     score_timesteps_BF = score_timesteps_B[:, None].expand(detached_window_BFCHW.shape[:2]).clone()
     # z0 remains the exact clean attention sink under every training path.
@@ -419,51 +558,139 @@ def self_forcing_losses(
     noisy_window_BFCHW = (1 - score_timesteps_BF[:, :, None, None, None]) * detached_window_BFCHW + score_timesteps_BF[
         :, :, None, None, None
     ] * score_noise_BFCHW
+    return noisy_window_BFCHW, score_noise_BFCHW, score_timesteps_BF
+
+
+def self_forcing_generator_losses(
+    *,
+    model: WanSelfForcingModel,
+    latents_BFCHW: torch.Tensor,
+    frame_indices_BF: torch.Tensor,
+    text_context_BLC: torch.Tensor,
+    rollout_scheduler: RFScheduler,
+    rollout_exit_step_index: int,
+    score_timesteps_B: torch.Tensor,
+    dmd_normalizer_min: float,
+) -> SelfForcingGeneratorLosses:
+    """Compute DMD on a differentiable second generated chunk."""
+    if dmd_normalizer_min <= 0:
+        raise ValueError("Self-Forcing dmd_normalizer_min must be positive")
+    rollout = _self_forcing_rollout(
+        model=model,
+        latents_BFCHW=latents_BFCHW,
+        frame_indices_BF=frame_indices_BF,
+        text_context_BLC=text_context_BLC,
+        rollout_scheduler=rollout_scheduler,
+        rollout_exit_step_index=rollout_exit_step_index,
+        retain_generator_graph=True,
+    )
+    (
+        noisy_window_BFCHW,
+        _score_noise_BFCHW,
+        score_timesteps_BF,
+    ) = _noisy_score_window(rollout, score_timesteps_B)
 
     with torch.no_grad():
+        fake_velocity_BFCHW = _forward_BFCHW(
+            model.fake_score,
+            noisy_window_BFCHW,
+            score_timesteps_BF,
+            text_context_BLC,
+            rollout.generated_window_frame_indices_BF,
+        )
         real_velocity_BFCHW = _forward_BFCHW(
             model.real_score,
             noisy_window_BFCHW,
             score_timesteps_BF,
             text_context_BLC,
+            rollout.generated_window_frame_indices_BF,
         )
+    score_t_BF111 = score_timesteps_BF[:, :, None, None, None]
+    real_x0_B1CHW = (noisy_window_BFCHW - score_t_BF111 * real_velocity_BFCHW)[:, -1:]
+    fake_x0_B1CHW = (noisy_window_BFCHW - score_t_BF111 * fake_velocity_BFCHW)[:, -1:]
+    (
+        dmd_gradient_B1CHW,
+        dmd_gradient_norm_B,
+        dmd_normalizer_B,
+    ) = _normalized_dmd_gradient(
+        generated_B1CHW=rollout.generated_2_B1CHW,
+        fake_x0_B1CHW=fake_x0_B1CHW,
+        real_x0_B1CHW=real_x0_B1CHW,
+        normalizer_min=dmd_normalizer_min,
+    )
+    dmd_target_B1CHW = rollout.generated_2_B1CHW.detach() - dmd_gradient_B1CHW
+    dmd_loss_B = 0.5 * (rollout.generated_2_B1CHW.float() - dmd_target_B1CHW.float()).square().mean(dim=(1, 2, 3, 4))
+    return SelfForcingGeneratorLosses(
+        dmd_loss_B=dmd_loss_B,
+        dmd_gradient_norm_B=dmd_gradient_norm_B,
+        dmd_normalizer_B=dmd_normalizer_B,
+        rollout_exit_timestep_B=torch.full_like(
+            dmd_loss_B,
+            float(rollout_scheduler.timesteps[rollout_exit_step_index]),
+        ),
+    )
+
+
+def self_forcing_critic_losses(
+    *,
+    model: WanSelfForcingModel,
+    latents_BFCHW: torch.Tensor,
+    frame_indices_BF: torch.Tensor,
+    text_context_BLC: torch.Tensor,
+    rollout_scheduler: RFScheduler,
+    rollout_exit_step_index: int,
+    score_timesteps_B: torch.Tensor,
+) -> SelfForcingCriticLosses:
+    """Fit the fake score on a fresh, fully detached student rollout."""
+    with torch.no_grad():
+        rollout = _self_forcing_rollout(
+            model=model,
+            latents_BFCHW=latents_BFCHW,
+            frame_indices_BF=frame_indices_BF,
+            text_context_BLC=text_context_BLC,
+            rollout_scheduler=rollout_scheduler,
+            rollout_exit_step_index=rollout_exit_step_index,
+            retain_generator_graph=False,
+        )
+        (
+            noisy_window_BFCHW,
+            score_noise_BFCHW,
+            score_timesteps_BF,
+        ) = _noisy_score_window(rollout, score_timesteps_B)
+
     fake_velocity_BFCHW = _forward_BFCHW(
         model.fake_score,
         noisy_window_BFCHW,
         score_timesteps_BF,
         text_context_BLC,
+        rollout.generated_window_frame_indices_BF,
     )
 
-    score_t_BF111 = score_timesteps_BF[:, :, None, None, None]
-    real_x0_BFCHW = noisy_window_BFCHW - score_t_BF111 * real_velocity_BFCHW
-    fake_x0_BFCHW = noisy_window_BFCHW - score_t_BF111 * fake_velocity_BFCHW
-    raw_dmd_gradient_B1CHW = (fake_x0_BFCHW[:, -1:] - real_x0_BFCHW[:, -1:]).detach()
-    normalizer_B = raw_dmd_gradient_B1CHW.float().abs().mean(dim=(1, 2, 3, 4)).clamp_min(dmd_normalizer_min)
-    dmd_gradient_B1CHW = raw_dmd_gradient_B1CHW / normalizer_B[:, None, None, None, None]
-    dmd_target_B1CHW = generated_2_B1CHW.detach() - dmd_gradient_B1CHW
-    dmd_loss_B = 0.5 * (generated_2_B1CHW.float() - dmd_target_B1CHW.float()).square().mean(dim=(1, 2, 3, 4))
-
-    fake_target_BFCHW = score_noise_BFCHW - detached_window_BFCHW
-    fake_score_loss_B = 0.5 * (fake_velocity_BFCHW[:, -2:].float() - fake_target_BFCHW[:, -2:].float()).square().mean(
+    fake_target_BFCHW = score_noise_BFCHW - rollout.generated_window_BFCHW.detach()
+    fake_score_loss_B = (fake_velocity_BFCHW[:, -2:].float() - fake_target_BFCHW[:, -2:].float()).square().mean(
         dim=(1, 2, 3, 4)
     )
-    loss_B = dmd_loss_B + fake_score_loss_weight * fake_score_loss_B
-    return SelfForcingLosses(
-        loss_B=loss_B,
-        dmd_loss_B=dmd_loss_B.detach(),
-        fake_score_loss_B=fake_score_loss_B.detach(),
-        dmd_gradient_norm_B=raw_dmd_gradient_B1CHW.float().square().mean(dim=(1, 2, 3, 4)).sqrt(),
+    return SelfForcingCriticLosses(
+        fake_score_loss_B=fake_score_loss_B,
+        rollout_exit_timestep_B=torch.full_like(
+            fake_score_loss_B,
+            float(rollout_scheduler.timesteps[rollout_exit_step_index]),
+        ),
     )
 
 
 __all__ = [
-    "SelfForcingLosses",
+    "SelfForcingCriticLosses",
+    "SelfForcingGeneratorLosses",
     "WanSelfForcingModel",
     "bidirectional_score_config",
     "generate_next_latent",
     "parallelize_wan_self_forcing",
+    "sample_self_forcing_exit_step",
     "self_forcing_config",
-    "self_forcing_losses",
+    "self_forcing_critic_losses",
+    "self_forcing_generator_losses",
     "shifted_rf_scheduler",
     "slide_self_forcing_context",
+    "slide_self_forcing_frame_indices",
 ]

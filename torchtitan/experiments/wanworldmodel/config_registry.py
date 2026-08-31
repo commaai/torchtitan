@@ -36,6 +36,10 @@ from .model_config import (
     self_forcing_model_registry,
     WAN_FLOAT8_FILTER_FQNS,
 )
+from .self_forcing_optimizer import (
+    WanSelfForcingLRSchedulers,
+    WanSelfForcingOptimizers,
+)
 from .self_forcing_trainer import WanSelfForcingTrainer
 from .trainer import WanWorldModelTrainer, WanWorldModelValidator
 from .torchpackage_checkpoint import (
@@ -257,32 +261,43 @@ def _self_forcing_optimizer(
     generator_lr: float,
     fake_score_lr: float,
     fused: bool,
-):
-    optimizer = default_adamw(generator_lr)
-    optimizer.param_groups = [
-        ParamGroupConfig(
-            pattern=r"^fake_score\.",
-            optimizer_name="AdamW",
-            optimizer_kwargs={
-                "lr": fake_score_lr,
-                "betas": (0.0, 0.999),
-                "eps": 1e-8,
-                "weight_decay": 1e-2,
-            },
-        ),
-        ParamGroupConfig(
-            pattern=r".*",
-            optimizer_name="AdamW",
-            optimizer_kwargs={
-                "lr": generator_lr,
-                "betas": (0.0, 0.999),
-                "eps": 1e-8,
-                "weight_decay": 1e-2,
-            },
-        ),
-    ]
-    optimizer.implementation = "fused_opt_states_bf16" if fused else "for-loop"
-    return optimizer
+) -> WanSelfForcingOptimizers.Config:
+    return WanSelfForcingOptimizers.Config(
+        param_groups=[
+            ParamGroupConfig(
+                pattern=r"^fake_score\.",
+                optimizer_name="AdamW",
+                optimizer_kwargs={
+                    "lr": fake_score_lr,
+                    "betas": (0.0, 0.999),
+                    "eps": 1e-8,
+                    "weight_decay": 1e-2,
+                },
+            ),
+            ParamGroupConfig(
+                pattern=r".*",
+                optimizer_name="AdamW",
+                optimizer_kwargs={
+                    "lr": generator_lr,
+                    "betas": (0.0, 0.999),
+                    "eps": 1e-8,
+                    "weight_decay": 1e-2,
+                },
+            ),
+        ],
+        implementation="fused_opt_states_bf16" if fused else "for-loop",
+    )
+
+
+def _self_forcing_lr_scheduler(
+    *,
+    total_steps: int | None,
+) -> WanSelfForcingLRSchedulers.Config:
+    return WanSelfForcingLRSchedulers.Config(
+        warmup_steps=0,
+        total_steps=total_steps,
+        decay_ratio=0.0,
+    )
 
 
 def worldmodel_wan_self_forcing() -> WanSelfForcingTrainer.Config:
@@ -299,6 +314,9 @@ def worldmodel_wan_self_forcing() -> WanSelfForcingTrainer.Config:
             generator_lr=2e-6,
             fake_score_lr=4e-7,
             fused=True,
+        ),
+        lr_scheduler=_self_forcing_lr_scheduler(
+            total_steps=base.lr_scheduler.total_steps,
         ),
         training=replace(
             base.training,
@@ -325,6 +343,7 @@ def worldmodel_wan_self_forcing() -> WanSelfForcingTrainer.Config:
         dmd_max_timestep=0.98,
         dmd_normalizer_min=1e-5,
         fake_score_loss_weight=1.0,
+        generator_update_interval=5,
     )
 
 
@@ -339,6 +358,9 @@ def worldmodel_wan_self_forcing_debug() -> WanSelfForcingTrainer.Config:
             fake_score_lr=1e-3,
             fused=False,
         ),
+        lr_scheduler=_self_forcing_lr_scheduler(
+            total_steps=base.lr_scheduler.total_steps,
+        ),
         teacher_checkpoint_path="",
         load_teacher_from_hf=False,
         rollout_steps=2,
@@ -347,4 +369,5 @@ def worldmodel_wan_self_forcing_debug() -> WanSelfForcingTrainer.Config:
         dmd_max_timestep=0.98,
         dmd_normalizer_min=1e-5,
         fake_score_loss_weight=1.0,
+        generator_update_interval=5,
     )

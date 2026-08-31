@@ -33,7 +33,11 @@ from torchtitan.experiments.worldmodel.model_for_inference import (
 )
 from torchtitan.experiments.wanworldmodel.model import WanModel
 from torchtitan.experiments.wanworldmodel.model_for_inference import (
+    DEFAULT_WAN_INFERENCE_SCHEDULE,
+    DEFAULT_WAN_INFERENCE_SHIFT,
+    DEFAULT_WAN_INFERENCE_STEPS,
     PACKAGED_TEXT_CONTEXT_BUFFER,
+    WAN_INFERENCE_SAMPLERS,
     WanModelForInference,
 )
 from torchtitan.observability import structured_logger as sl
@@ -150,6 +154,10 @@ class WanTorchPackageConfig:
     model_config: WanModel.Config
     text_context_LC: torch.Tensor | None = None
     text_prompt: str = ""
+    inference_sampler: str = "ode"
+    inference_steps: int = DEFAULT_WAN_INFERENCE_STEPS
+    inference_schedule: str = DEFAULT_WAN_INFERENCE_SCHEDULE
+    inference_shift: float = DEFAULT_WAN_INFERENCE_SHIFT
 
 
 TorchPackageConfig = WanModel.Config | WanTorchPackageConfig
@@ -167,13 +175,73 @@ def build_meta_model(
     *,
     dtype: torch.dtype = torch.bfloat16,
     default_kv_cache_dtype: KVCacheDType = FP8_KV_CACHE_DTYPE,
+    default_inference_sampler: str = "ode",
+    default_inference_steps: int = DEFAULT_WAN_INFERENCE_STEPS,
+    default_inference_schedule: str = DEFAULT_WAN_INFERENCE_SCHEDULE,
+    default_inference_shift: float = DEFAULT_WAN_INFERENCE_SHIFT,
 ) -> WanModelForInference:
     with torch.device("meta"):
         model = WanModelForInference(
             model_config,
             default_kv_cache_dtype=default_kv_cache_dtype,
+            default_inference_sampler=default_inference_sampler,
+            default_inference_steps=default_inference_steps,
+            default_inference_schedule=default_inference_schedule,
+            default_inference_shift=default_inference_shift,
         )
         return model.to(dtype=dtype).eval()
+
+
+def _package_inference_defaults(
+    state: TorchPackageConfig,
+) -> tuple[str, int, str, float]:
+    if not isinstance(state, WanTorchPackageConfig):
+        return (
+            "ode",
+            DEFAULT_WAN_INFERENCE_STEPS,
+            DEFAULT_WAN_INFERENCE_SCHEDULE,
+            DEFAULT_WAN_INFERENCE_SHIFT,
+        )
+
+    # getattr keeps recipe-state files written before these fields were added
+    # exportable as ordinary deterministic Wan packages.
+    inference_sampler = getattr(state, "inference_sampler", "ode")
+    inference_steps = getattr(
+        state,
+        "inference_steps",
+        DEFAULT_WAN_INFERENCE_STEPS,
+    )
+    inference_schedule = getattr(
+        state,
+        "inference_schedule",
+        DEFAULT_WAN_INFERENCE_SCHEDULE,
+    )
+    inference_shift = getattr(
+        state,
+        "inference_shift",
+        DEFAULT_WAN_INFERENCE_SHIFT,
+    )
+    if inference_sampler not in WAN_INFERENCE_SAMPLERS:
+        raise ValueError(
+            f"unknown Wan inference sampler {inference_sampler!r}; "
+            f"expected one of {WAN_INFERENCE_SAMPLERS}"
+        )
+    if inference_steps <= 0:
+        raise ValueError(
+            f"Wan package inference_steps must be positive, got {inference_steps}"
+        )
+    if not inference_schedule:
+        raise ValueError("Wan package inference_schedule cannot be empty")
+    if inference_shift <= 0:
+        raise ValueError(
+            f"Wan package inference_shift must be positive, got {inference_shift}"
+        )
+    return (
+        inference_sampler,
+        inference_steps,
+        inference_schedule,
+        inference_shift,
+    )
 
 
 def validate_model_config(state: Any) -> WanModel.Config:
@@ -189,6 +257,7 @@ def validate_model_config(state: Any) -> WanModel.Config:
 
 def validate_package_config(state: Any) -> TorchPackageConfig:
     validate_model_config(state)
+    _package_inference_defaults(state)
     if isinstance(state, WanTorchPackageConfig) and state.text_context_LC is not None:
         _normalize_wan_text_context(
             state.model_config,
@@ -253,6 +322,10 @@ def build_package(
     weight_format: WeightFormat = DEFAULT_WEIGHT_FORMAT,
     text_context_LC: torch.Tensor | None = None,
     text_prompt: str = "",
+    inference_sampler: str = "ode",
+    inference_steps: int = DEFAULT_WAN_INFERENCE_STEPS,
+    inference_schedule: str = DEFAULT_WAN_INFERENCE_SCHEDULE,
+    inference_shift: float = DEFAULT_WAN_INFERENCE_SHIFT,
 ) -> bytes:
     format_spec = WEIGHT_FORMAT_SPECS[weight_format]
     packaged_text_context_LC = _normalize_wan_text_context(
@@ -279,6 +352,10 @@ def build_package(
         model = build_meta_model(
             model_config,
             default_kv_cache_dtype=format_spec.kv_cache_dtype,
+            default_inference_sampler=inference_sampler,
+            default_inference_steps=inference_steps,
+            default_inference_schedule=inference_schedule,
+            default_inference_shift=inference_shift,
         )
         if packaged_text_context_LC is not None:
             model.set_packaged_text_context(
@@ -326,6 +403,10 @@ def build_package(
                 "kv_cache_dtype": format_spec.kv_cache_dtype,
                 "minimum_compute_capability": format_spec.minimum_compute_capability,
                 "text_prompt": text_prompt if packaged_text_context_LC is not None else "",
+                "inference_sampler": inference_sampler,
+                "inference_steps": inference_steps,
+                "inference_schedule": inference_schedule,
+                "inference_shift": inference_shift,
             }
             exporter.save_pickle("meta", "meta.pkl", metadata)
             del model_io
@@ -371,6 +452,12 @@ class WanTorchPackageRecipe:
     ) -> dict[str, bytes]:
         package_config = validate_package_config(state)
         model_config = validate_model_config(package_config)
+        (
+            inference_sampler,
+            inference_steps,
+            inference_schedule,
+            inference_shift,
+        ) = _package_inference_defaults(package_config)
         text_context_LC = (
             package_config.text_context_LC
             if isinstance(package_config, WanTorchPackageConfig)
@@ -389,6 +476,10 @@ class WanTorchPackageRecipe:
                 weight_format=self.weight_format,
                 text_context_LC=text_context_LC,
                 text_prompt=text_prompt,
+                inference_sampler=inference_sampler,
+                inference_steps=inference_steps,
+                inference_schedule=inference_schedule,
+                inference_shift=inference_shift,
             )
         }
 
@@ -405,6 +496,12 @@ class WanTrainingTorchPackageRecipe(WanTorchPackageRecipe):
     ) -> dict[str, bytes]:
         package_config = validate_package_config(state)
         model_config = validate_model_config(package_config)
+        (
+            inference_sampler,
+            inference_steps,
+            inference_schedule,
+            inference_shift,
+        ) = _package_inference_defaults(package_config)
         text_context_LC = (
             package_config.text_context_LC
             if isinstance(package_config, WanTorchPackageConfig)
@@ -423,6 +520,10 @@ class WanTrainingTorchPackageRecipe(WanTorchPackageRecipe):
                 weight_format=weight_format,
                 text_context_LC=text_context_LC,
                 text_prompt=text_prompt,
+                inference_sampler=inference_sampler,
+                inference_steps=inference_steps,
+                inference_schedule=inference_schedule,
+                inference_shift=inference_shift,
             )
             for weight_format in self.weight_formats
         }
