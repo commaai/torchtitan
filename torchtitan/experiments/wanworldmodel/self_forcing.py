@@ -548,13 +548,19 @@ def _noisy_score_window(
     score_timesteps_B: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     detached_window_BFCHW = rollout.generated_window_BFCHW.detach()
+    if detached_window_BFCHW.size(1) != 11:
+        raise ValueError(
+            "Self-Forcing score window must contain nine clean conditioning "
+            f"latents followed by two generated latents, got {detached_window_BFCHW.size(1)}"
+        )
     if score_timesteps_B.shape != (detached_window_BFCHW.size(0),):
         raise ValueError("Self-Forcing score timesteps must contain one value per sample")
 
     score_noise_BFCHW = torch.randn_like(detached_window_BFCHW)
     score_timesteps_BF = score_timesteps_B[:, None].expand(detached_window_BFCHW.shape[:2]).clone()
-    # z0 remains the exact clean attention sink under every training path.
-    score_timesteps_BF[:, 0] = 0.0
+    # The score problem is conditional: [z0, eight real history latents] stay
+    # exactly clean, matching rollout inference, while only [g1, g2] are noised.
+    score_timesteps_BF[:, :-2] = 0.0
     noisy_window_BFCHW = (1 - score_timesteps_BF[:, :, None, None, None]) * detached_window_BFCHW + score_timesteps_BF[
         :, :, None, None, None
     ] * score_noise_BFCHW
