@@ -66,7 +66,6 @@ def _critic_loss(
             action=next_action_BA,
         )
         bootstrap_B = torch.minimum(q1_target_B, q2_target_B)
-        # Rollouts are continuing tasks: every transition bootstraps, with no terminal mask.
         target_B = reward_B + gamma * bootstrap_B
         q_target_abs_gap_B = torch.abs(q1_target_B - q2_target_B)
         q_rollout_abs_gap_B = torch.abs(q1_rollout_B - q2_rollout_B)
