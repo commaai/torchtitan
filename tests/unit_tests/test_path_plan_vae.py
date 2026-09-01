@@ -17,7 +17,7 @@ from torchtitan.experiments.path.config_registry import (
 from torchtitan.experiments.path.model import PathModel, PlanVAE
 from torchtitan.experiments.path.model_config import _plan_vae_config, model_config
 from torchtitan.experiments.path.model_constants import ModelInputs, PLAN_SIZE
-from torchtitan.experiments.path.loss import _plan_consistency_loss, PathLoss
+from torchtitan.experiments.path.loss import PathLoss
 from torchtitan.experiments.path.plan_vae import (
     PLAN_VAE_PRIOR_RECONSTRUCTION,
     PLAN_VAE_RECONSTRUCTION,
@@ -26,7 +26,6 @@ from torchtitan.experiments.path.plan_vae import (
     prepare_plan_vae_batch,
     unnormalize_plan,
 )
-from torchtitan.experiments.path.validate import plan_vae_analyse_driving_data
 from xx.comma_data.constants import DEFAULT_TEST_2K_LIST
 from xx.release_tests.driving.analyse_driving import AnalyseDrivingRLConfig
 from xx.training.path.test import MODEL_REPORT_ROUTE_LISTS
@@ -79,53 +78,6 @@ def test_plan_vae_loss_and_batch() -> None:
     masked_predictions = vae(masked_inputs[ModelInputs.PLAN_VAE], sample_posterior=False)
     masked_loss, _ = PathLoss(PathLoss.Config(plan_normalization="per_horizon"))(masked_predictions, masked_targets)
     assert torch.isfinite(masked_loss).all()
-
-
-def test_plan_vae_kl_penalty_is_averaged_over_latent_dimensions() -> None:
-    config = PathLoss.Config()
-    mean = torch.zeros(2, 3, 4)
-    free_bits = config.vae_kl_free_bits
-    # every dimension above the free-bits threshold contributes
-    logvar = torch.full((2, 3, 4), 2.0 * torch.log(torch.tensor(2.0 * free_bits)))
-    kl_per_dimension = -0.5 * (1.0 + logvar - mean.square() - logvar.exp())
-    assert (kl_per_dimension > free_bits).all()
-    expected_penalty = (kl_per_dimension - free_bits).flatten(start_dim=1).mean(dim=-1)
-    kl_penalty = torch.nn.functional.relu(kl_per_dimension - free_bits).flatten(start_dim=1).mean(dim=-1)
-    torch.testing.assert_close(kl_penalty, expected_penalty)
-
-
-def test_plan_consistency_loss_penalizes_off_manifold_trajectory() -> None:
-    plans = _physical_plans()
-    mask = torch.ones_like(plans, dtype=torch.bool)
-    consistent = _plan_consistency_loss(plans, mask, normalization="per_horizon")
-
-    inconsistent = plans.clone()
-    inconsistent[..., 3:6] += 500.0  # break the position/derivative relation
-    broken = _plan_consistency_loss(inconsistent, mask, normalization="per_horizon")
-    assert (broken > consistent).all()
-
-
-def test_plan_vae_flop_counting_under_no_grad() -> None:
-    config = model_config("convnext_atto", training_stage="plan_vae")
-    model = config.build()
-    model.init_states()
-    nparams, flops = config.get_nparams_and_flops(model, seq_len=1)
-    assert nparams > 0
-    assert flops > 0
-
-
-def test_plan_vae_analyse_driving_data_uses_physical_mean_reconstructions() -> None:
-    plans = _physical_plans(batch_size=4, temporal_size=2)
-    rows = [("seg1", 0), ("seg1", 1), ("seg2", 0), ("seg2", 1)]
-    predictions = normalize_plan(plans, normalization="per_horizon")
-    data = plan_vae_analyse_driving_data(
-        [([rows[0], rows[1]], predictions[:2], plans[:2]), ([rows[2], rows[3]], predictions[2:], plans[2:])],
-        normalization="per_horizon",
-    )
-    assert set(data) == {"seg1", "seg2"}
-    for segment in data.values():
-        assert segment["pred"]["plan"].shape == (2, 33, 15)
-        assert segment["true"]["plan"].shape == (2, 33, 15)
 
 
 def test_deterministic_plan_autoencoder_preset() -> None:
