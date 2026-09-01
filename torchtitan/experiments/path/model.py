@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
@@ -32,7 +34,16 @@ from torchtitan.protocols.module import Module, ModuleDict, ModuleList, Sequenti
 from torchtitan.tools.logging import logger
 
 from . import convnext
-from .model_constants import frame_constants_from_fps, ModelInputs, TEMPORAL_INPUTS, VisionFrameType
+from .model_constants import frame_constants_from_fps, ModelInputs, PLAN_SIZE, TEMPORAL_INPUTS, VisionFrameType
+from .plan_vae import (
+    PLAN_VAE_LOGVAR,
+    PLAN_VAE_MEAN,
+    PLAN_VAE_PRIOR_RECONSTRUCTION,
+    PLAN_VAE_RECONSTRUCTION,
+    PLAN_VAE_SAMPLED_RECONSTRUCTION,
+    PlanNormalization,
+    unnormalize_plan,
+)
 
 
 @dataclass(frozen=True)
@@ -155,6 +166,94 @@ class PathTransformer(Module):
             shard(layer, reshard_after_forward)
 
 
+class PathCrossAttention(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        query_norm: LayerNorm.Config | RMSNorm.Config
+        context_norm: LayerNorm.Config | RMSNorm.Config
+        q_norm: LayerNorm.Config | RMSNorm.Config | None
+        k_norm: LayerNorm.Config | RMSNorm.Config | None
+        q_proj: Linear.Config
+        kv_proj: Linear.Config
+        c_proj: Linear.Config
+        inner_attention: ScaledDotProductAttention.Config
+        n_head: int
+        head_dim: int
+        dropout: float
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.head_dim = config.head_dim
+        self.query_norm = config.query_norm.build()
+        self.context_norm = config.context_norm.build()
+        self.q_norm = config.q_norm.build() if config.q_norm is not None else nn.Identity()
+        self.k_norm = config.k_norm.build() if config.k_norm is not None else nn.Identity()
+        self.q_proj = config.q_proj.build()
+        self.kv_proj = config.kv_proj.build()
+        self.c_proj = config.c_proj.build()
+        self.inner_attention = config.inner_attention.build()
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, query: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        batch_size, query_size, _ = query.shape
+        context_size = context.shape[1]
+        q = self.q_proj(self.query_norm(query)).view(batch_size, query_size, self.n_head, self.head_dim)
+        kv = self.kv_proj(self.context_norm(context)).view(
+            batch_size,
+            context_size,
+            2,
+            self.n_head,
+            self.head_dim,
+        )
+        k, v = kv.unbind(2)
+        q, k = self.q_norm(q), self.k_norm(k)
+        output = self.inner_attention(q, k, v, is_causal=False)
+        return self.dropout(self.c_proj(output.reshape(batch_size, query_size, -1)))
+
+
+class PathTransformerDecoderBlock(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        self_attention: PathSelfAttention.Config
+        cross_attention: PathCrossAttention.Config
+        mlp: PathMLP.Config
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.self_attention = config.self_attention.build()
+        self.cross_attention = config.cross_attention.build()
+        self.mlp = config.mlp.build()
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        x = x + self.self_attention(x)
+        x = x + self.cross_attention(x, context)
+        return x + self.mlp(x)
+
+
+class PathTransformerDecoder(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        layers: list[PathTransformerDecoderBlock.Config]
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.layers = ModuleList([layer.build() for layer in config.layers])
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, context)
+        return x
+
+    def apply_activation_checkpointing(self, wrap, base_fqn: str) -> None:
+        for layer_id, layer in enumerate(self.layers):
+            self.layers[layer_id] = wrap(layer, f"{base_fqn}.layers.{layer_id}")
+
+    def apply_fsdp(self, shard, reshard_after_forward: bool) -> None:
+        for layer in self.layers:
+            shard(layer, reshard_after_forward)
+
+
 class SpatialUnvision(Module):
     OUTPUT_SIZE = (128, 256)
     OUTPUT_CHANNELS = 6
@@ -236,6 +335,148 @@ class LinearEncoder(Module):
         return self.net(x)
 
 
+class PlanVAE(Module):
+    N_EMBD = 256
+    N_HEAD = 8
+    N_ENCODER_LAYER = 6
+    N_DECODER_LAYER = 6
+    N_LATENT_TOKENS = 4
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        plan_size: int
+        plan_horizon: int
+        plan_width: int
+        latent_size: int
+        num_latent_tokens: int
+        input_projection: Linear.Config
+        plan_pos_embedding: Embedding.Config
+        encoder: PathTransformer.Config
+        pool_query_embedding: Embedding.Config
+        pool_attention: PathCrossAttention.Config
+        posterior_norm: LayerNorm.Config | RMSNorm.Config
+        posterior_projection: Linear.Config
+        latent_projection: Linear.Config
+        decoder_pos_embedding: Embedding.Config
+        decoder: PathTransformerDecoder.Config
+        output_norm: LayerNorm.Config | RMSNorm.Config
+        output_projection: Linear.Config
+        output_scale: ScaleLayer.Config
+        min_posterior_std: float = 1e-2
+        normalization: PlanNormalization = "pooled"
+        sample_posterior_during_training: bool = True
+
+    def __init__(self, config: Config):
+        super().__init__()
+        if config.plan_size != config.plan_horizon * config.plan_width:
+            raise ValueError(
+                f"plan_size={config.plan_size} does not match "
+                f"plan_horizon * plan_width={config.plan_horizon * config.plan_width}"
+            )
+        self.plan_size = config.plan_size
+        self.plan_horizon = config.plan_horizon
+        self.plan_width = config.plan_width
+        self.latent_size = config.latent_size
+        self.num_latent_tokens = config.num_latent_tokens
+        self.model_dim = config.input_projection.out_features
+        self.min_posterior_std = config.min_posterior_std
+        self.normalization = config.normalization
+        self.sample_posterior_during_training = config.sample_posterior_during_training
+        self.register_buffer("_pretrained", torch.empty((), dtype=torch.bool), persistent=True)
+        self.input_projection = config.input_projection.build()
+        self.plan_pos_embedding = config.plan_pos_embedding.build()
+        self.encoder = config.encoder.build()
+        self.pool_query_embedding = config.pool_query_embedding.build()
+        self.pool_attention = config.pool_attention.build()
+        self.posterior_norm = config.posterior_norm.build()
+        self.posterior_projection = config.posterior_projection.build()
+        self.latent_projection = config.latent_projection.build()
+        self.decoder_pos_embedding = config.decoder_pos_embedding.build()
+        self.decoder = config.decoder.build()
+        self.output_norm = config.output_norm.build()
+        self.output_projection = config.output_projection.build()
+        self.output_scale = config.output_scale.build()
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        device = buffer_device if buffer_device is not None else self._pretrained.device
+        self._pretrained = torch.tensor(False, dtype=torch.bool, device=device)
+
+    def mark_pretrained(self) -> None:
+        self._pretrained.fill_(True)
+
+    def is_pretrained(self) -> bool:
+        value = self._pretrained
+        if isinstance(value, DTensor):
+            value = value.full_tensor()
+        return bool(value.item())
+
+    def encode_stats(self, normalized_plan_BTP: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        leading_shape = normalized_plan_BTP.shape[:-1]
+        plan_NHW = normalized_plan_BTP.reshape(-1, self.plan_horizon, self.plan_width)
+        positions_H = torch.arange(self.plan_horizon, device=normalized_plan_BTP.device)
+        tokens_NHC = self.input_projection(plan_NHW) + self.plan_pos_embedding(positions_H)
+        tokens_NHC = self.encoder(tokens_NHC)
+        pool_positions_K = torch.arange(self.num_latent_tokens, device=normalized_plan_BTP.device)
+        queries_KC = self.pool_query_embedding(pool_positions_K)
+        queries_NKC = queries_KC.unsqueeze(0).expand(tokens_NHC.shape[0], -1, -1)
+        pooled_NKC = queries_NKC + self.pool_attention(queries_NKC, tokens_NHC)
+        stats_NZ2 = self.posterior_projection(self.posterior_norm(pooled_NKC.flatten(1)))
+        mean_NZ, raw_scale_NZ = stats_NZ2.chunk(2, dim=-1)
+        posterior_std_NZ = F.softplus(raw_scale_NZ) + self.min_posterior_std
+        logvar_NZ = 2.0 * posterior_std_NZ.log()
+        return (
+            mean_NZ.reshape(*leading_shape, self.latent_size),
+            logvar_NZ.reshape(*leading_shape, self.latent_size),
+        )
+
+    def encode_mean(self, normalized_plan_BTP: torch.Tensor) -> torch.Tensor:
+        mean_BTZ, _ = self.encode_stats(normalized_plan_BTP)
+        return mean_BTZ
+
+    def decode(self, latent_BTZ: torch.Tensor) -> torch.Tensor:
+        leading_shape = latent_BTZ.shape[:-1]
+        memory_NKC = self.latent_projection(latent_BTZ.reshape(-1, self.latent_size)).unflatten(
+            -1,
+            (self.num_latent_tokens, self.model_dim),
+        )
+        positions_H = torch.arange(self.plan_horizon, device=latent_BTZ.device)
+        queries_HC = self.decoder_pos_embedding(positions_H)
+        queries_NHC = queries_HC.unsqueeze(0).expand(memory_NKC.shape[0], -1, -1)
+        decoded_NHC = self.decoder(queries_NHC, memory_NKC)
+        plan_NHW = self.output_projection(self.output_norm(decoded_NHC))
+        plan_NP = self.output_scale(plan_NHW.flatten(-2))
+        return plan_NP.reshape(*leading_shape, self.plan_size)
+
+    def apply_activation_checkpointing(self, wrap, base_fqn: str) -> None:
+        self.encoder.apply_activation_checkpointing(wrap, f"{base_fqn}.encoder")
+        self.decoder.apply_activation_checkpointing(wrap, f"{base_fqn}.decoder")
+
+    def apply_fsdp(self, shard, reshard_after_forward: bool) -> None:
+        self.encoder.apply_fsdp(shard, reshard_after_forward)
+        self.decoder.apply_fsdp(shard, reshard_after_forward)
+        shard(self.encoder, reshard_after_forward)
+        shard(self.decoder, reshard_after_forward)
+        shard(self, reshard_after_forward)
+
+    def forward(
+        self,
+        normalized_plan_BTP: torch.Tensor,
+        *,
+        sample_posterior: bool,
+    ) -> dict[str, torch.Tensor]:
+        mean_BTZ, logvar_BTZ = self.encode_stats(normalized_plan_BTP)
+        outputs = {
+            PLAN_VAE_RECONSTRUCTION: self.decode(mean_BTZ),
+            PLAN_VAE_MEAN: mean_BTZ,
+            PLAN_VAE_LOGVAR: logvar_BTZ,
+        }
+        if sample_posterior:
+            latent_BTZ = mean_BTZ + torch.randn_like(mean_BTZ) * torch.exp(0.5 * logvar_BTZ)
+            outputs[PLAN_VAE_SAMPLED_RECONSTRUCTION] = self.decode(latent_BTZ)
+            outputs[PLAN_VAE_PRIOR_RECONSTRUCTION] = self.decode(torch.randn_like(mean_BTZ))
+        return outputs
+
+
 class TemporalSummarizer(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -284,6 +525,7 @@ class TemporalSummarizer(Module):
         self.desire_window_idxs = self._make_desire_window_idxs(device)
 
     def _window_desire(self, desire: torch.Tensor) -> torch.Tensor:
+        desire = torch.zeros_like(desire)
         desire = desire.index_select(1, self.desire_window_idxs)
         return desire.reshape(desire.shape[0], self.temporal_size, -1)
 
@@ -357,6 +599,7 @@ class TemporalPolicy(Module):
     class Config(Module.Config):
         temporal_summarizer: TemporalSummarizer.Config
         temporal_hydra: Hydra.Config
+        plan_vae: PlanVAE.Config | None
         history_idxs: tuple[int, ...]
 
     def __init__(self, config: Config):
@@ -364,6 +607,7 @@ class TemporalPolicy(Module):
         self.config = config
         self.temporal_summarizer = config.temporal_summarizer.build()
         self.temporal_hydra = config.temporal_hydra.build()
+        self.plan_vae = config.plan_vae.build() if config.plan_vae is not None else None
         self.register_buffer(
             "history_idxs",
             torch.tensor(config.history_idxs, dtype=torch.long),
@@ -373,6 +617,25 @@ class TemporalPolicy(Module):
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         device = buffer_device if buffer_device is not None else self.history_idxs.device
         self.history_idxs = torch.tensor(self.config.history_idxs, dtype=torch.long, device=device)
+
+    def decode_plan(self, plan_head_output: torch.Tensor) -> torch.Tensor:
+        """Decode the plan head output through the frozen plan VAE decoder.
+
+        A latent-only head (width == latent_size) returns the decoded plan mean;
+        a latent + log-sigma head (width == latent_size + PLAN_SIZE) returns the
+        master plan format (mu | log_sigma)."""
+        assert self.plan_vae is not None
+        latent_BTP = plan_head_output[..., : self.plan_vae.latent_size]
+        # the frozen VAE is an FSDP-ignored module and keeps float32 params
+        decoder_dtype = next(self.plan_vae.decoder.parameters()).dtype
+        plan_BTP = unnormalize_plan(
+            self.plan_vae.decode(latent_BTP.to(decoder_dtype)),
+            normalization=self.plan_vae.normalization,
+        )
+        if plan_head_output.shape[-1] == self.plan_vae.latent_size + PLAN_SIZE:
+            log_sigma_BTP = plan_head_output[..., self.plan_vae.latent_size :]
+            return torch.cat((plan_BTP.to(log_sigma_BTP.dtype), log_sigma_BTP), dim=-1)
+        return plan_BTP.to(plan_head_output.dtype)
 
     def forward(
         self,
@@ -388,7 +651,15 @@ class TemporalPolicy(Module):
             traffic_convention[:, -1].to(dtype),
             action_t[:, -1].to(dtype),
         )
-        return self.temporal_hydra(summary)
+        outputs = self.temporal_hydra(summary)
+        if self.plan_vae is not None:
+            outputs["plan_latent"] = outputs["plan"][..., : self.plan_vae.latent_size]
+            if outputs["plan"].shape[-1] == 2 * self.plan_vae.latent_size:
+                outputs["plan_latent_logvar"] = outputs["plan"][
+                    ..., self.plan_vae.latent_size : 2 * self.plan_vae.latent_size
+                ]
+            outputs["plan"] = self.decode_plan(outputs["plan"])
+        return outputs
 
 
 class Vision(Module):
@@ -480,6 +751,8 @@ class Vision(Module):
 class PathModel(BaseModel):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseModel.Config):
+        training_stage: Literal["plan_vae", "policy"]
+        plan_loss: Literal["decoded_laplacian", "latent_mse"] = "decoded_laplacian"
         n_frames_input: int
         input_frame_names: tuple[str, ...]
         frame_type: VisionFrameType
@@ -508,6 +781,10 @@ class PathModel(BaseModel):
                 self,
                 device=next(model.parameters()).device,
             )
+            if self.training_stage == "plan_vae":
+                with torch.no_grad(), FlopCounterMode(display=False) as counter:
+                    model(inputs)
+                return nparams, 3 * counter.get_total_flops()
             with torch.no_grad(), FlopCounterMode(display=False) as counter:
                 model(inputs)
             # MFU convention estimates backward as twice the counted forward work.
@@ -520,12 +797,22 @@ class PathModel(BaseModel):
         self.point_policy = config.point_policy.build()
         self.temporal_policy = config.temporal_policy.build()
         self.unvision = config.unvision_decoder.build()
+        if config.training_stage == "plan_vae":
+            self.requires_grad_(False)
+            assert self.temporal_policy.plan_vae is not None
+            self.temporal_policy.plan_vae.requires_grad_(True)
+        else:
+            assert self.temporal_policy.plan_vae is not None
+            self.temporal_policy.plan_vae.requires_grad_(False)
 
     @staticmethod
     def input_shapes(
         config: PathModel.Config,
         batch_size: int = 1,
     ) -> dict[str, tuple[int, ...]]:
+        if config.training_stage == "plan_vae":
+            temporal_size = len(config.temporal_policy.history_idxs)
+            return {ModelInputs.PLAN_VAE: (batch_size, temporal_size, PLAN_SIZE)}
         frame_constants = frame_constants_from_fps(
             n_frames=config.n_frames_input,
             frame_type=config.frame_type,
@@ -547,6 +834,8 @@ class PathModel(BaseModel):
 
     @staticmethod
     def input_dtypes(config: PathModel.Config) -> dict[str, torch.dtype]:
+        if config.training_stage == "plan_vae":
+            return {ModelInputs.PLAN_VAE: torch.float32}
         dtypes = dict.fromkeys(config.vision.input_frame_names, torch.uint8)
         for name in TEMPORAL_INPUTS:
             if name != ModelInputs.FEATURES:
@@ -592,6 +881,13 @@ class PathModel(BaseModel):
         traffic_convention: torch.Tensor | None = None,
         action_t: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        if isinstance(inputs, dict) and self.config.training_stage == "plan_vae":
+            assert self.temporal_policy.plan_vae is not None
+            plan_vae = self.temporal_policy.plan_vae
+            return self.temporal_policy.plan_vae(
+                inputs[ModelInputs.PLAN_VAE],
+                sample_posterior=self.training and plan_vae.sample_posterior_during_training,
+            )
         if isinstance(inputs, torch.Tensor):
             inputs = {
                 ModelInputs.IMG: inputs,
@@ -726,9 +1022,24 @@ def _apply_fsdp(
         pp_enabled,
     )
 
-    def shard(module: nn.Module, reshard: bool) -> None:
-        fully_shard(module, **fsdp_config, reshard_after_forward=reshard)
+    def shard(
+        module: nn.Module,
+        reshard: bool,
+        *,
+        ignored_params: set[nn.Parameter] | None = None,
+    ) -> None:
+        fully_shard(
+            module,
+            **fsdp_config,
+            reshard_after_forward=reshard,
+            ignored_params=ignored_params,
+        )
 
+    assert model.temporal_policy.plan_vae is not None
+    plan_vae = model.temporal_policy.plan_vae
+    frozen_plan_vae_params = set(plan_vae.parameters()) if model.config.training_stage == "policy" else None
+    if frozen_plan_vae_params is None:
+        plan_vae.apply_fsdp(shard, reshard_after_forward)
     model.vision.encoder.apply_fsdp(
         shard,
         reshard_after_forward,
@@ -741,9 +1052,13 @@ def _apply_fsdp(
     model.unvision.transformer.apply_fsdp(shard, reshard_after_forward)
     shard(model.vision.encoder, reshard_after_forward)
     shard(model.point_policy, reshard_after_forward)
-    shard(model.temporal_policy, reshard_after_forward)
+    shard(
+        model.temporal_policy,
+        reshard_after_forward,
+        ignored_params=frozen_plan_vae_params,
+    )
     shard(model.unvision, reshard_after_forward)
-    fully_shard(model, **fsdp_config)
+    fully_shard(model, **fsdp_config, ignored_params=frozen_plan_vae_params)
 
     if enable_symm_mem:
         enable_fsdp_symm_mem(model)

@@ -36,6 +36,7 @@ __all__ = [
     "convnext_base",
     "convnext_small",
     "convnext_tiny",
+    "convnext_xlarge",
     "convnext_xxlarge",
     "create_convnext",
     "pretrained_name",
@@ -82,6 +83,11 @@ CONVNEXT_FLAVORS = {
         "depths": (3, 3, 27, 3),
         "dims": (128, 256, 512, 1024),
         "pretrained": "convnext_base.clip_laion2b_augreg_ft_in1k",
+    },
+    "convnext_xlarge": {
+        "depths": (3, 3, 27, 3),
+        "dims": (256, 512, 1024, 2048),
+        "pretrained": "convnext_xlarge.fb_in22k_ft_in1k",
     },
     "convnext_xxlarge": {
         "depths": (3, 4, 30, 3),
@@ -459,6 +465,10 @@ def convnext_small(pretrained: bool = False, **kwargs) -> ConvNeXt:
 
 def convnext_base(pretrained: bool = False, **kwargs) -> ConvNeXt:
     return create_convnext("convnext_base", pretrained=pretrained, **kwargs)
+
+
+def convnext_xlarge(pretrained: bool = False, **kwargs) -> ConvNeXt:
+    return create_convnext("convnext_xlarge", pretrained=pretrained, **kwargs)
 
 
 def convnext_xxlarge(pretrained: bool = False, **kwargs) -> ConvNeXt:

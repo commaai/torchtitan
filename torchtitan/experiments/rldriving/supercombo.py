@@ -9,7 +9,7 @@ from xx.ml_tools.constants.model import ModelInputs, SPATIAL_SIZE
 
 import torch
 
-from torchtitan.experiments.path.model import PathSelfAttention
+from torchtitan.experiments.path.model import PathModel, PathSelfAttention
 from torchtitan.experiments.path.model_config import model_config
 from .model import actor_config
 
@@ -35,9 +35,9 @@ def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
 # some micro optimizations can be made but not worth it for now
 # there are some Unsqueeze -> Gather that can be bipassed (traffic_convention, action_t)
 class Supercombo(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, model: PathModel.Config | None = None) -> None:
         super().__init__()
-        config = model_config()
+        config = model if model is not None else model_config()
         config.temporal_policy.temporal_summarizer.dense_training_outputs = False
         self.vision = config.vision.build()
         self.point_policy = config.point_policy.build()
@@ -51,7 +51,14 @@ class Supercombo(torch.nn.Module):
                 (self.on_policy.temporal_hydra, ON_POLICY_OUTPUT_ORDER),
             )
             for name in names
+            if name != "plan"
         )
+        if self.off_policy.plan_vae is not None:
+            # only the decoded-laplacian head appends a log-sigma to the decoded plan
+            if config.plan_loss == "decoded_laplacian":
+                output_size += 2 * self.off_policy.plan_vae.plan_size
+            else:
+                output_size += self.off_policy.plan_vae.plan_size
         self.register_buffer("pad", torch.zeros(1, -output_size % 4), persistent=False)
         for policy in (self.off_policy, self.on_policy):
             summarizer = policy.temporal_summarizer

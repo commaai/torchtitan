@@ -7,15 +7,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from xx.training.lib.onnx_helpers import add_onnx_metadata, patch_depthwise_convs
 
 import onnx
 import torch
 import torch.nn as nn
+from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader
 
 from torchtitan.components import fs
 from torchtitan.components.onnx_checkpoint import _ONNX_DTYPE_MAP, OnnxCheckpointManager
+from torchtitan.tools.logging import logger
 
 from .model import PathModel
 from .model_constants import ModelInputs
@@ -67,6 +70,52 @@ class PathOnnxCheckpointManager(OnnxCheckpointManager):
         self.temporal_policy_onnx_compute_dtype = _ONNX_DTYPE_MAP[config.temporal_policy_onnx_compute_dtype]
         self.vision_input_names = config.vision_input_names
         self.temporal_policy_input_names = config.temporal_policy_input_names
+
+    def dcp_load(
+        self,
+        state_dict: dict[str, Any],
+        checkpoint_id: str,
+        from_hf: bool,
+        from_quantized: bool,
+    ) -> None:
+        # DCP's partial loader tolerates missing keys but normally raises on a
+        # matching key whose shape changed. Path experiments intentionally use
+        # plan-VAE checkpoints across backbone sizes, so skip those incompatible
+        # tensors when partial loading was explicitly requested.
+        if self.allow_partial_initial_load and not from_hf:
+            metadata = FsspecReader(checkpoint_id).read_metadata()
+            saved_keys = set(metadata.state_dict_metadata)
+            # plan-VAE checkpoints trained with the diffusion experiment stored the
+            # VAE under temporal_policy.diffusion_plan.plan_vae; remap to the current
+            # temporal_policy.plan_vae location so the frozen decoder can warm-start.
+            new_prefix = "temporal_policy.plan_vae."
+            old_prefix = "temporal_policy.diffusion_plan.plan_vae."
+            if not any(key.startswith(new_prefix) for key in saved_keys) and any(
+                key.startswith(old_prefix) for key in saved_keys
+            ):
+                state_dict = {
+                    (key.replace(new_prefix, old_prefix, 1) if key.startswith(new_prefix) else key): value
+                    for key, value in state_dict.items()
+                }
+            mismatched = []
+            for name, value in tuple(state_dict.items()):
+                saved = metadata.state_dict_metadata.get(name)
+                saved_size = getattr(saved, "size", None)
+                if (
+                    isinstance(value, torch.Tensor)
+                    and saved_size is not None
+                    and tuple(value.shape) != tuple(saved_size)
+                ):
+                    mismatched.append(name)
+                    del state_dict[name]
+            if mismatched:
+                logger.warning(
+                    "Skipping %d shape-mismatched tensors during partial checkpoint load: %s%s",
+                    len(mismatched),
+                    ", ".join(mismatched[:8]),
+                    " ..." if len(mismatched) > 8 else "",
+                )
+        super().dcp_load(state_dict, checkpoint_id, from_hf, from_quantized)
 
     def _export_onnx(self, model: nn.Module, path: str) -> None:
         assert isinstance(model, PathModel)

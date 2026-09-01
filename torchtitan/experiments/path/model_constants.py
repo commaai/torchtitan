@@ -72,6 +72,7 @@ class ModelInputs:
     DESIRE = "desire_pulse"
     TRAFFIC = "traffic_convention"
     ACTION_T = "action_t"
+    PLAN_VAE = "plan_vae"
     ANTI_CHEATING_SAMPLES = "anti_cheating_samples"
     FEATURE_QUEUE = "feature_queue"
 
