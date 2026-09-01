@@ -55,9 +55,9 @@ def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
 # some micro optimizations can be made but not worth it for now
 # there are some Unsqueeze -> Gather that can be bipassed (traffic_convention, action_t)
 class Supercombo(torch.nn.Module):
-    def __init__(self, vision_flavor: str = "convnext_xxlarge") -> None:
+    def __init__(self) -> None:
         super().__init__()
-        config = model_config(vision_flavor)
+        config = model_config("convnext_xlarge")
         config.temporal_policy.temporal_summarizer.dense_training_outputs = False
         self.vision = config.vision.build()
         if not isinstance(self.vision.encoder.norm_pre, torch.nn.Identity):
