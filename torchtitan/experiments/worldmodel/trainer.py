@@ -45,6 +45,13 @@ class WorldModelFloat8Config:
     emulate: bool = False
 
 
+@dataclass(kw_only=True, slots=True)
+class PrefillNoiseConfig:
+    prob: float = 0.0
+    std_min: float = 0.0
+    std_max: float = 0.0
+
+
 def _batch_size(inputs: dict[str, torch.Tensor]) -> int:
     return next(iter(inputs.values())).shape[0]
 
@@ -90,6 +97,7 @@ def _prepare_worldmodel_batch(
     future_size_frames: int,
     no_noise_prefill_frames_prob: float,
     fake_timesteps_prob: float,
+    prefill_noise: PrefillNoiseConfig | None = None,
     train: bool,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     latents = tokenizer.encode(input_dict, device=device, dtype=dtype)
@@ -118,17 +126,34 @@ def _prepare_worldmodel_batch(
 
         mask = torch.ones_like(latents, device=device, dtype=torch.bool)
         fake_timesteps = timesteps.clone()
+        prefill_noise_range: tuple[int, int] | None = None
         if torch.rand((), device=device) < no_noise_prefill_frames_prob:
             end = min(inference_prefill_frames, num_frames)
             mask[:, :end] = False
             timesteps[:, :end] = scheduler.no_noise_timestep
             fake_timesteps[:, :end] = scheduler.no_noise_timestep
             start = min(future_size_frames, end)
-            if start < end and torch.rand((), device=device) < fake_timesteps_prob:
-                fake_timesteps[:, start:end] = scheduler.sample_timestep((batch_size, end - start))
-                mask[:, start:] = True
+            if start < end:
+                if torch.rand((), device=device) < fake_timesteps_prob:
+                    fake_timesteps[:, start:end] = scheduler.sample_timestep((batch_size, end - start))
+                    mask[:, start:] = True
+                if train and prefill_noise is not None and prefill_noise.prob > 0.0:
+                    if torch.rand((), device=device) < prefill_noise.prob:
+                        prefill_noise_range = (start, end)
 
         noisy_latents = scheduler.add_noise(latents, noise, fake_timesteps)
+        if prefill_noise_range is not None and prefill_noise is not None:
+            start, end = prefill_noise_range
+            num_frames = end - start
+            noise_std = torch.linspace(
+                prefill_noise.std_min,
+                prefill_noise.std_max,
+                num_frames,
+                device=device,
+                dtype=dtype,
+            )
+            context_latents = noisy_latents[:, start:end]
+            context_latents.add_(torch.randn_like(context_latents) * noise_std.view(1, num_frames, 1, 1, 1))
         targets = {**targets, "v": latents - noise, "mask": mask}
 
     return {
@@ -285,6 +310,7 @@ class WorldModelTrainer(Trainer):
         validator: WorldModelValidator.Config
         checkpoint: WorldModelTorchPackageCheckpointManager.Config
         float8: WorldModelFloat8Config = field(default_factory=WorldModelFloat8Config)
+        prefill_noise: PrefillNoiseConfig = field(default_factory=PrefillNoiseConfig)
         pose_dropout: float
         noise_scheduler_steps: int
         no_noise_prefill_frames_prob: float
@@ -349,6 +375,7 @@ class WorldModelTrainer(Trainer):
                 future_size_frames=self.config.dataloader.future_size_frames,
                 no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
                 fake_timesteps_prob=self.config.fake_timesteps_prob,
+                prefill_noise=self.config.prefill_noise,
                 train=True,
             )
         self.ntokens_seen += model_inputs["x"].shape[0] * self.config.training.seq_len
@@ -519,6 +546,13 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
         raise ValueError("model input spatial size must match dataloader latent_size")
     if model_config.in_channels != config.dataloader.in_channels:
         raise ValueError("model in_channels must match dataloader in_channels")
+    prefill_noise = config.prefill_noise
+    if not 0.0 <= prefill_noise.prob <= 1.0:
+        raise ValueError("prefill_noise.prob must be in [0, 1]")
+    if prefill_noise.std_min < 0.0:
+        raise ValueError("prefill_noise.std_min must be non-negative")
+    if prefill_noise.std_max < prefill_noise.std_min:
+        raise ValueError("prefill_noise.std_max must be >= prefill_noise.std_min")
     if (
         config.parallelism.tensor_parallel_degree > 1
         or config.parallelism.pipeline_parallel_degree > 1
