@@ -21,6 +21,20 @@ VISION_OUTPUT_ORDER = tuple(
 OFF_POLICY_OUTPUT_ORDER = ("plan", "lead", "lead_prob", "desire_state")
 ON_POLICY_OUTPUT_ORDER = ("action",)
 OUTPUT_ORDER = (*VISION_OUTPUT_ORDER, *OFF_POLICY_OUTPUT_ORDER, *ON_POLICY_OUTPUT_ORDER, "hidden_state")
+TINYGRAD_ONNX_DOMAIN = "org.tinygrad"
+TINYGRAD_CONTIGUOUS_OP = "Contiguous"
+
+
+def _tinygrad_contiguous(x: torch.Tensor) -> torch.Tensor:
+    if torch.onnx.is_in_onnx_export():
+        return torch.onnx.ops.symbolic(
+            f"{TINYGRAD_ONNX_DOMAIN}::{TINYGRAD_CONTIGUOUS_OP}",
+            (x,),
+            dtype=x.dtype,
+            shape=x.shape,
+            version=1,
+        )
+    return x.contiguous()
 
 
 def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
@@ -64,7 +78,7 @@ class Supercombo(torch.nn.Module):
                 attention.forward = MethodType(_naive_attention, attention)
 
     def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
-        current = self.vision(inputs)
+        current = _tinygrad_contiguous(self.vision(inputs))
         features = torch.cat((inputs["features_buffer"], current[:, None]), dim=1)
         outputs = self.point_policy(current.mean(dim=1))
         for policy, names in ((self.off_policy, OFF_POLICY_OUTPUT_ORDER), (self.on_policy, ON_POLICY_OUTPUT_ORDER)):
