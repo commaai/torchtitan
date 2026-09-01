@@ -21,6 +21,25 @@ VISION_OUTPUT_ORDER = tuple(
 OFF_POLICY_OUTPUT_ORDER = ("plan", "lead", "lead_prob", "desire_state")
 ON_POLICY_OUTPUT_ORDER = ("action",)
 OUTPUT_ORDER = (*VISION_OUTPUT_ORDER, *OFF_POLICY_OUTPUT_ORDER, *ON_POLICY_OUTPUT_ORDER, "hidden_state")
+TINYGRAD_ONNX_DOMAIN = "org.tinygrad"
+TINYGRAD_CONTIGUOUS_OP = "Contiguous"
+
+
+def _tinygrad_contiguous(x: torch.Tensor) -> torch.Tensor:
+    if torch.onnx.is_in_onnx_export():
+        return torch.onnx.ops.symbolic(
+            f"{TINYGRAD_ONNX_DOMAIN}::{TINYGRAD_CONTIGUOUS_OP}",
+            (x,),
+            dtype=x.dtype,
+            shape=x.shape,
+            version=1,
+        )
+    return x.contiguous()
+
+
+class _TinygradContiguous(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _tinygrad_contiguous(x)
 
 
 def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
@@ -41,6 +60,11 @@ class Supercombo(torch.nn.Module):
         config = model_config()
         config.temporal_policy.temporal_summarizer.dense_training_outputs = False
         self.vision = config.vision.build()
+        if not isinstance(self.vision.encoder.norm_pre, torch.nn.Identity):
+            raise TypeError("expected ConvNeXt norm_pre to be Identity")
+        # Match the ConvNeXt reassociation heuristic's realization boundary: after the
+        # final residual block and before the reduction in the head LayerNorm.
+        self.vision.encoder.norm_pre = _TinygradContiguous()
         self.point_policy = config.point_policy.build()
         self.off_policy = config.temporal_policy.build()
         self.on_policy = actor_config().build()
