@@ -15,7 +15,7 @@ from functools import cache
 from typing import Any, cast, Literal
 
 from xx.common.helpers import parse_info
-from xx.ml_tools.constants.model import TEMPORAL_INPUTS
+from xx.ml_tools.constants.model import ACTION_DISTRIBUTION_SIZE, ACTION_HEAD_SIZE, ACTION_LEN, TEMPORAL_INPUTS
 from xx.training.lib.checkpoint import Checkpoint
 from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
 from xx.training.rldriving.dataloader import RolloutContext
@@ -38,7 +38,7 @@ from torchtitan.trainer import Trainer
 
 from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
-from .model import RLDrivingModel
+from .model import actor_config, load_legacy_actor_state, RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
 from .validate import RLDrivingValidator
 
@@ -57,6 +57,41 @@ PreparedBatch = tuple[
 
 
 _get_path_checkpoint = cache(Checkpoint)
+
+
+def _checkpoint_action_head_size(storage_reader: FsspecReader) -> int:
+    suffix = "temporal_hydra.final_layer.action.weight"
+    action_weights = [
+        value for name, value in storage_reader.read_metadata().state_dict_metadata.items() if name.endswith(suffix)
+    ]
+    if len(action_weights) != 1:
+        raise ValueError(f"Expected one action head named *{suffix}, found {len(action_weights)}")
+    return int(action_weights[0].size[0])
+
+
+def _load_path_actor_warm_start(actor: nn.Module, checkpoint: str) -> None:
+    storage_reader = FsspecReader(_get_path_checkpoint(checkpoint).url_or_file())
+    action_head_size = _checkpoint_action_head_size(storage_reader)
+    if action_head_size == ACTION_HEAD_SIZE:
+        dcp.load({"temporal_policy": actor}, storage_reader=storage_reader)
+        return
+
+    legacy_action_head_size = ACTION_DISTRIBUTION_SIZE * ACTION_LEN
+    if action_head_size != legacy_action_head_size:
+        raise ValueError(
+            f"Expected warm-start action head size {legacy_action_head_size} or {ACTION_HEAD_SIZE}, "
+            f"got {action_head_size}"
+        )
+    logger.info(
+        "Expanding legacy point-action warm start across %d action chunk steps",
+        ACTION_HEAD_SIZE // action_head_size,
+    )
+    # The temporary module is fully overwritten by the checkpoint. Preserve RNG
+    # so legacy compatibility does not perturb subsequent model initialization.
+    with torch.random.fork_rng():
+        legacy_actor = actor_config(action_chunks=False).build()
+    dcp.load({"temporal_policy": legacy_actor}, storage_reader=storage_reader)
+    load_legacy_actor_state(legacy_actor, actor)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -176,10 +211,7 @@ class RLDrivingTrainer(Trainer):
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:rldriving:train")
         self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
-        dcp.load(
-            {"temporal_policy": self.model.actor},
-            storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
-        )
+        _load_path_actor_warm_start(self.model.actor, config.warm_start_checkpoint)
         self.model.warm_start_critics_from_actor()
 
     # pyrefly: ignore [bad-override]

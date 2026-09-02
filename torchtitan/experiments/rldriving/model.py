@@ -12,7 +12,13 @@ from dataclasses import dataclass
 from typing import Any, cast
 from xx.training.path.model import Hydra, LinearEncoder, PathHead, PathMLP, TemporalPolicy, TemporalSummarizer
 from xx.training.path.model_config import TEMPORAL_HEADS, temporal_policy_config
-from xx.training.path.model_constants import ACTION_LEN, ModelInputs
+from xx.training.path.model_constants import (
+    ACTION_CHUNK_SIZE,
+    ACTION_DISTRIBUTION_SIZE,
+    ACTION_HEAD_SIZE,
+    ACTION_LEN,
+    ModelInputs,
+)
 
 import torch
 import torch.nn as nn
@@ -83,9 +89,14 @@ class Critic(Module):
         return q_B1.squeeze(-1).clone()
 
 
-def actor_config() -> TemporalPolicy.Config:
+def actor_config(*, action_chunks: bool = True) -> TemporalPolicy.Config:
     action_heads = tuple(head for head in TEMPORAL_HEADS if head.name == ACTION_HEAD_NAME)
-    return temporal_policy_config(heads=action_heads, dropout=0.0, dense_training_outputs=False)
+    return temporal_policy_config(
+        heads=action_heads,
+        dropout=0.0,
+        dense_training_outputs=False,
+        action_chunks=action_chunks,
+    )
 
 
 def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
@@ -245,6 +256,30 @@ class RLDrivingModel(BaseModel):
 def _copy_model_state(source: nn.Module, destination: nn.Module) -> None:
     options = StateDictOptions(full_state_dict=True)
     source_state = get_model_state_dict(source, options=options)
+    set_model_state_dict(destination, source_state, options=options)
+
+
+@torch.no_grad()
+def load_legacy_actor_state(source: TemporalPolicy, destination: nn.Module) -> None:
+    """Load a point-action actor into a chunk actor by repeating its action head."""
+    options = StateDictOptions(full_state_dict=True)
+    source_state = get_model_state_dict(source, options=options)
+    action_head_names = (
+        "temporal_hydra.final_layer.action.weight",
+        "temporal_hydra.final_layer.action.bias",
+        "temporal_hydra.scale_layer.action.scale",
+    )
+    for name in action_head_names:
+        value = source_state[name]
+        expected_size = ACTION_DISTRIBUTION_SIZE * ACTION_LEN
+        if value.shape[0] != expected_size:
+            raise ValueError(f"Expected legacy {name} size {expected_size}, got {value.shape[0]}")
+        source_state[name] = (
+            value.reshape(ACTION_DISTRIBUTION_SIZE, ACTION_LEN, 1, *value.shape[1:])
+            .expand(ACTION_DISTRIBUTION_SIZE, ACTION_LEN, ACTION_CHUNK_SIZE, *value.shape[1:])
+            .reshape(ACTION_HEAD_SIZE, *value.shape[1:])
+            .clone()
+        )
     set_model_state_dict(destination, source_state, options=options)
 
 

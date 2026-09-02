@@ -17,9 +17,10 @@ import torch.nn.functional as F
 from torchtitan.components.loss import BaseLoss
 from torchtitan.config import CompileConfig
 from torchtitan.tools.logging import logger
+from xx.training.path.model_constants import first_action_from_action_head
 
 
-# B: batch, A: action components.
+# B: batch, O: flattened action-head output, A: selected action components.
 ActorOutputs = dict[str, torch.Tensor]
 ModelInputs = dict[str, torch.Tensor]
 Targets = dict[str, torch.Tensor]
@@ -29,10 +30,10 @@ ACTION_OUTPUT = "action"
 
 
 def _sample_fixed_noise_policy(
-    action_pred_BA: torch.Tensor,
+    action_pred_BO: torch.Tensor,
     action_noise_A: torch.Tensor,
 ) -> torch.Tensor:
-    action_mean_BA = action_pred_BA[:, :2]
+    action_mean_BA = first_action_from_action_head(action_pred_BO)
     return action_mean_BA + torch.randn_like(action_mean_BA) * action_noise_A
 
 
@@ -100,24 +101,26 @@ def _actor_loss(
     action_bound: float,
     action_bound_loss_weight: float,
 ) -> LossResult:
-    action_pred_BA = actor_outputs[ACTION_OUTPUT]
+    action_pred_BO = actor_outputs[ACTION_OUTPUT]
+    action_BA = first_action_from_action_head(action_pred_BO)
     q1_new_B, q2_new_B = online_critic(
         inputs=current_inputs,
-        action=action_pred_BA[:, :2],
+        action=action_BA,
     )
     actor_pi_B = -q1_new_B
     actor_q_abs_gap_B = torch.abs(q1_new_B - q2_new_B)
 
-    curvature_B = action_pred_BA[:, 0] / targets["speed"].squeeze(-1).square()
+    curvature_B = action_BA[:, 0] / targets["speed"].squeeze(-1).square()
     curvature_loss_B = curv_cost * curvature_B.square()
 
-    command_jerk_BA = (next_actor_outputs[ACTION_OUTPUT][:, :2] - action_pred_BA[:, :2]).abs() * fps
+    next_action_BA = first_action_from_action_head(next_actor_outputs[ACTION_OUTPUT])
+    command_jerk_BA = (next_action_BA - action_BA).abs() * fps
     smooth_lat_B = smooth_lat_cost * command_jerk_BA[:, 0].square()
     smooth_long_B = smooth_long_cost * command_jerk_BA[:, 1].square()
     smooth_B = smooth_lat_B + smooth_long_B
     actor_loss_B = actor_pi_B + curvature_loss_B + smooth_B
 
-    action_abs_BA = torch.abs(action_pred_BA[..., :2])
+    action_abs_BA = torch.abs(action_BA)
     action_bound_excess_BA = torch.clamp(action_abs_BA - action_bound, min=0.0)
     action_bound_loss_B = action_bound_excess_BA.square().mean(dim=-1)
     loss_B = actor_loss_B + action_bound_loss_weight * action_bound_loss_B
