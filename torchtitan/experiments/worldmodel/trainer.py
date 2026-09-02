@@ -45,11 +45,6 @@ class WorldModelFloat8Config:
     emulate: bool = False
 
 
-@dataclass(kw_only=True, slots=True)
-class PrefillNoiseConfig:
-    prob: float = 0.0
-
-
 def _batch_size(inputs: dict[str, torch.Tensor]) -> int:
     return next(iter(inputs.values())).shape[0]
 
@@ -95,7 +90,7 @@ def _prepare_worldmodel_batch(
     future_size_frames: int,
     no_noise_prefill_frames_prob: float,
     fake_timesteps_prob: float,
-    prefill_noise: PrefillNoiseConfig | None = None,
+    prefill_noise_prob: float = 0.0,
     train: bool,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     latents = tokenizer.encode(input_dict, device=device, dtype=dtype)
@@ -134,8 +129,8 @@ def _prepare_worldmodel_batch(
                 if torch.rand((), device=device) < fake_timesteps_prob:
                     fake_timesteps[:, start:end] = scheduler.sample_timestep((batch_size, end - start))
                     mask[:, start:] = True
-                elif train and prefill_noise is not None and prefill_noise.prob > 0.0:
-                    if torch.rand((), device=device) < prefill_noise.prob:
+                elif train and prefill_noise_prob > 0.0:
+                    if torch.rand((), device=device) < prefill_noise_prob:
                         sampled_timesteps = scheduler.sample_timestep((batch_size, end - start))
                         fake_timesteps[:, start:end] = sampled_timesteps.sort(dim=1).values
 
@@ -296,7 +291,7 @@ class WorldModelTrainer(Trainer):
         validator: WorldModelValidator.Config
         checkpoint: WorldModelTorchPackageCheckpointManager.Config
         float8: WorldModelFloat8Config = field(default_factory=WorldModelFloat8Config)
-        prefill_noise: PrefillNoiseConfig = field(default_factory=PrefillNoiseConfig)
+        prefill_noise_prob: float = 0.0
         pose_dropout: float
         noise_scheduler_steps: int
         no_noise_prefill_frames_prob: float
@@ -361,7 +356,7 @@ class WorldModelTrainer(Trainer):
                 future_size_frames=self.config.dataloader.future_size_frames,
                 no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
                 fake_timesteps_prob=self.config.fake_timesteps_prob,
-                prefill_noise=self.config.prefill_noise,
+                prefill_noise_prob=self.config.prefill_noise_prob,
                 train=True,
             )
         self.ntokens_seen += model_inputs["x"].shape[0] * self.config.training.seq_len
@@ -532,9 +527,8 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
         raise ValueError("model input spatial size must match dataloader latent_size")
     if model_config.in_channels != config.dataloader.in_channels:
         raise ValueError("model in_channels must match dataloader in_channels")
-    prefill_noise = config.prefill_noise
-    if not 0.0 <= prefill_noise.prob <= 1.0:
-        raise ValueError("prefill_noise.prob must be in [0, 1]")
+    if not 0.0 <= config.prefill_noise_prob <= 1.0:
+        raise ValueError("prefill_noise_prob must be in [0, 1]")
     if (
         config.parallelism.tensor_parallel_degree > 1
         or config.parallelism.pipeline_parallel_degree > 1
