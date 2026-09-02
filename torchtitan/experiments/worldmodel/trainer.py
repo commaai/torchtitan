@@ -48,8 +48,6 @@ class WorldModelFloat8Config:
 @dataclass(kw_only=True, slots=True)
 class PrefillNoiseConfig:
     prob: float = 0.0
-    timestep_min: float = 0.0
-    timestep_max: float = 0.0
 
 
 def _batch_size(inputs: dict[str, torch.Tensor]) -> int:
@@ -138,13 +136,8 @@ def _prepare_worldmodel_batch(
                     mask[:, start:] = True
                 elif train and prefill_noise is not None and prefill_noise.prob > 0.0:
                     if torch.rand((), device=device) < prefill_noise.prob:
-                        fake_timesteps[:, start:end] = torch.linspace(
-                            prefill_noise.timestep_min,
-                            prefill_noise.timestep_max,
-                            end - start,
-                            device=device,
-                            dtype=fake_timesteps.dtype,
-                        )
+                        sampled_timesteps = scheduler.sample_timestep((batch_size, end - start))
+                        fake_timesteps[:, start:end] = sampled_timesteps.sort(dim=1).values
 
         noisy_latents = scheduler.add_noise(latents, noise, fake_timesteps)
         targets = {**targets, "v": latents - noise, "mask": mask}
@@ -542,8 +535,6 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
     prefill_noise = config.prefill_noise
     if not 0.0 <= prefill_noise.prob <= 1.0:
         raise ValueError("prefill_noise.prob must be in [0, 1]")
-    if not 0.0 <= prefill_noise.timestep_min <= prefill_noise.timestep_max <= 1.0:
-        raise ValueError("prefill_noise timesteps must satisfy 0 <= min <= max <= 1")
     if (
         config.parallelism.tensor_parallel_degree > 1
         or config.parallelism.pipeline_parallel_degree > 1
