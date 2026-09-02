@@ -11,6 +11,9 @@ from typing import cast
 
 from xx.comma_data.constants import BASE_DIR_GT, DEFAULT_TRAIN_LIST
 from xx.ml_tools.constants.model import SUPERCOMBO_FPS
+from xx.release_tests.lib.base_report import BaseReportConfig, ReportFormat
+from xx.training.lib.torchtitan.report_runner import Report
+from xx.training.rldriving.test import MODEL_REPORTS
 
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
@@ -23,7 +26,6 @@ from .loss import RLDrivingLoss
 from .model import actor_config, critic_config, parallelize_rldriving, RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
 from .trainer import RLDrivingLRSchedulersConfig, RLDrivingTrainer
-from .validate import RLDrivingValidator
 
 
 def model_registry() -> ModelSpec:
@@ -40,6 +42,40 @@ def model_registry() -> ModelSpec:
     )
 
 
+def _make_reports(*, fps: int, num_epochs: int, steps_per_epoch: int) -> list[Report]:
+    frequent_steps = [(epoch + 1) * steps_per_epoch for epoch in range(0, num_epochs, num_epochs // 10)]
+    sparse_steps = [(epoch + 1) * steps_per_epoch for epoch in range(0, num_epochs, num_epochs // 2)]
+    steps_by_report = {
+        "analyse_lat.no_noise": frequent_steps,
+        "analyse_lat.realistic_noise": frequent_steps,
+        "analyse_long": frequent_steps,
+        "analyse_unintended_lead_following": sparse_steps,
+        "analyse_speed_convergence": sparse_steps,
+        "analyse_platform_oscillation": sparse_steps,
+        "analyse_nurec": sparse_steps,
+    }
+
+    def override_config(config: BaseReportConfig, eid: str) -> BaseReportConfig:
+        return config.replace(
+            rollout={"agent": {"supercombo": eid, "model_trained_fps": fps}},
+            save_tmp=False,
+            format=ReportFormat.HTML,
+        )
+
+    reports = []
+    for report_name, (test_cls, config_cls) in MODEL_REPORTS.items():
+        reports.append(
+            Report(
+                test_cls=test_cls,
+                test_config=config_cls(),
+                config_override_fn=override_config,
+                steps=steps_by_report[report_name],
+                wait_for_ckpt_keys=["model.onnx"],
+            )
+        )
+    return reports
+
+
 def rldriving() -> RLDrivingTrainer.Config:
     fps = SUPERCOMBO_FPS
     num_epochs = 201
@@ -53,24 +89,6 @@ def rldriving() -> RLDrivingTrainer.Config:
     checkpoint_base_folder = f"{reporterv2_host.rstrip('/')}/checkpoint" if reporterv2_host else ""
     actor_optim = {"lr": 4e-5, "betas": (0.9, 0.999), "eps": 1e-8}
     critic_optim = {"lr": 2e-4, "betas": (0.9, 0.999), "eps": 1e-8}
-    frequent_report_steps = [(epoch + 1) * steps_per_epoch for epoch in range(0, num_epochs, num_epochs // 10)]
-    sparse_report_steps = [(epoch + 1) * steps_per_epoch for epoch in range(0, num_epochs, num_epochs // 2)]
-    reports = dict.fromkeys(
-        (
-            "analyse_lat.no_noise",
-            "analyse_lat.realistic_noise",
-            "analyse_long",
-        ),
-        frequent_report_steps,
-    ) | dict.fromkeys(
-        (
-            "analyse_unintended_lead_following",
-            "analyse_speed_convergence",
-            "analyse_platform_oscillation",
-            "analyse_nurec",
-        ),
-        sparse_report_steps,
-    )
     return RLDrivingTrainer.Config(
         model_spec=model_spec,
         loss=RLDrivingLoss.Config(
@@ -159,13 +177,8 @@ def rldriving() -> RLDrivingTrainer.Config:
             enable_reporterv2=True,
             save_freq=steps_per_epoch,
         ),
-        validator=RLDrivingValidator.Config(
-            enable=True,
-            freq=steps_per_epoch,
-            fps=fps,
-            reports=reports,
-            miniray={"priority": 3},
-        ),
+        reports=_make_reports(fps=fps, num_epochs=num_epochs, steps_per_epoch=steps_per_epoch),
+        miniray={"priority": 3},
         debug=DebugConfig(seed=0),
     )
 

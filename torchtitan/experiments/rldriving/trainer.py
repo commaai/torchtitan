@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import cache
 from typing import Any, cast, Literal
@@ -17,6 +17,7 @@ from typing import Any, cast, Literal
 from xx.common.helpers import parse_info
 from xx.ml_tools.constants.model import TEMPORAL_INPUTS
 from xx.training.lib.checkpoint import Checkpoint
+from xx.training.lib.torchtitan.report_runner import Report, ReportRunner
 from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
 from xx.training.rldriving.dataloader import RolloutContext
 
@@ -40,7 +41,6 @@ from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
 from .model import RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
-from .validate import RLDrivingValidator
 
 
 Batch = tuple[
@@ -140,18 +140,19 @@ class RLDrivingTrainer(Trainer):
         dataloader: RLDrivingDataLoader.Config  # pyrefly: ignore [bad-override]
         checkpoint: RLDrivingOnnxCheckpointManager.Config  # pyrefly: ignore [bad-override]
         lr_scheduler: RLDrivingLRSchedulers.Config  # pyrefly: ignore [bad-override]
-        validator: RLDrivingValidator.Config  # pyrefly: ignore [bad-override]
         warm_start_checkpoint: str
         steps_per_epoch: int
         train_step_barrier_timeout_seconds: int
         ema_tau: float
         fps: int
+        miniray: dict[str, Any] = field(default_factory=dict)
+        reports: list[Report] = field(default_factory=list)
 
         def __post_init__(self) -> None:
             Trainer.Config.__post_init__(self)
             if self.codedir:
                 self.dataloader.codedir = self.codedir
-                self.validator.miniray = {**self.validator.miniray, "codedir": self.codedir}
+                self.miniray["codedir"] = self.codedir
             if self.steps_per_epoch != self.dataloader.steps_per_epoch:
                 raise ValueError("trainer and dataloader steps_per_epoch must match")
             if self.ema_tau < 1.0:
@@ -161,7 +162,6 @@ class RLDrivingTrainer(Trainer):
     loss_fn: RLDrivingLoss  # pyrefly: ignore [bad-override]
     dataloader: RLDrivingDataLoader  # pyrefly: ignore [bad-override]
     lr_schedulers: RLDrivingLRSchedulers  # pyrefly: ignore [bad-override]
-    validator: RLDrivingValidator  # pyrefly: ignore [bad-override]
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -174,6 +174,13 @@ class RLDrivingTrainer(Trainer):
             )
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:rldriving:train")
+        self.report_runner = ReportRunner(
+            config.reports,
+            metrics_processor=self.metrics_processor,
+            miniray={**config.miniray, "job_group": f"rldriving_validation_{training_id}"},
+            training_id=training_id,
+            enabled=dist.get_rank() == 0,
+        )
         self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
         dcp.load(
@@ -381,8 +388,7 @@ class RLDrivingTrainer(Trainer):
                         self.step,
                         last_step=(self.step == config.training.steps),
                     )
-                    if config.validator.enable and self.validator.should_validate(self.step):
-                        self.validator.validate(self.model_parts, self.step)
+                    self.report_runner.submit(step=self.step)
                     profiler.step()
                     if self.step - loaded_step == 1:
                         dist_utils.set_pg_timeouts(
@@ -397,8 +403,7 @@ class RLDrivingTrainer(Trainer):
 
     def close(self) -> None:
         self.dataloader.close()
-        if self.config.validator.enable:
-            self.validator.close()
+        self.report_runner.close()
         super().close()
         if self.train_step_barrier_group is not None:
             dist.destroy_process_group(self.train_step_barrier_group)
