@@ -85,7 +85,18 @@ class Critic(Module):
 
 def actor_config() -> TemporalPolicy.Config:
     action_heads = tuple(head for head in TEMPORAL_HEADS if head.name == ACTION_HEAD_NAME)
-    return temporal_policy_config(heads=action_heads, dropout=0.0, dense_training_outputs=False)
+    config = temporal_policy_config(heads=action_heads, dropout=0.0, dense_training_outputs=False)
+    # Map the current (t-4, t) vision feature to causal slot zero while keeping
+    # the latest desire window in the full external input contract.
+    config.history_idxs = config.history_idxs[-1:]
+
+    summarizer = config.temporal_summarizer
+    summarizer.desire_window_starts = summarizer.desire_window_starts[-1:]
+    summarizer.temporal_size = len(config.history_idxs)
+    # Keep the full positional embedding table so dense PATH checkpoints load
+    # without adaptation. A one-step sequence uses row zero, matching the first
+    # causal output of PATH pretraining.
+    return config
 
 
 def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
