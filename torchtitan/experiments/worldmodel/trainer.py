@@ -48,8 +48,8 @@ class WorldModelFloat8Config:
 @dataclass(kw_only=True, slots=True)
 class PrefillNoiseConfig:
     prob: float = 0.0
-    std_min: float = 0.0
-    std_max: float = 0.0
+    timestep_min: float = 0.0
+    timestep_max: float = 0.0
 
 
 def _batch_size(inputs: dict[str, torch.Tensor]) -> int:
@@ -126,7 +126,6 @@ def _prepare_worldmodel_batch(
 
         mask = torch.ones_like(latents, device=device, dtype=torch.bool)
         fake_timesteps = timesteps.clone()
-        prefill_noise_range: tuple[int, int] | None = None
         if torch.rand((), device=device) < no_noise_prefill_frames_prob:
             end = min(inference_prefill_frames, num_frames)
             mask[:, :end] = False
@@ -137,23 +136,17 @@ def _prepare_worldmodel_batch(
                 if torch.rand((), device=device) < fake_timesteps_prob:
                     fake_timesteps[:, start:end] = scheduler.sample_timestep((batch_size, end - start))
                     mask[:, start:] = True
-                if train and prefill_noise is not None and prefill_noise.prob > 0.0:
+                elif train and prefill_noise is not None and prefill_noise.prob > 0.0:
                     if torch.rand((), device=device) < prefill_noise.prob:
-                        prefill_noise_range = (start, end)
+                        fake_timesteps[:, start:end] = torch.linspace(
+                            prefill_noise.timestep_min,
+                            prefill_noise.timestep_max,
+                            end - start,
+                            device=device,
+                            dtype=fake_timesteps.dtype,
+                        )
 
         noisy_latents = scheduler.add_noise(latents, noise, fake_timesteps)
-        if prefill_noise_range is not None and prefill_noise is not None:
-            start, end = prefill_noise_range
-            num_frames = end - start
-            noise_std = torch.linspace(
-                prefill_noise.std_min,
-                prefill_noise.std_max,
-                num_frames,
-                device=device,
-                dtype=dtype,
-            )
-            context_latents = noisy_latents[:, start:end]
-            context_latents.add_(torch.randn_like(context_latents) * noise_std.view(1, num_frames, 1, 1, 1))
         targets = {**targets, "v": latents - noise, "mask": mask}
 
     return {
@@ -549,10 +542,8 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
     prefill_noise = config.prefill_noise
     if not 0.0 <= prefill_noise.prob <= 1.0:
         raise ValueError("prefill_noise.prob must be in [0, 1]")
-    if prefill_noise.std_min < 0.0:
-        raise ValueError("prefill_noise.std_min must be non-negative")
-    if prefill_noise.std_max < prefill_noise.std_min:
-        raise ValueError("prefill_noise.std_max must be >= prefill_noise.std_min")
+    if not 0.0 <= prefill_noise.timestep_min <= prefill_noise.timestep_max <= 1.0:
+        raise ValueError("prefill_noise timesteps must satisfy 0 <= min <= max <= 1")
     if (
         config.parallelism.tensor_parallel_degree > 1
         or config.parallelism.pipeline_parallel_degree > 1
