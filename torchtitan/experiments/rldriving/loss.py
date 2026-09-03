@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torchtitan.components.loss import BaseLoss
 from torchtitan.config import CompileConfig
 from torchtitan.tools.logging import logger
-from xx.training.path.model_constants import first_action_from_action_head
+from xx.training.path.model_constants import actions_from_action_head
 
 
 # B: batch, O: flattened action-head output, A: selected action components.
@@ -33,7 +33,7 @@ def _sample_fixed_noise_policy(
     action_pred_BO: torch.Tensor,
     action_noise_A: torch.Tensor,
 ) -> torch.Tensor:
-    action_mean_BA = first_action_from_action_head(action_pred_BO)
+    action_mean_BA = actions_from_action_head(action_pred_BO)[..., 0]
     return action_mean_BA + torch.randn_like(action_mean_BA) * action_noise_A
 
 
@@ -102,7 +102,7 @@ def _actor_loss(
     action_bound_loss_weight: float,
 ) -> LossResult:
     action_pred_BO = actor_outputs[ACTION_OUTPUT]
-    action_BA = first_action_from_action_head(action_pred_BO)
+    action_BA = actions_from_action_head(action_pred_BO)[..., 0]
     q1_new_B, q2_new_B = online_critic(
         inputs=current_inputs,
         action=action_BA,
@@ -113,7 +113,7 @@ def _actor_loss(
     curvature_B = action_BA[:, 0] / targets["speed"].squeeze(-1).square()
     curvature_loss_B = curv_cost * curvature_B.square()
 
-    next_action_BA = first_action_from_action_head(next_actor_outputs[ACTION_OUTPUT])
+    next_action_BA = actions_from_action_head(next_actor_outputs[ACTION_OUTPUT])[..., 0]
     command_jerk_BA = (next_action_BA - action_BA).abs() * fps
     smooth_lat_B = smooth_lat_cost * command_jerk_BA[:, 0].square()
     smooth_long_B = smooth_long_cost * command_jerk_BA[:, 1].square()
