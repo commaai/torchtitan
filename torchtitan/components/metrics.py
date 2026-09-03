@@ -199,6 +199,11 @@ class ReporterV2Logger(BaseLogger):
         reporter_config.setdefault("trainer", model_name)
         self.reporter = ReporterV2(reporter_config)
         torchtitan_reporterv2_layout = [
+            {
+                "pattern": "loss_metrics/([^/]+)/(.*)",
+                "group_by": "loss_metrics/$1",
+                "supergroup_by": "loss_metrics",
+            },
             {"pattern": "validation_metrics/([^/]+)/(.*)", "group_by": "$1/$2", "supergroup_by": "$1"},
             {"pattern": "validation_metrics/([^/]+)", "group_by": "$1", "supergroup_by": "/"},
             {"pattern": "([^/]+)/(.*)", "group_by": "$1/$2", "supergroup_by": "$1"},
