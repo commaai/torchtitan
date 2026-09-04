@@ -95,7 +95,7 @@ def rldriving() -> RLDrivingTrainer.Config:
             action_noise=(0.25, 0.25),
             gamma=0.95,
             fps=fps,
-            smooth_lat_cost=0.1,
+            smooth_lat_cost=0.15,
             smooth_long_cost=0.1,
             curv_cost=100.0,
         ),

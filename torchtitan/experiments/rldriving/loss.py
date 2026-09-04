@@ -38,18 +38,18 @@ def _sample_fixed_noise_policy(
 
 def _critic_loss(
     *,
-    next_actor_outputs: ActorOutputs,
+    bootstrap_actor_outputs: ActorOutputs,
     targets: Targets,
     online_critic: nn.Module,
     target_critic: nn.Module,
     current_inputs: ModelInputs,
-    next_inputs: ModelInputs,
+    bootstrap_inputs: ModelInputs,
     action_noise_A: torch.Tensor,
     gamma: float,
 ) -> LossResult:
     action_reward_B = targets["action_reward"]
     rollout_action_BA = action_reward_B[:, 0:2]
-    reward_B = action_reward_B[:, 2]
+    rewards_BN = targets["n_step_reward"]
 
     q1_rollout_B, q2_rollout_B = online_critic(
         inputs=current_inputs,
@@ -57,19 +57,24 @@ def _critic_loss(
     )
 
     with torch.no_grad():
-        next_action_BA = _sample_fixed_noise_policy(
-            next_actor_outputs[ACTION_OUTPUT],
+        bootstrap_action_BA = _sample_fixed_noise_policy(
+            bootstrap_actor_outputs[ACTION_OUTPUT],
             action_noise_A,
         )
         q1_target_B, q2_target_B = target_critic(
-            inputs=next_inputs,
-            action=next_action_BA,
+            inputs=bootstrap_inputs,
+            action=bootstrap_action_BA,
         )
         bootstrap_B = torch.minimum(q1_target_B, q2_target_B)
-        target_B = reward_B + gamma * bootstrap_B
+        discounts_N = gamma ** torch.arange(
+            rewards_BN.shape[1], device=rewards_BN.device, dtype=rewards_BN.dtype
+        )
+        discounted_reward_B = (rewards_BN * discounts_N).sum(dim=1)
+        bootstrap_discount = gamma ** rewards_BN.shape[1]
+        target_B = discounted_reward_B + bootstrap_discount * bootstrap_B
         q_target_abs_gap_B = torch.abs(q1_target_B - q2_target_B)
         q_rollout_abs_gap_B = torch.abs(q1_rollout_B - q2_rollout_B)
-        q_target_clip_correction_B = gamma * 0.5 * q_target_abs_gap_B
+        q_target_clip_correction_B = bootstrap_discount * 0.5 * q_target_abs_gap_B
 
     critic_loss_B = 0.5 * (
         F.mse_loss(q1_rollout_B, target_B, reduction="none") + F.mse_loss(q2_rollout_B, target_B, reduction="none")
@@ -78,7 +83,8 @@ def _critic_loss(
         "critic_loss": critic_loss_B.detach(),
         "q1_rollout": q1_rollout_B.detach(),
         "q2_rollout": q2_rollout_B.detach(),
-        "reward": reward_B.detach(),
+        "reward": rewards_BN[:, 0].detach(),
+        "discounted_n_step_reward": discounted_reward_B.detach(),
         "q_rollout_abs_gap": q_rollout_abs_gap_B.detach(),
         "q_target_abs_gap": q_target_abs_gap_B.detach(),
         "q_target_clip_correction": q_target_clip_correction_B.detach(),
@@ -190,20 +196,20 @@ class RLDrivingLoss(BaseLoss):
     def critic_loss(
         self,
         *,
-        next_actor_outputs: ActorOutputs,
+        bootstrap_actor_outputs: ActorOutputs,
         targets: Targets,
         online_critic: nn.Module,
         target_critic: nn.Module,
         current_inputs: ModelInputs,
-        next_inputs: ModelInputs,
+        bootstrap_inputs: ModelInputs,
     ) -> LossResult:
         return self.critic_fn(
-            next_actor_outputs=next_actor_outputs,
+            bootstrap_actor_outputs=bootstrap_actor_outputs,
             targets=targets,
             online_critic=online_critic,
             target_critic=target_critic,
             current_inputs=current_inputs,
-            next_inputs=next_inputs,
+            bootstrap_inputs=bootstrap_inputs,
             action_noise_A=self.action_noise_A,
             gamma=self.gamma,
         )

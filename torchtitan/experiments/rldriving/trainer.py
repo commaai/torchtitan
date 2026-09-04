@@ -54,6 +54,13 @@ PreparedBatch = tuple[
     dict[str, torch.Tensor],
     dict[str, torch.Tensor],
 ]
+NStepPreparedBatch = tuple[
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+    dict[str, torch.Tensor],
+]
 
 
 _get_path_checkpoint = cache(Checkpoint)
@@ -204,15 +211,25 @@ class RLDrivingTrainer(Trainer):
             yield batch
 
     def prepare_batch(self, batch: Batch) -> PreparedBatch:
+        current_inputs, next_inputs, _, targets, metadata = self._prepare_n_step_batch(batch)
+        return current_inputs, next_inputs, targets, metadata
+
+    def _prepare_n_step_batch(self, batch: Batch) -> NStepPreparedBatch:
         inputs, targets, metadata = batch
         inputs = {name: value.to(self.device) for name, value in inputs.items()}
         targets = {name: value.to(self.device) for name, value in targets.items()}
         metadata = {name: value.to(self.device) for name, value in metadata.items()}
         current_inputs = {name: inputs[name].float() for name in TEMPORAL_INPUTS}
+        n_step = inputs[f"next_{next(iter(TEMPORAL_INPUTS))}"].shape[1]
         next_inputs = {
-            name: torch.cat((inputs[name][:, 1:], inputs[f"next_{name}"]), dim=1).float() for name in current_inputs
+            name: torch.cat((inputs[name][:, 1:], inputs[f"next_{name}"][:, :1]), dim=1).float()
+            for name in current_inputs
         }
-        return current_inputs, next_inputs, targets, metadata
+        bootstrap_inputs = {
+            name: torch.cat((inputs[name][:, n_step:], inputs[f"next_{name}"]), dim=1).float()
+            for name in current_inputs
+        }
+        return current_inputs, next_inputs, bootstrap_inputs, targets, metadata
 
     # pyrefly: ignore [bad-override]
     def train_step(self, data_iterator: Iterator[Batch]) -> None:
@@ -223,7 +240,7 @@ class RLDrivingTrainer(Trainer):
         info = batch[0].get("info")
         if info is not None:
             self.unique_segment_counter.update(parse_info(value)["name"] for value in info.cpu().numpy())
-        current_inputs, next_inputs, targets, metadata = self.prepare_batch(batch)
+        current_inputs, next_inputs, bootstrap_inputs, targets, metadata = self._prepare_n_step_batch(batch)
         batch_size = next(iter(current_inputs.values())).shape[0]
         self.ntokens_seen += batch_size
         local_samples = torch.tensor(batch_size, dtype=torch.float32, device=self.device)
@@ -255,20 +272,20 @@ class RLDrivingTrainer(Trainer):
         self.optimizers.zero_grad()
         with self.train_context():
             with torch.no_grad():
-                next_actor_outputs = self.model.target_forward(next_inputs)
+                bootstrap_actor_outputs = self.model.target_forward(bootstrap_inputs)
             critic_loss_B, critic_metrics = self.loss_fn.critic_loss(
-                next_actor_outputs=next_actor_outputs,
+                bootstrap_actor_outputs=bootstrap_actor_outputs,
                 targets=targets,
                 online_critic=self.model.critic,
                 target_critic=self.model.target_critic,
                 current_inputs=current_inputs,
-                next_inputs=next_inputs,
+                bootstrap_inputs=bootstrap_inputs,
             )
             critic_loss = critic_loss_B.sum() / local_samples
             critic_loss.backward()
         critic_loss = critic_loss.detach()
         self._accumulate_metrics(metric_sums, critic_metrics)
-        del next_actor_outputs, critic_loss_B, critic_metrics
+        del bootstrap_actor_outputs, critic_loss_B, critic_metrics
         critic_grad_norm = self._clip_phase_grad_norm(self.model.critic)
         self.lr_schedulers.step_phase("critic")
         self.optimizers.zero_grad()
