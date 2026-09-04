@@ -237,6 +237,21 @@ class WorldModelForInference(WorldModel):
         self.default_kv_cache_dtype = default_kv_cache_dtype
 
     @staticmethod
+    def _cast_plan_head_input_to_float32(
+        _module: nn.Module,
+        args: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        return (args[0].float(), *args[1:])
+
+    def _ensure_plan_head_float32(self) -> None:
+        if self.plan_head is None or getattr(self, "_plan_head_fp32_ready", False):
+            return
+
+        self.plan_head.float()
+        self.plan_head.register_forward_pre_hook(self._cast_plan_head_input_to_float32)
+        self._plan_head_fp32_ready = True
+
+    @staticmethod
     def input_shapes(config: WorldModel.Config, batch_size: int = 1) -> dict[str, tuple[int, ...]]:
         frames, height, width = config.input_size
         pose_size = config.pose_size // 2
@@ -302,6 +317,7 @@ class WorldModelForInference(WorldModel):
         ).to_dict()
 
     def compile_for_inference(self) -> None:
+        self._ensure_plan_head_float32()
         for block in self.blocks:
             block.compile(mode="max-autotune-no-cudagraphs")
 
@@ -502,6 +518,27 @@ class WorldModelForInference(WorldModel):
             if trajectory is not None:
                 trajectory.append(x.clone())
 
+        # The final denoising step produces the clean latent, so read the plan head once more at t=0.
+        if "plan" in model_output:
+            timesteps = dummy_timestep * scheduler.no_noise_timestep
+            model_inputs = pack_cfg_inputs(
+                cfg,
+                x,
+                timesteps,
+                augments_pos_ref_augment,
+                ref_augment_from_augments_euler,
+                pose_mask,
+                fidxs,
+            )
+            clean_output = self(
+                *model_inputs,
+                input_pos=semantic_pos,
+                cache_pos=cache_pos,
+                cache_seq_length=cache_seq_length,
+                input_mask=input_mask,
+            )
+            model_output["plan"] = clean_output["plan"]
+
         return x, model_output, torch.stack(trajectory, dim=1) if trajectory is not None else None
 
     @torch.inference_mode()
@@ -523,6 +560,7 @@ class WorldModelForInference(WorldModel):
         kv_cache_dtype: KVCacheDType | None = None,
         **scheduler_kwargs: Any,
     ) -> dict[str, torch.Tensor]:
+        self._ensure_plan_head_float32()
         if num_prefill_frames is None:
             num_prefill_frames = 14 if num_conditioning_frames is None else num_conditioning_frames
         elif num_conditioning_frames is not None and num_conditioning_frames != num_prefill_frames:
