@@ -925,7 +925,7 @@ class WorldModel(BaseModel):
             w=self.config.input_size[2] // self.config.patch_size[2],
         )
 
-    def forward_features(
+    def forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
@@ -938,13 +938,7 @@ class WorldModel(BaseModel):
         cache_pos: torch.Tensor | None = None,
         cache_seq_length: int | None = None,
         input_mask: TensorOrMask | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Embed and contextualize latent patches without applying output heads.
-
-        Keeping the shared DiT trunk separate from its diffusion and plan heads
-        lets downstream policies attach task-specific readouts while preserving
-        the exact world-model conditioning and attention implementation.
-        """
+    ) -> dict[str, torch.Tensor]:
         if input_pos is None:
             input_mask = self.mask
 
@@ -972,34 +966,6 @@ class WorldModel(BaseModel):
         t2 = t2 + pos2 + euler2 + pose_mask2 + fidx2
         for block in self.blocks:
             x = block(x, t6, input_pos_t, input_mask, cache_pos, cache_seq_length)
-        return x, t2, input_pos_t
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        augments_pos_ref_augment: torch.Tensor,
-        ref_augment_from_augments_euler: torch.Tensor,
-        pose_mask: torch.Tensor,
-        fidx: torch.Tensor,
-        return_plan: bool = True,
-        input_pos: torch.Tensor | None = None,
-        cache_pos: torch.Tensor | None = None,
-        cache_seq_length: int | None = None,
-        input_mask: TensorOrMask | None = None,
-    ) -> dict[str, torch.Tensor]:
-        x, t2, input_pos_t = self.forward_features(
-            x,
-            t,
-            augments_pos_ref_augment,
-            ref_augment_from_augments_euler,
-            pose_mask,
-            fidx,
-            input_pos=input_pos,
-            cache_pos=cache_pos,
-            cache_seq_length=cache_seq_length,
-            input_mask=input_mask,
-        )
         outputs = {}
         if return_plan and self.plan_head is not None:
             outputs["plan"] = self.plan_head(x[:, -1, :])

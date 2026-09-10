@@ -537,7 +537,7 @@ class MetricsProcessor(Configurable):
             extra_metrics: Optional additional metrics to log
 
         """
-        assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
+        assert self.num_flops_per_token >= 0, "num_flops_per_token must be set (zero if unknown)"
 
         time_delta = time.perf_counter() - self.time_last_log
 
@@ -548,8 +548,8 @@ class MetricsProcessor(Configurable):
         # https://arxiv.org/abs/2204.02311
         # MFU is based on BF16 peak FLOPS which is misleading when quantization
         # (FP8/MX) is active, so we skip it in that case.
-        tflops = self.num_flops_per_token * tps / 1e12
-        if self.has_quantization:
+        tflops = self.num_flops_per_token * tps / 1e12 if self.num_flops_per_token else None
+        if self.has_quantization or tflops is None:
             mfu = None
         else:
             mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
@@ -565,7 +565,6 @@ class MetricsProcessor(Configurable):
             "loss_metrics/global_max_loss": global_max_loss,
             "grad_norm": grad_norm,
             "throughput(tps)": tps,
-            "tflops": tflops,
             "time_metrics/end_to_end(s)": time_end_to_end,
             "time_metrics/data_loading(s)": time_data_loading,
             "time_metrics/data_loading(%)": time_data_loading_pct,
@@ -576,6 +575,8 @@ class MetricsProcessor(Configurable):
             "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
             "memory/num_ooms": device_mem_stats.num_ooms,
         }
+        if tflops is not None:
+            metrics["tflops"] = tflops
         if mfu is not None:
             metrics["mfu(%)"] = mfu
 
@@ -586,6 +587,7 @@ class MetricsProcessor(Configurable):
 
         color = self.color
         mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+        tflops_str = f"{tflops:,.2f}" if tflops is not None else "N/A"
         logger.info(
             f"{color.red}step: {step:2}  "
             f"{color.green}loss: {global_avg_loss:8.5f}  "
@@ -593,7 +595,7 @@ class MetricsProcessor(Configurable):
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
-            f"{color.cyan}tflops: {tflops:,.2f}  "
+            f"{color.cyan}tflops: {tflops_str}  "
             f"{color.magenta}mfu: {mfu_str}{color.reset}"
         )
 
