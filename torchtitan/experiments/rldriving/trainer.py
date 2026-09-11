@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections.abc import Iterable, Iterator
@@ -115,18 +116,19 @@ class RLDrivingLRSchedulers(LRSchedulersContainer):
                     return 0.0
                 warmup_end = config.actor_delay_epochs + max_epoch * config.actor_warmup_fraction
                 if epoch < warmup_end:
-                    return (epoch - config.actor_delay_epochs) / (max_epoch * config.actor_warmup_fraction)
+                    progress = (epoch - config.actor_delay_epochs) / (max_epoch * config.actor_warmup_fraction)
+                    return 0.5 * (1.0 - math.cos(math.pi * progress))
                 if epoch < cooldown_start:
                     return 1.0
                 progress = min(1.0, (epoch - cooldown_start) / (max_epoch - cooldown_start))
-                return 1.0 + progress * (config.min_lr_factor - 1.0)
+                return 1.0 + 0.5 * (1.0 - math.cos(math.pi * progress)) * (config.min_lr_factor - 1.0)
 
             if epoch < config.critic_switch_epoch:
                 return 1.0
             lr = config.critic_second_lr
             if epoch >= cooldown_start:
                 progress = min(1.0, (epoch - cooldown_start) / (max_epoch - cooldown_start))
-                lr *= 1.0 + progress * (config.min_lr_factor - 1.0)
+                lr *= 1.0 + 0.5 * (1.0 - math.cos(math.pi * progress)) * (config.min_lr_factor - 1.0)
             return lr / base_lr
 
         return lr_lambda
