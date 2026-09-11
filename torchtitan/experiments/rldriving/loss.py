@@ -105,6 +105,7 @@ def _actor_loss(
     action_bound_loss_weight: float,
 ) -> LossResult:
     action_pred_BA = actor_outputs[ACTION_OUTPUT]
+    next_action_pred_BA = next_actor_outputs[ACTION_OUTPUT]
     q1_new_B, q2_new_B = online_critic(
         inputs=current_inputs,
         action=action_pred_BA[:, :2],
@@ -113,14 +114,11 @@ def _actor_loss(
     actor_q_abs_gap_B = torch.abs(q1_new_B - q2_new_B)
 
     curvature_B = action_pred_BA[:, 0] / targets["speed"].squeeze(-1).square()
-
-    curvature_rate_B = torch.zeros_like(curvature_B)
-    if curv_rate_cost:
-        next_curvature_B = next_actor_outputs[ACTION_OUTPUT][:, 0] / targets["next_speed"].squeeze(-1).square()
-        curvature_rate_B = (next_curvature_B - curvature_B) * fps
+    next_curvature_B = next_action_pred_BA[:, 0] / targets["next_speed"].squeeze(-1).square()
+    curvature_rate_B = (next_curvature_B - curvature_B) * fps
     curvature_rate_loss_B = curv_rate_cost * curvature_rate_B.square()
 
-    command_jerk_BA = (next_actor_outputs[ACTION_OUTPUT][:, :2] - action_pred_BA[:, :2]).abs() * fps
+    command_jerk_BA = (next_action_pred_BA[:, :2] - action_pred_BA[:, :2]).abs() * fps
     smooth_lat_B = smooth_lat_cost * command_jerk_BA[:, 0].square()
     smooth_long_B = smooth_long_cost * command_jerk_BA[:, 1].square()
     smooth_B = smooth_lat_B + smooth_long_B
