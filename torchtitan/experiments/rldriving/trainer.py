@@ -169,11 +169,6 @@ class RLDrivingTrainer(Trainer):
                 raise ValueError("trainer and dataloader steps_per_epoch must match")
             if self.ema_tau < 1.0:
                 raise ValueError("ema_tau must be at least 1")
-            if not 0 < self.rollout_exploration_decay_fraction <= 1:
-                raise ValueError("rollout_exploration_decay_fraction must be in (0, 1]")
-            for std in (self.rollout_exploration_lat_std, self.rollout_exploration_long_std):
-                if not math.isfinite(std) or std < 0:
-                    raise ValueError("rollout exploration standard deviations must be finite and nonnegative")
             if self.dataloader.load_caches and (self.rollout_exploration_lat_std or self.rollout_exploration_long_std):
                 raise ValueError("annealed rollout exploration requires fresh rollouts, not cached data")
 
@@ -207,20 +202,6 @@ class RLDrivingTrainer(Trainer):
             storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
         )
         self.model.warm_start_critics_from_actor()
-
-    def _rollout_context(self) -> RolloutContext:
-        steps_per_epoch = self.config.steps_per_epoch
-        epoch = ((self.step - 1) // steps_per_epoch) * steps_per_epoch + 1
-        scheduled_steps = (self.config.lr_scheduler.num_epochs - 1) * steps_per_epoch
-        decay_steps = scheduled_steps * self.config.rollout_exploration_decay_fraction
-        factor = max(0.0, 1.0 - max(0, self.step - 1) / decay_steps)
-        return RolloutContext(
-            epoch=epoch,
-            command_exploration_std=(
-                self.config.rollout_exploration_lat_std * factor,
-                self.config.rollout_exploration_long_std * factor,
-            ),
-        )
 
     # pyrefly: ignore [bad-override]
     def batch_generator(self, data_iterable: Iterable[Batch]) -> Iterator[Batch]:
@@ -259,8 +240,21 @@ class RLDrivingTrainer(Trainer):
 
     # pyrefly: ignore [bad-override]
     def train_step(self, data_iterator: Iterator[Batch]) -> None:
-        rollout_context = self._rollout_context()
-        self.dataloader.attach_training_context(rollout_context)
+        steps_per_epoch = self.config.steps_per_epoch
+        rollout_epoch = ((self.step - 1) // steps_per_epoch) * steps_per_epoch + 1
+        decay_steps = (
+            (self.config.lr_scheduler.num_epochs - 1) * steps_per_epoch * self.config.rollout_exploration_decay_fraction
+        )
+        factor = max(0.0, 1.0 - max(0, self.step - 1) / decay_steps)
+        self.dataloader.attach_training_context(
+            RolloutContext(
+                epoch=rollout_epoch,
+                command_exploration_std=(
+                    self.config.rollout_exploration_lat_std * factor,
+                    self.config.rollout_exploration_long_std * factor,
+                ),
+            )
+        )
         batch = next(data_iterator)
         info = batch[0].get("info")
         if info is not None:
@@ -379,8 +373,6 @@ class RLDrivingTrainer(Trainer):
                 "actor_grad_norm": float(actor_grad_norm.item()),
                 "critic_grad_norm": float(critic_grad_norm.item()),
                 "dataset/unique_segments_seen": unique_segments_seen,
-                "rollout/exploration_lat_std": rollout_context.command_exploration_std[0],
-                "rollout/exploration_long_std": rollout_context.command_exploration_std[1],
                 **lr_metrics,
                 **{f"rldriving/{name}": value for name, value in metric_averages.items()},
                 **{f"sim/{name}": value for name, value in metadata_averages.items()},
