@@ -97,11 +97,12 @@ def rldriving() -> RLDrivingTrainer.Config:
             fps=fps,
             smooth_lat_cost=0.15,
             smooth_long_cost=0.1,
-            curv_cost=100.0,
+            curv_cost=0.0,
+            curv_rate_cost=20.0,
         ),
         warm_start_checkpoint=os.getenv(
             "RLDRIVING_WARM_START_CHECKPOINT",
-            "849a624a-8a7d-8946-bf04-86148e5e0ef8/56320",
+            "b9facbcc-4d47-410e-b3ce-dfcbad12ba92/56320",
         ),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=RLDrivingDataLoader.Config(
@@ -140,6 +141,8 @@ def rldriving() -> RLDrivingTrainer.Config:
         lr_scheduler=RLDrivingLRSchedulersConfig(
             steps_per_epoch=steps_per_epoch,
             num_epochs=num_epochs,
+            actor_warmup_fraction=0.225,
+            min_lr_factor=0.0,
         ),
         training=TrainingConfig(
             local_batch_size=32,
@@ -170,6 +173,9 @@ def rldriving() -> RLDrivingTrainer.Config:
         train_step_barrier_timeout_seconds=60 * 60,
         ema_tau=128.0,
         fps=fps,
+        rollout_exploration_lat_std=0.2,
+        rollout_exploration_long_std=0.2,
+        rollout_exploration_decay_fraction=0.3,
         activation_checkpoint=None,
         compile=CompileConfig(enable=True, components=["model"]),
         metrics=MetricsProcessor.Config(

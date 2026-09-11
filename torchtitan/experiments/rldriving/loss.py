@@ -66,9 +66,7 @@ def _critic_loss(
             action=bootstrap_action_BA,
         )
         bootstrap_B = torch.minimum(q1_target_B, q2_target_B)
-        discounts_N = gamma ** torch.arange(
-            rewards_BN.shape[1], device=rewards_BN.device, dtype=rewards_BN.dtype
-        )
+        discounts_N = gamma ** torch.arange(rewards_BN.shape[1], device=rewards_BN.device, dtype=rewards_BN.dtype)
         discounted_reward_B = (rewards_BN * discounts_N).sum(dim=1)
         bootstrap_discount = gamma ** rewards_BN.shape[1]
         target_B = discounted_reward_B + bootstrap_discount * bootstrap_B
@@ -103,6 +101,7 @@ def _actor_loss(
     smooth_lat_cost: float,
     smooth_long_cost: float,
     curv_cost: float,
+    curv_rate_cost: float,
     action_bound: float,
     action_bound_loss_weight: float,
 ) -> LossResult:
@@ -117,11 +116,17 @@ def _actor_loss(
     curvature_B = action_pred_BA[:, 0] / targets["speed"].squeeze(-1).square()
     curvature_loss_B = curv_cost * curvature_B.square()
 
+    curvature_rate_B = torch.zeros_like(curvature_B)
+    if curv_rate_cost:
+        next_curvature_B = next_actor_outputs[ACTION_OUTPUT][:, 0] / targets["next_speed"].squeeze(-1).square()
+        curvature_rate_B = (next_curvature_B - curvature_B) * fps
+    curvature_rate_loss_B = curv_rate_cost * curvature_rate_B.square()
+
     command_jerk_BA = (next_actor_outputs[ACTION_OUTPUT][:, :2] - action_pred_BA[:, :2]).abs() * fps
     smooth_lat_B = smooth_lat_cost * command_jerk_BA[:, 0].square()
     smooth_long_B = smooth_long_cost * command_jerk_BA[:, 1].square()
     smooth_B = smooth_lat_B + smooth_long_B
-    actor_loss_B = actor_pi_B + curvature_loss_B + smooth_B
+    actor_loss_B = actor_pi_B + curvature_loss_B + curvature_rate_loss_B + smooth_B
 
     action_abs_BA = torch.abs(action_pred_BA[..., :2])
     action_bound_excess_BA = torch.clamp(action_abs_BA - action_bound, min=0.0)
@@ -135,6 +140,9 @@ def _actor_loss(
         "actor_q_abs_gap": actor_q_abs_gap_B.detach(),
         "actor_curv": curvature_B.detach(),
         "actor_curv_loss": curvature_loss_B.detach(),
+        "actor_curv_rate": curvature_rate_B.detach(),
+        "actor_curv_rate_abs": curvature_rate_B.abs().detach(),
+        "actor_curv_rate_loss": curvature_rate_loss_B.detach(),
         "actor_cmd_lat_jerk": command_jerk_BA[:, 0].detach(),
         "actor_cmd_long_jerk": command_jerk_BA[:, 1].detach(),
         "actor_smooth_lat_loss": smooth_lat_B.detach(),
@@ -156,6 +164,7 @@ class RLDrivingLoss(BaseLoss):
         smooth_lat_cost: float = 0.0
         smooth_long_cost: float = 0.0
         curv_cost: float = 0.0
+        curv_rate_cost: float = 0.0
         action_bound: float = 10.0
         action_bound_loss_weight: float = 1.0
 
@@ -171,6 +180,7 @@ class RLDrivingLoss(BaseLoss):
         self.smooth_lat_cost = config.smooth_lat_cost
         self.smooth_long_cost = config.smooth_long_cost
         self.curv_cost = config.curv_cost
+        self.curv_rate_cost = config.curv_rate_cost
         self.action_bound = config.action_bound
         self.action_bound_loss_weight = config.action_bound_loss_weight
 
@@ -233,6 +243,7 @@ class RLDrivingLoss(BaseLoss):
             smooth_lat_cost=self.smooth_lat_cost,
             smooth_long_cost=self.smooth_long_cost,
             curv_cost=self.curv_cost,
+            curv_rate_cost=self.curv_rate_cost,
             action_bound=self.action_bound,
             action_bound_loss_weight=self.action_bound_loss_weight,
         )
