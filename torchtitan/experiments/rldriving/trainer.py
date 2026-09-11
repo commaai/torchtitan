@@ -245,15 +245,11 @@ class RLDrivingTrainer(Trainer):
         decay_steps = (
             (self.config.lr_scheduler.num_epochs - 1) * steps_per_epoch * self.config.rollout_exploration_decay_fraction
         )
-        factor = max(0.0, 1.0 - max(0, self.step - 1) / decay_steps)
+        factor = max(0.0, 1.0 - (self.step - 1) / decay_steps)
+        lat_std = self.config.rollout_exploration_lat_std * factor
+        long_std = self.config.rollout_exploration_long_std * factor
         self.dataloader.attach_training_context(
-            RolloutContext(
-                epoch=rollout_epoch,
-                command_exploration_std=(
-                    self.config.rollout_exploration_lat_std * factor,
-                    self.config.rollout_exploration_long_std * factor,
-                ),
-            )
+            RolloutContext(epoch=rollout_epoch, command_exploration_std=(lat_std, long_std))
         )
         batch = next(data_iterator)
         info = batch[0].get("info")
