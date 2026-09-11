@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections.abc import Iterable, Iterator
@@ -101,6 +102,17 @@ class RLDrivingLRSchedulers(LRSchedulersContainer):
             )
         ]
 
+    def _ramp_progress(self, progress: float) -> float:
+        kind = self.config.decay_type
+        progress = max(0.0, min(1.0, progress))
+        if kind == "linear":
+            return progress
+        if kind == "cosine":
+            return 0.5 * (1.0 - math.cos(math.pi * progress))
+        if kind == "sqrt":
+            return math.sqrt(progress)
+        raise ValueError(f"Unknown LR ramp type: {kind}")
+
     def _lr_lambda(self, group):
         phase = group["param_names"][0].split(".", 1)[0]
         base_lr = float(group["lr"])
@@ -115,17 +127,18 @@ class RLDrivingLRSchedulers(LRSchedulersContainer):
                     return 0.0
                 warmup_end = config.actor_delay_epochs + max_epoch * config.actor_warmup_fraction
                 if epoch < warmup_end:
-                    return (epoch - config.actor_delay_epochs) / (max_epoch * config.actor_warmup_fraction)
+                    progress = (epoch - config.actor_delay_epochs) / (max_epoch * config.actor_warmup_fraction)
+                    return self._ramp_progress(progress)
                 if epoch < cooldown_start:
                     return 1.0
-                progress = min(1.0, (epoch - cooldown_start) / (max_epoch - cooldown_start))
+                progress = self._ramp_progress((epoch - cooldown_start) / (max_epoch - cooldown_start))
                 return 1.0 + progress * (config.min_lr_factor - 1.0)
 
             if epoch < config.critic_switch_epoch:
                 return 1.0
             lr = config.critic_second_lr
             if epoch >= cooldown_start:
-                progress = min(1.0, (epoch - cooldown_start) / (max_epoch - cooldown_start))
+                progress = self._ramp_progress((epoch - cooldown_start) / (max_epoch - cooldown_start))
                 lr *= 1.0 + progress * (config.min_lr_factor - 1.0)
             return lr / base_lr
 
