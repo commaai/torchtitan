@@ -154,9 +154,6 @@ class RLDrivingTrainer(Trainer):
         train_step_barrier_timeout_seconds: int
         ema_tau: float
         fps: int
-        rollout_exploration_decay_fraction: float = 0.3
-        rollout_exploration_lat_std: float = 0.5
-        rollout_exploration_long_std: float = 0.5
         miniray: dict[str, Any] = field(default_factory=dict)
         reports: list[Report] = field(default_factory=list)
 
@@ -169,8 +166,6 @@ class RLDrivingTrainer(Trainer):
                 raise ValueError("trainer and dataloader steps_per_epoch must match")
             if self.ema_tau < 1.0:
                 raise ValueError("ema_tau must be at least 1")
-            if self.dataloader.load_caches and (self.rollout_exploration_lat_std or self.rollout_exploration_long_std):
-                raise ValueError("annealed rollout exploration requires fresh rollouts, not cached data")
 
     config: Config  # pyrefly: ignore [bad-override]
     loss_fn: RLDrivingLoss  # pyrefly: ignore [bad-override]
@@ -242,15 +237,7 @@ class RLDrivingTrainer(Trainer):
     def train_step(self, data_iterator: Iterator[Batch]) -> None:
         steps_per_epoch = self.config.steps_per_epoch
         rollout_epoch = ((self.step - 1) // steps_per_epoch) * steps_per_epoch + 1
-        decay_steps = (
-            (self.config.lr_scheduler.num_epochs - 1) * steps_per_epoch * self.config.rollout_exploration_decay_fraction
-        )
-        factor = max(0.0, 1.0 - (self.step - 1) / decay_steps)
-        lat_std = self.config.rollout_exploration_lat_std * factor
-        long_std = self.config.rollout_exploration_long_std * factor
-        self.dataloader.attach_training_context(
-            RolloutContext(epoch=rollout_epoch, command_exploration_std=(lat_std, long_std))
-        )
+        self.dataloader.attach_training_context(RolloutContext(epoch=rollout_epoch))
         batch = next(data_iterator)
         info = batch[0].get("info")
         if info is not None:
