@@ -38,6 +38,7 @@ def _sample_fixed_noise_policy(
 
 def _critic_loss(
     *,
+    config: RLDrivingLoss.Config,
     bootstrap_actor_outputs: ActorOutputs,
     targets: Targets,
     online_critic: nn.Module,
@@ -45,7 +46,6 @@ def _critic_loss(
     current_inputs: ModelInputs,
     bootstrap_inputs: ModelInputs,
     action_noise_A: torch.Tensor,
-    gamma: float,
 ) -> LossResult:
     action_reward_B = targets["action_reward"]
     rollout_action_BA = action_reward_B[:, 0:2]
@@ -66,9 +66,11 @@ def _critic_loss(
             action=bootstrap_action_BA,
         )
         bootstrap_B = torch.minimum(q1_target_B, q2_target_B)
-        discounts_N = gamma ** torch.arange(rewards_BN.shape[1], device=rewards_BN.device, dtype=rewards_BN.dtype)
+        discounts_N = config.gamma ** torch.arange(
+            rewards_BN.shape[1], device=rewards_BN.device, dtype=rewards_BN.dtype
+        )
         discounted_reward_B = (rewards_BN * discounts_N).sum(dim=1)
-        bootstrap_discount = gamma ** rewards_BN.shape[1]
+        bootstrap_discount = config.gamma ** rewards_BN.shape[1]
         target_B = discounted_reward_B + bootstrap_discount * bootstrap_B
         q_target_abs_gap_B = torch.abs(q1_target_B - q2_target_B)
         q_rollout_abs_gap_B = torch.abs(q1_rollout_B - q2_rollout_B)
@@ -92,17 +94,12 @@ def _critic_loss(
 
 def _actor_loss(
     *,
+    config: RLDrivingLoss.Config,
     actor_outputs: ActorOutputs,
     next_actor_outputs: ActorOutputs,
     online_critic: nn.Module,
     current_inputs: ModelInputs,
     targets: Targets,
-    fps: float,
-    smooth_lat_cost: float,
-    smooth_long_cost: float,
-    curv_rate_cost: float,
-    action_bound: float,
-    action_bound_loss_weight: float,
 ) -> LossResult:
     action_pred_BA = actor_outputs[ACTION_OUTPUT]
     next_action_pred_BA = next_actor_outputs[ACTION_OUTPUT]
@@ -115,19 +112,19 @@ def _actor_loss(
 
     curvature_B = action_pred_BA[:, 0] / targets["speed"].squeeze(-1).square()
     next_curvature_B = next_action_pred_BA[:, 0] / targets["next_speed"].squeeze(-1).square()
-    curvature_rate_B = (next_curvature_B - curvature_B) * fps
-    curvature_rate_loss_B = curv_rate_cost * curvature_rate_B.square()
+    curvature_rate_B = (next_curvature_B - curvature_B) * config.fps
+    curvature_rate_loss_B = config.curv_rate_cost * curvature_rate_B.square()
 
-    command_jerk_BA = (next_action_pred_BA[:, :2] - action_pred_BA[:, :2]).abs() * fps
-    smooth_lat_B = smooth_lat_cost * command_jerk_BA[:, 0].square()
-    smooth_long_B = smooth_long_cost * command_jerk_BA[:, 1].square()
+    command_jerk_BA = (next_action_pred_BA[:, :2] - action_pred_BA[:, :2]).abs() * config.fps
+    smooth_lat_B = config.smooth_lat_cost * command_jerk_BA[:, 0].square()
+    smooth_long_B = config.smooth_long_cost * command_jerk_BA[:, 1].square()
     smooth_B = smooth_lat_B + smooth_long_B
     actor_loss_B = actor_pi_B + curvature_rate_loss_B + smooth_B
 
     action_abs_BA = torch.abs(action_pred_BA[..., :2])
-    action_bound_excess_BA = torch.clamp(action_abs_BA - action_bound, min=0.0)
+    action_bound_excess_BA = torch.clamp(action_abs_BA - config.action_bound, min=0.0)
     action_bound_loss_B = action_bound_excess_BA.square().mean(dim=-1)
-    loss_B = actor_loss_B + action_bound_loss_weight * action_bound_loss_B
+    loss_B = actor_loss_B + config.action_bound_loss_weight * action_bound_loss_B
 
     metrics = {
         "loss": loss_B.detach(),
@@ -168,14 +165,8 @@ class RLDrivingLoss(BaseLoss):
         *,
         compile_config: CompileConfig | None = None,
     ) -> None:
+        self.config = config
         self.action_noise_A = torch.tensor(config.action_noise)
-        self.gamma = config.gamma
-        self.fps = config.fps
-        self.smooth_lat_cost = config.smooth_lat_cost
-        self.smooth_long_cost = config.smooth_long_cost
-        self.curv_rate_cost = config.curv_rate_cost
-        self.action_bound = config.action_bound
-        self.action_bound_loss_weight = config.action_bound_loss_weight
 
         self.critic_fn = _critic_loss
         self.actor_fn = _actor_loss
@@ -207,6 +198,7 @@ class RLDrivingLoss(BaseLoss):
         bootstrap_inputs: ModelInputs,
     ) -> LossResult:
         return self.critic_fn(
+            config=self.config,
             bootstrap_actor_outputs=bootstrap_actor_outputs,
             targets=targets,
             online_critic=online_critic,
@@ -214,7 +206,6 @@ class RLDrivingLoss(BaseLoss):
             current_inputs=current_inputs,
             bootstrap_inputs=bootstrap_inputs,
             action_noise_A=self.action_noise_A,
-            gamma=self.gamma,
         )
 
     def actor_loss(
@@ -227,15 +218,10 @@ class RLDrivingLoss(BaseLoss):
         targets: Targets,
     ) -> LossResult:
         return self.actor_fn(
+            config=self.config,
             actor_outputs=actor_outputs,
             next_actor_outputs=next_actor_outputs,
             online_critic=online_critic,
             current_inputs=current_inputs,
             targets=targets,
-            fps=self.fps,
-            smooth_lat_cost=self.smooth_lat_cost,
-            smooth_long_cost=self.smooth_long_cost,
-            curv_rate_cost=self.curv_rate_cost,
-            action_bound=self.action_bound,
-            action_bound_loss_weight=self.action_bound_loss_weight,
         )
