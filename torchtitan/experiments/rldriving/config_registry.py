@@ -172,9 +172,6 @@ def rldriving() -> RLDrivingTrainer.Config:
         train_step_barrier_timeout_seconds=60 * 60,
         ema_tau=128.0,
         fps=fps,
-        rollout_exploration_lat_std=0.5,
-        rollout_exploration_long_std=0.5,
-        rollout_exploration_decay_fraction=0.3,
         activation_checkpoint=None,
         compile=CompileConfig(enable=True, components=["model"]),
         metrics=MetricsProcessor.Config(

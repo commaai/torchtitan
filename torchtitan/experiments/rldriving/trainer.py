@@ -155,8 +155,8 @@ class RLDrivingTrainer(Trainer):
         ema_tau: float
         fps: int
         rollout_exploration_decay_fraction: float = 0.3
-        rollout_exploration_lat_std: float = 0.0
-        rollout_exploration_long_std: float = 0.0
+        rollout_exploration_lat_std: float = 0.5
+        rollout_exploration_long_std: float = 0.5
         miniray: dict[str, Any] = field(default_factory=dict)
         reports: list[Report] = field(default_factory=list)
 
