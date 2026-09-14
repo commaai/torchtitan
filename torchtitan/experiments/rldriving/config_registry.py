@@ -140,8 +140,6 @@ def rldriving() -> RLDrivingTrainer.Config:
         lr_scheduler=RLDrivingLRSchedulersConfig(
             steps_per_epoch=steps_per_epoch,
             num_epochs=num_epochs,
-            actor_warmup_fraction=0.225,
-            min_lr_factor=0.0,
         ),
         training=TrainingConfig(
             local_batch_size=32,
