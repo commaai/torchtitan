@@ -14,6 +14,9 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Any, cast
 from xx.common.helpers import parse_info
+from xx.release_tests.lib.base_report import ReportFormat
+from xx.release_tests.worldmodel.analyse_worldmodel import AnalyseWorldmodel, AnalyseWorldmodelConfig
+from xx.training.lib.torchtitan.report_runner import Report, ReportRunner
 from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
 
 import einops
@@ -296,6 +299,7 @@ class WorldModelTrainer(Trainer):
         noise_scheduler_steps: int
         no_noise_prefill_frames_prob: float
         fake_timesteps_prob: float
+        enable_rollout_report: bool = True
 
         def __post_init__(self) -> None:
             Trainer.Config.__post_init__(self)
@@ -316,6 +320,42 @@ class WorldModelTrainer(Trainer):
         self.loss_fn = cast(WorldModelLoss, self.loss_fn)
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:worldmodel:train")
+        checkpoint_steps = sorted(
+            set(range(config.checkpoint.interval, config.training.steps + 1, config.checkpoint.interval))
+            | {config.training.steps}
+            | ({1} if config.checkpoint.enable_first_step_checkpoint else set())
+        )
+        report_steps = sorted(
+            {
+                checkpoint_steps[0],
+                min(checkpoint_steps, key=lambda step: abs(step - config.training.steps / 2)),
+                config.training.steps,
+            }
+        )
+        self.report_runner = ReportRunner(
+            [
+                Report(
+                    test_cls=AnalyseWorldmodel,
+                    test_config=AnalyseWorldmodelConfig(format=ReportFormat.HTML, save_tmp=False),
+                    config_override_fn=lambda report_config, eid: report_config.replace(
+                        rollout={"env": {"worldmodel": eid}}
+                    ),
+                    steps=report_steps,
+                    wait_for_ckpt_keys=["model.fp8.torchpackage", "model.fp8_nvfp4.torchpackage"],
+                )
+            ],
+            metrics_processor=self.metrics_processor,
+            miniray={"codedir": config.codedir},
+            training_id=training_id,
+            enabled=(
+                config.enable_rollout_report
+                and config.metrics.enable_reporterv2
+                and config.checkpoint.enable
+                and not config.checkpoint.load_only
+                and config.checkpoint.export_torch_package
+                and torch.distributed.get_rank() == 0
+            ),
+        )
 
     def batch_generator(
         self,
@@ -425,6 +465,7 @@ class WorldModelTrainer(Trainer):
             self.lr_schedulers.step()
 
         self.unique_segment_counter.update(step_segment_names)
+        self.report_runner.submit(step=self.step)
 
         if not self.metrics_processor.should_log(self.step):
             return
@@ -474,6 +515,7 @@ class WorldModelTrainer(Trainer):
         )
 
     def close(self) -> None:
+        self.report_runner.close()
         self.dataloader.close()
         if self.config.validator.enable:
             self.validator.close()
