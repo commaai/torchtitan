@@ -307,7 +307,7 @@ class WorldModelTorchPackageRecipe:
 
 
 class WorldModelTrainingTorchPackageRecipe(WorldModelTorchPackageRecipe):
-    weight_formats = WEIGHT_FORMATS
+    weight_formats: tuple[WeightFormat, ...] = ("fp8", "fp8_nvfp4", "bf16")
 
     def build_package(
         self,
