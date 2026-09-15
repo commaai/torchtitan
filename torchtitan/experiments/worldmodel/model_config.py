@@ -75,7 +75,7 @@ def _model_config(
     plan_layers: int = 4,
     mlp_multiple_of: int = 256,
     attention_impl: str = "FLEX",
-    attention_mask: str = "LAST_FRAME_CAUSAL",
+    attention_mask: str = "BLOCKWISE_LOWER_TRIANGLE",
     norm: str = "RMSNorm",
     experimental_pose_only_xy: bool = False,
 ) -> WorldModel.Config:
@@ -125,9 +125,7 @@ def _model_config(
     )
 
 
-def _blocks_only_float8(
-    *, model_compile_enabled: bool, emulate: bool = False
-) -> Float8LinearConverter.Config:
+def _blocks_only_float8(*, model_compile_enabled: bool, emulate: bool = False) -> Float8LinearConverter.Config:
     return Float8LinearConverter.Config(
         recipe_name="tensorwise",
         filter_fqns=WORLD_MODEL_FLOAT8_FILTER_FQNS,

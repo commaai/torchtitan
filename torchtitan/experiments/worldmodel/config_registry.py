@@ -107,12 +107,7 @@ def worldmodel() -> WorldModelTrainer.Config:
             enable_first_step_checkpoint=True,
             last_save_model_only=False,
             checkpoint_id_format="",
-            exclude_from_loading=[
-                "optimizer",
-                "lr_scheduler",
-                "dataloader",
-                "train_state",
-            ],
+            exclude_from_loading=["dataloader"],
             export_torch_package=True,
         ),
         validator=WorldModelValidator.Config(
