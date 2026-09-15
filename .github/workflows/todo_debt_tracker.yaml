@@ -4,19 +4,18 @@ on:
   # 1. Manual trigger
   workflow_dispatch:
 
-  # 2. Automatic trigger (Once a day at midnight UTC)
-  schedule:
-    - cron: '0 0 * * *'
+  # Disabled: the upstream tracker expects issue #2936, which is absent here.
+  # schedule:
+  #   - cron: '0 0 * * *'
 
-  # 3. Triggered if the script or the action configuration is changed
-  push:
-    branches: [main]
+  # push:
+  #   branches: [main]
 
-  pull_request:
-    branches: [main]
-    paths:
-      - '.github/workflows/todo_debt_tracker.yaml'
-      - '.github/scripts/todo_debt_tracker.py'
+  # pull_request:
+  #   branches: [main]
+  #   paths:
+  #     - '.github/workflows/todo_debt_tracker.yaml'
+  #     - '.github/scripts/todo_debt_tracker.py'
 
 concurrency:
   group: todo-debt-tracker # Serial execution of simultaneous commits
