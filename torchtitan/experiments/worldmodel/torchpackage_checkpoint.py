@@ -173,8 +173,7 @@ def convert_state_dict_for_inference(
     *,
     weight_format: WeightFormat = DEFAULT_WEIGHT_FORMAT,
 ) -> dict[str, torch.Tensor]:
-    with torch.device("cpu"):
-        model = WorldModelForInference(model_config).to(dtype=torch.bfloat16).eval()
+    model = build_meta_model(model_config)
     model.load_state_dict(state_dict, strict=True, assign=True)
     state_dict.clear()
     del state_dict
