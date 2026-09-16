@@ -96,12 +96,12 @@ def rldriving() -> RLDrivingTrainer.Config:
             gamma=0.95,
             fps=fps,
             smooth_lat_cost=0.15,
-            smooth_long_cost=0.1,
-            curv_cost=100.0,
+            smooth_long_cost=0.05,
+            curv_rate_cost=20.0,
         ),
         warm_start_checkpoint=os.getenv(
             "RLDRIVING_WARM_START_CHECKPOINT",
-            "849a624a-8a7d-8946-bf04-86148e5e0ef8/56320",
+            "b9facbcc-4d47-410e-b3ce-dfcbad12ba92/56320",
         ),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=RLDrivingDataLoader.Config(
