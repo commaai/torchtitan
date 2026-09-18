@@ -281,7 +281,11 @@ class WorldModelTorchPackageRecipe:
         model = build_meta_model(model_config)
         try:
             return {
-                name: torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu")
+                name: torch.empty(
+                    tensor.shape,
+                    dtype=torch.float32 if name.startswith("plan_head.") else tensor.dtype,
+                    device="cpu",
+                )
                 for name, tensor in model.state_dict().items()
             }
         finally:
