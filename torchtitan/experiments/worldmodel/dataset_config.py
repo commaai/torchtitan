@@ -19,7 +19,7 @@ def _dataloader_config(
     split: str,
     dataset: str = DEFAULT_TRAIN_LIST,
     dataset_path: str | None = None,
-    shuffle_size: int = 50_000,
+    shuffle_size: int = 25_000,
     min_mixing: float = 0.5,
     num_writers: int = 2,
     num_readers: int = 4,
