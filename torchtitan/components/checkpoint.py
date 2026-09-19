@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import enum
+import os
 import queue
 import re
 import threading
@@ -25,7 +26,7 @@ from fsspec.core import split_protocol
 
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files_on_every_rank
-from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader, FsspecWriter
+from torch.distributed.checkpoint._fsspec_filesystem import FileSystem as FsspecFileSystem, FsspecReader, FsspecWriter
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
 from torch.distributed.checkpoint.stateful import Stateful
@@ -48,6 +49,16 @@ LR_SCHEDULER = "lr_scheduler"
 DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
 CHECKPOINT_UPLOAD_TIMEOUT_SECONDS = 600.0
+
+
+class _CheckpointWriter(FsspecWriter):
+    def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        super().reset()
+        if checkpoint_id:
+            # FsspecWriter.reset() otherwise recreates the filesystem without its timeout.
+            self.path = cast(FsspecFileSystem, self.fs).init_path(
+                checkpoint_id, timeout=CHECKPOINT_UPLOAD_TIMEOUT_SECONDS
+            )
 
 
 class AsyncMode(str, enum.Enum):
@@ -565,7 +576,7 @@ class CheckpointManager(Configurable):
             # `consolidate_safetensors_files_on_every_rank` is used later to manage
             # the multi-file merging process.
         else:
-            storage_writer = FsspecWriter(checkpoint_id, timeout=CHECKPOINT_UPLOAD_TIMEOUT_SECONDS)
+            storage_writer = _CheckpointWriter(checkpoint_id, timeout=CHECKPOINT_UPLOAD_TIMEOUT_SECONDS)
 
         # Execution Dispatch
         checkpoint_save_id = None if to_hf else checkpoint_id  # for HF the storage_writer handles the path
