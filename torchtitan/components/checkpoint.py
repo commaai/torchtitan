@@ -615,9 +615,8 @@ class CheckpointManager(Configurable):
     def _log_dcp_size(metadata: Metadata) -> None:
         total_bytes = sum(info.length for info in metadata.storage_data.values())
         if not dist.is_initialized() or dist.get_rank() == 0:
-            logger.info(
-                "total DCP checkpoint size: %.3f GB (%d shards).", total_bytes / 1e9, len(metadata.storage_data)
-            )
+            num_shards = len({info.relative_path for info in metadata.storage_data.values()})
+            logger.info("total DCP checkpoint size: %.3f GB (%d shards).", total_bytes / 1e9, num_shards)
 
         if total_bytes > CHECKPOINT_SIZE_LIMIT_BYTES:
             raise RuntimeError(
