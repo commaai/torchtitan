@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from torchtitan.components import fs
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
@@ -186,6 +187,16 @@ class ReporterV2Logger(BaseLogger):
         if not training_id:
             raise ValueError("REPORTERV2_TRAINING_ID must be set to use ReporterV2 logging")
         from reporterv2 import ReporterV2
+
+        if any(
+            fs.exists(f"{host.rstrip('/')}/{prefix}/{training_id}")
+            for prefix in ("runs", "checkpoint", "runs_timestamps")
+        ):
+            raise FileExistsError(
+                f"ReporterV2 run {training_id!r} already exists. "
+                f"checkpoint.initial_load_path={host.rstrip('/')}/checkpoint/{training_id}/<step> "
+                "checkpoint.initial_load_model_only=false. To resume a run."
+            )
 
         reporter_config = dict(config_dict or {})
         metrics_config = reporter_config.get("metrics", {})
@@ -498,6 +509,8 @@ class MetricsProcessor(Configurable):
             try:
                 reporterv2_logger = ReporterV2Logger(config_dict=config_dict, tag=tag)
                 logger_container.add_logger(reporterv2_logger)
+            except FileExistsError:
+                raise
             except Exception as e:
                 if "No module named 'reporterv2'" in str(e):
                     logger.error(
