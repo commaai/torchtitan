@@ -26,6 +26,7 @@ from fsspec.core import split_protocol
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files_on_every_rank
 from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader, FsspecWriter
+from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
 from torch.distributed.checkpoint.stateful import Stateful
@@ -48,6 +49,7 @@ LR_SCHEDULER = "lr_scheduler"
 DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
 CHECKPOINT_UPLOAD_TIMEOUT_SECONDS = 600.0
+CHECKPOINT_SIZE_LIMIT_BYTES = 100_000_000_000
 
 
 class AsyncMode(str, enum.Enum):
@@ -515,7 +517,7 @@ class CheckpointManager(Configurable):
         async_mode: AsyncMode,
         enable_garbage_collection: bool = False,
         to_hf: bool = False,
-    ) -> Future | AsyncSaveResponse | None:
+    ) -> Future | AsyncSaveResponse | Metadata:
         """Execute the DCP saving process.
 
         This method orchestrates the state_dict transformation (e.g., to HuggingFace
@@ -531,13 +533,13 @@ class CheckpointManager(Configurable):
                 state_dict to be compatible with safetensors and HF model definitions.
 
         Returns:
-            - None: If saved synchronously (AsyncMode.DISABLED).
+            - Metadata: If saved synchronously (AsyncMode.DISABLED).
             - Future: If AsyncMode.ASYNC is used (tracks disk I/O).
             - AsyncSaveResponse: If AsyncMode.ASYNC_WITH_PINNED_MEM is used
               (tracks both staging and disk I/O).
         """
 
-        ret: Future | AsyncSaveResponse | None = None
+        ret: Future | AsyncSaveResponse | Metadata
 
         storage_writer: StorageWriter | None = None
         checkpoint_save_id: str | None = None
@@ -592,6 +594,8 @@ class CheckpointManager(Configurable):
                 storage_writer=storage_writer,
                 checkpoint_id=checkpoint_save_id,
             )
+            if not to_hf:
+                self._log_dcp_size(ret)
 
         # Post-Processing
         if to_hf and fqn_to_index_mapping:
@@ -606,6 +610,19 @@ class CheckpointManager(Configurable):
             GarbageCollection.collect("GC collection invoked by checkpointer.")
 
         return ret
+
+    @staticmethod
+    def _log_dcp_size(metadata: Metadata) -> None:
+        total_bytes = sum(info.length for info in metadata.storage_data.values())
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            num_shards = len({info.relative_path for info in metadata.storage_data.values()})
+            logger.info("total DCP checkpoint size: %.3f GB (%d shards).", total_bytes / 1e9, num_shards)
+
+        if total_bytes > CHECKPOINT_SIZE_LIMIT_BYTES:
+            raise RuntimeError(
+                f"DCP checkpoint shards exceed the size limit: "
+                f"{total_bytes / 1e9:.3f} > {CHECKPOINT_SIZE_LIMIT_BYTES / 1e9:.3f} GB."
+            )
 
     def dcp_load(
         self,
@@ -889,8 +906,9 @@ class CheckpointManager(Configurable):
         if self.async_mode == AsyncMode.DISABLED:
             raise RuntimeError("self.save_future is not None, but self.async_mode is DISABLED.")
 
-        self.save_future.result()
+        metadata = self.save_future.result()
         self.save_future = None
+        self._log_dcp_size(metadata)
 
     def _async_wait(self) -> None:
         """Compatibility wrapper for subclasses that predate maybe_wait_for_saving."""
