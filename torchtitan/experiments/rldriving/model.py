@@ -283,6 +283,22 @@ def parallelize_rldriving(
     def shard(module: nn.Module, reshard: bool = reshard_after_forward) -> None:
         fully_shard(module, **fsdp_config, reshard_after_forward=reshard)
 
+    hydra_fsdp_config = {
+        **fsdp_config,
+        "mp_policy": MixedPrecisionPolicy(
+            param_dtype=torch.float32, reduce_dtype=torch.float32, cast_forward_inputs=True
+        ),
+    }
+    for hydra in (
+        model.actor.temporal_hydra,
+        model.target_actor.temporal_hydra,
+        model.critic.critic1.q_hydra,
+        model.critic.critic2.q_hydra,
+        model.target_critic.critic1.q_hydra,
+        model.target_critic.critic2.q_hydra,
+    ):
+        fully_shard(hydra, **hydra_fsdp_config, reshard_after_forward=reshard_after_forward)
+
     for temporal_summarizer in (
         model.actor.temporal_summarizer,
         model.critic.critic1.temporal_summarizer,
