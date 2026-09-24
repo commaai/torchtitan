@@ -467,6 +467,18 @@ class WorldModelForInference(WorldModel):
         self.max_seq_length = -1
         self.cache_dtype = None
 
+    def _get_pose_guidance(self, device):
+        if not hasattr(self, "_pose_guidance"):
+            import torch_package_importer
+            from .pose_guidance import PoseGuidance
+
+            self._pose_guidance = PoseGuidance(
+                torch_package_importer.load_binary("assets", "posenet_graph.pt"),
+                torch_package_importer.load_binary("assets", "pose_decoder.pt2"),
+                device,
+            )
+        return self._pose_guidance
+
     @torch.inference_mode()
     def forward_n_steps(
         self,
@@ -484,6 +496,7 @@ class WorldModelForInference(WorldModel):
         scheduler: RFScheduler,
         steps: int,
         return_trajectory: bool = False,
+        pose_guidance: dict | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor | None]:
         device = x.device
         batch, frames = x.shape[:2]
@@ -514,7 +527,20 @@ class WorldModelForInference(WorldModel):
                 unconditional, conditional = velocity.chunk(2, dim=1)
                 velocity = unconditional + cfg * (conditional - unconditional)
             model_output["sample"] = velocity
-            x = scheduler.step(velocity, step_idx, x).to(x.dtype)
+            correction = 0.
+            if pose_guidance is not None:
+                time = float(scheduler.timesteps[step_idx])
+                if (step_idx % pose_guidance["every"] == 0
+                        and pose_guidance["end"] <= time <= pose_guidance["start"]):
+                    clean = x.float() + time * velocity.float()
+                    correction = pose_guidance["helper"].correct(
+                        clean, pose_guidance["previous"], pose_guidance["target"],
+                        mean=self.config.compressor_mean, std=self.config.compressor_std,
+                        max_rms=pose_guidance["strength"], rate=pose_guidance["fps"],
+                        scales=(.2, .1, .1, .01, .01, .0035),
+                        method=pose_guidance["method"],
+                    )
+            x = (scheduler.step(velocity, step_idx, x) + correction).to(x.dtype)
             if trajectory is not None:
                 trajectory.append(x.clone())
 
@@ -558,6 +584,13 @@ class WorldModelForInference(WorldModel):
         cfg: float = 0.0,
         return_trajectory: bool = False,
         kv_cache_dtype: KVCacheDType | None = None,
+        initial_noise_level: float | None = None,
+        pose_guidance_strength: float = 0.,
+        pose_guidance_start: float = .5,
+        pose_guidance_end: float = .02,
+        pose_guidance_every: int = 3,
+        pose_guidance_fps: float = 5.,
+        pose_guidance_method: str = "gradient",
         **scheduler_kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         self._ensure_plan_head_float32()
@@ -612,6 +645,11 @@ class WorldModelForInference(WorldModel):
         scheduler = RFScheduler(steps=steps, inference_schedule=inference_schedule, **scheduler_kwargs).to(
             device=device
         )
+        if initial_noise_level is not None:
+            if not 0.0 <= initial_noise_level <= 1.0:
+                raise ValueError("initial_noise_level must be between 0 and 1")
+            scheduler.timesteps.mul_(initial_noise_level)
+            scheduler.dt.mul_(initial_noise_level)
         prefix_tokens = num_prefill_frames * self.config.num_spatial_patches
         decode_tokens = (frames - num_prefill_frames) * self.config.num_spatial_patches
         packed_decode_tokens = decode_tokens * (2 if cfg > 0.0 else 1)
@@ -632,6 +670,19 @@ class WorldModelForInference(WorldModel):
             cfg > 0.0,
         )
 
+        pose_guidance = None
+        if pose_guidance_strength > 0.:
+            if frames - num_prefill_frames != 1 or num_prefill_frames < 1:
+                raise ValueError("Pose guidance requires one generated frame and a previous context frame")
+            if pose_guidance_every < 1 or pose_guidance_fps <= 0.:
+                raise ValueError("Pose guidance interval and fps must be positive")
+            helper = self._get_pose_guidance(device)
+            previous = helper.preprocess(latents[:, num_prefill_frames - 1].float())
+            target = torch.cat((augments_pos_ref_augment[:, -1], ref_augment_from_augments_euler[:, -1]), dim=-1)
+            pose_guidance = dict(helper=helper, previous=previous, target=target,
+                                 strength=pose_guidance_strength, start=pose_guidance_start,
+                                 end=pose_guidance_end, every=pose_guidance_every, fps=pose_guidance_fps,
+                                 method=pose_guidance_method)
         latents[:, :num_prefill_frames] = self.scale_latents(latents[:, :num_prefill_frames])
         self._prefill(
             latents=latents,
@@ -646,6 +697,10 @@ class WorldModelForInference(WorldModel):
         )
 
         decode_frames = latents[:, num_prefill_frames:]
+        if initial_noise_level is not None:
+            decode_frames = scheduler.add_noise(
+                self.scale_latents(decode_frames), torch.randn_like(decode_frames), scheduler.timesteps[0],
+            ).to(dtype)
         num_cfg_copies = 2 if cfg > 0.0 else 1
         # CFG copies repeat the trained positions but need unique cache slots.
         semantic_pos = torch.arange(prefix_tokens, prefix_tokens + decode_tokens, device=device).repeat(num_cfg_copies)
@@ -664,6 +719,7 @@ class WorldModelForInference(WorldModel):
             scheduler=scheduler,
             steps=steps,
             return_trajectory=return_trajectory,
+            pose_guidance=pose_guidance,
         )
 
         if not is_meta and not all(torch.isfinite(value).all() for value in model_output.values()):
