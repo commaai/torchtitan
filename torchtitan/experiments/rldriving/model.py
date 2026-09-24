@@ -53,6 +53,7 @@ class Critic(Module):
     class Config(Module.Config):
         temporal_summarizer: TemporalSummarizer.Config
         history_idxs: tuple[int, ...]
+        action_t_encoder: LinearEncoder.Config
         action_encoder: LinearEncoder.Config
         post_action_mlp1: PathMLP.Config
         post_action_mlp2: PathMLP.Config
@@ -62,6 +63,7 @@ class Critic(Module):
         super().__init__()
         self.temporal_summarizer = config.temporal_summarizer.build()
         self.history_idxs = config.history_idxs
+        self.action_t_encoder = config.action_t_encoder.build()
         self.action_encoder = config.action_encoder.build()
         self.post_action_mlp1 = config.post_action_mlp1.build()
         self.post_action_mlp2 = config.post_action_mlp2.build()
@@ -74,7 +76,9 @@ class Critic(Module):
             features_BTSD[:, self.history_idxs],
             inputs[ModelInputs.DESIRE].to(dtype),
             inputs[ModelInputs.TRAFFIC][:, -1].to(dtype),
-            inputs[ModelInputs.ACTION_T][:, -1].to(dtype),
+        )
+        critic_features_BD = critic_features_BD + self.action_t_encoder(
+            inputs[ModelInputs.ACTION_T][:, -1].to(dtype)
         )
         critic_features_BD = critic_features_BD + self.post_action_mlp1(critic_features_BD)
         critic_features_BD = critic_features_BD + self.action_encoder(action.to(dtype))
@@ -89,6 +93,8 @@ def actor_config() -> TemporalPolicy.Config:
 
 
 def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
+    if actor.temporal_hydra.action_t_encoder is None:
+        raise ValueError("RL actor must have an action_t encoder")
     dim = actor.temporal_summarizer.temporal_pos_embedding.embedding_dim
     hidden = 256 * math.ceil(2 * dim / 256)
     post_action_mlp = PathMLP.Config(
@@ -101,6 +107,7 @@ def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
     return Critic.Config(
         temporal_summarizer=copy.deepcopy(actor.temporal_summarizer),
         history_idxs=actor.history_idxs,
+        action_t_encoder=copy.deepcopy(actor.temporal_hydra.action_t_encoder),
         action_encoder=LinearEncoder.Config(
             in_layer=Linear.Config(in_features=ACTION_LEN, out_features=dim, bias=True),
             out_layer=Linear.Config(in_features=dim, out_features=dim, bias=False),
@@ -203,7 +210,7 @@ class RLDrivingModel(BaseModel):
             ModelInputs.ACTION_T: (
                 batch_size,
                 temporal_len,
-                summarizer.action_t_encoder.in_layer.in_features,
+                config.critic.action_t_encoder.in_layer.in_features,
             ),
         }
 
@@ -222,11 +229,11 @@ class RLDrivingModel(BaseModel):
 
     @torch.no_grad()
     def warm_start_critics_from_actor(self) -> None:
-        for destination in (
-            self.critic.critic1.temporal_summarizer,
-            self.critic.critic2.temporal_summarizer,
-        ):
-            _copy_model_state(self.actor.temporal_summarizer, destination)
+        action_t_encoder = self.actor.temporal_hydra.action_t_encoder
+        assert action_t_encoder is not None
+        for critic in (self.critic.critic1, self.critic.critic2):
+            _copy_model_state(self.actor.temporal_summarizer, critic.temporal_summarizer)
+            _copy_model_state(action_t_encoder, critic.action_t_encoder)
         self.sync_targets()
 
     def train(self, mode: bool = True) -> RLDrivingModel:
