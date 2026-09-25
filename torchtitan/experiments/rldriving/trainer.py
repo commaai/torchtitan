@@ -24,7 +24,6 @@ from xx.training.rldriving.dataloader import RolloutContext
 
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -42,6 +41,7 @@ from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
 from .model import RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
+from .warm_start import load_path_actor
 
 
 Batch = tuple[
@@ -166,6 +166,9 @@ class RLDrivingTrainer(Trainer):
                 raise ValueError("trainer and dataloader steps_per_epoch must match")
             if self.ema_tau < 1.0:
                 raise ValueError("ema_tau must be at least 1")
+            self.dataloader.temporal_len = RLDrivingModel.input_shapes(self.model_spec.model)["features"][1]
+            if self.dataloader.pre_worldmodel_warmup_seconds * self.fps < self.dataloader.temporal_len:
+                raise ValueError("Rollout warmup must cover the complete input history and initial vision frame")
 
     config: Config  # pyrefly: ignore [bad-override]
     loss_fn: RLDrivingLoss  # pyrefly: ignore [bad-override]
@@ -192,9 +195,8 @@ class RLDrivingTrainer(Trainer):
         )
         self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
-        dcp.load(
-            {"temporal_policy": self.model.actor},
-            storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
+        load_path_actor(
+            self.model.actor, FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file())
         )
         self.model.warm_start_critics_from_actor()
 

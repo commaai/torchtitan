@@ -13,6 +13,7 @@ from typing import Any, cast
 from xx.training.path.model import Hydra, LinearEncoder, PathHead, PathMLP, TemporalPolicy, TemporalSummarizer
 from xx.training.path.model_config import TEMPORAL_HEADS, temporal_policy_config
 from xx.training.path.model_constants import ACTION_LEN, ModelInputs
+from xx.training.rldriving.context import ATTENTION_WINDOW_FRAMES, FEATURE_HISTORY_FRAMES, TEMPORAL_LAYERS
 
 import torch
 import torch.nn as nn
@@ -22,9 +23,9 @@ from torch.utils.flop_counter import FlopCounterMode
 
 from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig, FullAC
 from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
-from torchtitan.models.common import LayerNorm, Linear
+from torchtitan.models.common import Embedding, LayerNorm, Linear
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
@@ -75,7 +76,10 @@ class Critic(Module):
         critic_features_BD = self.temporal_summarizer(
             features_BTSD[:, self.history_idxs],
             inputs[ModelInputs.DESIRE].to(dtype),
-            inputs[ModelInputs.TRAFFIC][:, -1].to(dtype),
+            (
+                inputs[ModelInputs.TRAFFIC][:, self.history_idxs]
+                if self.temporal_summarizer.streaming else inputs[ModelInputs.TRAFFIC][:, -1]
+            ).to(dtype),
         )
         critic_features_BD = critic_features_BD + self.action_t_encoder(
             inputs[ModelInputs.ACTION_T][:, -1].to(dtype)
@@ -87,9 +91,33 @@ class Critic(Module):
         return q_B1.squeeze(-1).clone()
 
 
-def actor_config() -> TemporalPolicy.Config:
+def actor_config(*, long_context: bool = True) -> TemporalPolicy.Config:
     action_heads = tuple(head for head in TEMPORAL_HEADS if head.name == ACTION_HEAD_NAME)
-    return temporal_policy_config(heads=action_heads, dropout=0.0, dense_training_outputs=False)
+    config = temporal_policy_config(heads=action_heads, dropout=0.0, dense_training_outputs=False)
+    if not long_context:
+        return config
+    summary = config.temporal_summarizer
+    if len(summary.transformer.layers) != TEMPORAL_LAYERS:
+        raise ValueError("Update the RL context budget when changing transformer depth")
+    config.history_idxs = tuple(range(-FEATURE_HISTORY_FRAMES, 0))
+    summary.temporal_size = FEATURE_HISTORY_FRAMES
+    summary.desire_window_starts = tuple(range(FEATURE_HISTORY_FRAMES))
+    summary.streaming = True
+    summary.temporal_pos_embedding.num_embeddings = 1
+    summary.attention_sink = Embedding.Config(
+        num_embeddings=1, embedding_dim=summary.temporal_pos_embedding.embedding_dim,
+        param_init={"weight": torch.nn.init.zeros_},
+    )
+    for layer in summary.transformer.layers:
+        attention = layer.attention
+        attention.window_frames = ATTENTION_WINDOW_FRAMES
+        attention.spatial_size = summary.spatial_size
+        attention.has_sink = True
+        attention.relative_position_bias = Embedding.Config(
+            num_embeddings=ATTENTION_WINDOW_FRAMES + 1, embedding_dim=attention.n_head,
+            param_init={"weight": torch.nn.init.zeros_},
+        )
+    return config
 
 
 def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
@@ -156,8 +184,8 @@ class RLDrivingModel(BaseModel):
             for name, degree in unsupported.items():
                 if degree > 1:
                     raise ValueError(f"rldriving does not support {name}")
-            if config.activation_checkpoint is not None:
-                raise ValueError("rldriving does not support activation checkpointing")
+            if config.activation_checkpoint is not None and not isinstance(config.activation_checkpoint, FullAC.Config):
+                raise ValueError("rldriving supports full activation checkpointing")
 
         def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
             rldriving_model = cast(RLDrivingModel, model)
@@ -255,6 +283,20 @@ def _copy_model_state(source: nn.Module, destination: nn.Module) -> None:
     set_model_state_dict(destination, source_state, options=options)
 
 
+def _apply_activation_checkpointing(model: RLDrivingModel, config: FullAC.Config, *, dump_folder: str = "") -> None:
+    policy = config.build(dump_folder=dump_folder)
+
+    def wrap(module: nn.Module, fqn: str) -> nn.Module:
+        return policy._wrap_block(module, base_fqn=fqn)
+
+    for name, module in (
+        ("actor", model.actor), ("critic.critic1", model.critic.critic1), ("critic.critic2", model.critic.critic2),
+    ):
+        module.temporal_summarizer.transformer.apply_activation_checkpointing(
+            wrap, f"{name}.temporal_summarizer.transformer"
+        )
+
+
 def parallelize_rldriving(
     model: RLDrivingModel,
     *,
@@ -265,8 +307,13 @@ def parallelize_rldriving(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> RLDrivingModel:
+    if ac_config is not None:
+        if not isinstance(ac_config, FullAC.Config):
+            raise ValueError("rldriving supports full activation checkpointing")
+        _apply_activation_checkpointing(model, ac_config, dump_folder=dump_folder)
     if compile_config.enable and "model" in compile_config.components:
         torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
         model.actor.compile(backend=compile_config.backend)
         model.critic.compile(backend=compile_config.backend)
         model.target_actor.compile(backend=compile_config.backend)

@@ -14,11 +14,14 @@ from xx.ml_tools.constants.model import SUPERCOMBO_FPS
 from xx.release_tests.lib.base_report import BaseReportConfig, ReportFormat
 from xx.training.lib.torchtitan.report_runner import Report
 from xx.training.rldriving.test import MODEL_REPORTS
+from xx.training.rldriving.context import PATH_CHECKPOINT
+from xx.training.rldriving.kv_cache import cached_input_shapes
 
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.components.tokenizer import NoOpTokenizer
 from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .dataset import RLDrivingDataLoader
@@ -101,7 +104,7 @@ def rldriving() -> RLDrivingTrainer.Config:
         ),
         warm_start_checkpoint=os.getenv(
             "RLDRIVING_WARM_START_CHECKPOINT",
-            "b9facbcc-4d47-410e-b3ce-dfcbad12ba92/56320",
+            PATH_CHECKPOINT,
         ),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=RLDrivingDataLoader.Config(
@@ -170,7 +173,7 @@ def rldriving() -> RLDrivingTrainer.Config:
         train_step_barrier_timeout_seconds=60 * 60,
         ema_tau=128.0,
         fps=fps,
-        activation_checkpoint=None,
+        activation_checkpoint=FullAC.Config(),
         compile=CompileConfig(enable=True, components=["model"]),
         metrics=MetricsProcessor.Config(
             log_freq=16,
@@ -190,7 +193,10 @@ def _checkpoint_config(
     folder: str,
     interval: int,
 ) -> RLDrivingOnnxCheckpointManager.Config:
-    input_shapes = RLDrivingModel.input_shapes(model)
+    input_shapes = (
+        cached_input_shapes(model.actor)
+        if model.actor.temporal_summarizer.streaming else RLDrivingModel.input_shapes(model)
+    )
     return RLDrivingOnnxCheckpointManager.Config(
         keep_latest_k=0,
         enable=True,

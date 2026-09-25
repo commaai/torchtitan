@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import cast
 from xx.training.lib.torchtitan.onnx_checkpoint import OnnxCheckpointManager
+from xx.training.rldriving.kv_cache import CachedActionPolicy, cached_input_shapes
 
 import torch
 import torch.nn as nn
@@ -41,6 +42,11 @@ class RLDrivingOnnxCheckpointManager(OnnxCheckpointManager):
 
     def _export_onnx(self, model: nn.Module, path: str) -> None:
         model = cast(RLDrivingModel, model)
+        if model.target_actor.temporal_summarizer.streaming:
+            shapes = cached_input_shapes(model.target_actor.config)
+            inputs = {name: torch.zeros(shape) for name, shape in shapes.items()}
+            self._export_one(CachedActionPolicy(model.target_actor).eval(), inputs, path)
+            return
         inputs = dict(zip(self.input_names, self._build_onnx_inputs()))
         self._export_one(
             _TargetActorOnnxModel(model).eval(),

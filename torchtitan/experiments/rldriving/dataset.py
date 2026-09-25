@@ -15,6 +15,7 @@ from xx.comma_data.constants import BASE_DIR_GT
 from xx.common.basedir import XX_BASEDIR
 from xx.training.lib.dataloader import DataLoader
 from xx.training.rldriving.config import DatasetConfig
+from xx.training.rldriving.context import temporal_input_length, WARMUP_SECONDS
 from xx.training.rldriving.dataloader import get_dataset, RolloutContext
 
 import torch
@@ -28,6 +29,7 @@ class RLDrivingDataLoader(BaseDataLoader):
     class Config(BaseDataLoader.Config):
         dataset: str
         fps: int
+        temporal_len: int = temporal_input_length()
         training_id: str = ""
         shuffle_size: int = 50_000
         min_mixing: float = 0.9
@@ -49,7 +51,7 @@ class RLDrivingDataLoader(BaseDataLoader):
 
         zero_desire: bool = False
         photo_noise_model: Literal["NONE", "VISION"] = "VISION"
-        pre_worldmodel_warmup_seconds: int = 7
+        pre_worldmodel_warmup_seconds: int = WARMUP_SECONDS
         min_simulation_seconds: int = 6
         max_simulation_seconds: int = 7
         worldmodel_future_size_seconds: int = 1
@@ -98,6 +100,7 @@ class RLDrivingDataLoader(BaseDataLoader):
             save_cache=config.save_cache,
             load_caches=list(config.load_caches),
             fps=config.fps,
+            temporal_len=config.temporal_len,
             zero_desire=config.zero_desire,
             photo_noise_model=config.photo_noise_model,
             pre_worldmodel_warmup_seconds=config.pre_worldmodel_warmup_seconds,

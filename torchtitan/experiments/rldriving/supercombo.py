@@ -9,6 +9,7 @@ from types import MethodType
 from xx.training.path.model import PathSelfAttention
 from xx.training.path.model_config import model_config
 from xx.training.path.model_constants import ModelInputs, SPATIAL_SIZE
+from xx.training.rldriving.kv_cache import cached_policy_step, KV_STATE, VALID_STATE
 
 import torch
 
@@ -48,14 +49,18 @@ def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
     q, k, v = (value.squeeze(0) for value in qkv.permute(2, 0, 3, 1, 4).split(1))
     q, k = self.q_norm(q), self.k_norm(k)
     scores = (q @ k.transpose(-2, -1)) * self.head_dim**-0.5
-    x = (scores.masked_fill(~self._supercombo_mask, float("-inf")).softmax(-1) @ v).transpose(1, 2)
+    if self.window_frames is None:
+        scores = scores.masked_fill(~self._supercombo_mask, float("-inf"))
+    else:
+        scores = scores + self.attention_bias(t, x.device, q.dtype)[None]
+    x = (scores.softmax(-1) @ v).transpose(1, 2)
     return self.dropout(self.c_proj(x.reshape(b, t, self.n_head * self.head_dim)))
 
 
 # some micro optimizations can be made but not worth it for now
 # there are some Unsqueeze -> Gather that can be bipassed (traffic_convention, action_t)
 class Supercombo(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, *, long_context: bool = True) -> None:
         super().__init__()
         config = model_config("convnext_xlarge")
         config.temporal_policy.temporal_summarizer.dense_training_outputs = False
@@ -67,7 +72,7 @@ class Supercombo(torch.nn.Module):
         self.vision.encoder.norm_pre = _TinygradContiguous()
         self.point_policy = config.point_policy.build()
         self.off_policy = config.temporal_policy.build()
-        self.on_policy = actor_config().build()
+        self.on_policy = actor_config(long_context=long_context).build()
         output_size = SPATIAL_SIZE * self.vision.config.vision_features + sum(
             hydra.final_layer[name].out_features
             for hydra, names in (
@@ -87,17 +92,33 @@ class Supercombo(torch.nn.Module):
                 attention.register_buffer("_supercombo_mask", mask.tril(), persistent=False)
                 attention.forward = MethodType(_naive_attention, attention)
 
-    def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor | dict[str, torch.Tensor]:
         current = self.vision(inputs)
         features = torch.cat((inputs["features_buffer"], current[:, None]), dim=1)
         outputs = self.point_policy(current.mean(dim=1))
+        cache_outputs = {}
         for policy, names in ((self.off_policy, OFF_POLICY_OUTPUT_ORDER), (self.on_policy, ON_POLICY_OUTPUT_ORDER)):
-            policy_outputs = policy(
-                features,
-                inputs[ModelInputs.DESIRE],
-                inputs[ModelInputs.TRAFFIC][:, None],
-                inputs[ModelInputs.ACTION_T][:, None],
-            )
+            summary = policy.temporal_summarizer
+            temporal_len = max(summary.desire_window_starts) + summary.desire_window_len
+            if policy is self.on_policy and KV_STATE in inputs:
+                policy_outputs = cached_policy_step(policy, {
+                    ModelInputs.FEATURES: current[:, None],
+                    ModelInputs.DESIRE: inputs[ModelInputs.DESIRE][:, -summary.desire_window_len:],
+                    ModelInputs.TRAFFIC: inputs[ModelInputs.TRAFFIC][:, None],
+                    ModelInputs.ACTION_T: inputs[ModelInputs.ACTION_T][:, None],
+                    KV_STATE: inputs[KV_STATE], VALID_STATE: inputs[VALID_STATE],
+                })
+                cache_outputs = {
+                    name: value for name, value in policy_outputs.items() if name.startswith('next_state_')
+                }
+            else:
+                policy_outputs = policy(
+                    features,
+                    inputs[ModelInputs.DESIRE][:, -temporal_len:],
+                    inputs[ModelInputs.TRAFFIC][:, None].expand(-1, temporal_len, -1),
+                    inputs[ModelInputs.ACTION_T][:, None],
+                )
             outputs.update({name: policy_outputs[name] for name in names})
         outputs["hidden_state"] = current.detach().flatten(1)
-        return torch.cat([outputs[name] for name in OUTPUT_ORDER] + [self.pad], dim=1)
+        packed = torch.cat([outputs[name] for name in OUTPUT_ORDER] + [self.pad], dim=1)
+        return {"outputs": packed, **cache_outputs} if cache_outputs else packed
