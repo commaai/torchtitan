@@ -228,13 +228,16 @@ class WorldModelForInference(WorldModel):
         default_kv_cache_dtype: KVCacheDType = FP8_KV_CACHE_DTYPE,
     ):
         super().__init__(config)
-        for block in self.blocks:
+        for block in self._attention_blocks():
             block.attn.__class__ = InferenceSelfAttention
         self.inference_masks: dict[tuple[str, int, int, bool], tuple[TensorOrMask | None, TensorOrMask | None]] = {}
         self.max_batch_size = -1
         self.max_seq_length = -1
         self.cache_dtype: torch.dtype | None = None
         self.default_kv_cache_dtype = default_kv_cache_dtype
+
+    def _attention_blocks(self):
+        return (*self.blocks, *getattr(self.plan_head, "blocks", ()))
 
     @staticmethod
     def _cast_plan_head_input_to_float32(
@@ -247,21 +250,33 @@ class WorldModelForInference(WorldModel):
         if self.plan_head is None or getattr(self, "_plan_head_fp32_ready", False):
             return
 
-        self.plan_head.float()
-        self.plan_head.register_forward_pre_hook(self._cast_plan_head_input_to_float32)
+        if self.config.plan_head_transformer:
+            for module in (
+                self.plan_head.head,
+                self.plan_head.scale_layer,
+                self.plan_head.action_head,
+                self.plan_head.action_scale,
+            ):
+                module.float()
+        else:
+            self.plan_head.float()
+            self.plan_head.register_forward_pre_hook(self._cast_plan_head_input_to_float32)
         self._plan_head_fp32_ready = True
 
     @staticmethod
     def input_shapes(config: WorldModel.Config, batch_size: int = 1) -> dict[str, tuple[int, ...]]:
         frames, height, width = config.input_size
         pose_size = config.pose_size // 2
-        return {
+        shapes: dict[str, tuple[int, ...]] = {
             "latents": (batch_size, frames, config.in_channels, height, width),
             "augments_pos_ref_augment": (batch_size, frames, pose_size),
             "ref_augment_from_augments_euler": (batch_size, frames, pose_size),
             "pose_mask": (batch_size, frames),
             "fidxs": (batch_size, frames),
         }
+        if config.plan_head_transformer or config.plan_head_action:
+            shapes["action_t"] = (batch_size, 2)
+        return shapes
 
     @staticmethod
     def input_dtypes(dtype: torch.dtype = torch.bfloat16) -> dict[str, torch.dtype]:
@@ -271,6 +286,7 @@ class WorldModelForInference(WorldModel):
             "ref_augment_from_augments_euler": dtype,
             "pose_mask": torch.int64,
             "fidxs": torch.int64,
+            "action_t": dtype,
         }
 
     @classmethod
@@ -318,7 +334,7 @@ class WorldModelForInference(WorldModel):
 
     def compile_for_inference(self) -> None:
         self._ensure_plan_head_float32()
-        for block in self.blocks:
+        for block in self._attention_blocks():
             block.compile(mode="max-autotune-no-cudagraphs")
 
     def quantize_for_inference(self, weight_format: WeightFormat = "fp8_nvfp4") -> None:
@@ -433,7 +449,7 @@ class WorldModelForInference(WorldModel):
             return False
         return all(
             (cache := block.attn.kv_cache) is not None and cache.dtype == dtype and cache.k_cache.device == device
-            for block in self.blocks
+            for block in self._attention_blocks()
         )
 
     def setup_caches(
@@ -450,7 +466,7 @@ class WorldModelForInference(WorldModel):
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         self.cache_dtype = dtype
-        for block in self.blocks:
+        for block in self._attention_blocks():
             block.attn.kv_cache = KVCache(
                 max_batch_size,
                 max_seq_length,
@@ -461,7 +477,7 @@ class WorldModelForInference(WorldModel):
             )
 
     def cleanup_caches(self) -> None:
-        for block in self.blocks:
+        for block in self._attention_blocks():
             block.attn.kv_cache = None
         self.max_batch_size = -1
         self.max_seq_length = -1
@@ -484,6 +500,7 @@ class WorldModelForInference(WorldModel):
         scheduler: RFScheduler,
         steps: int,
         return_trajectory: bool = False,
+        action_t: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor | None]:
         device = x.device
         batch, frames = x.shape[:2]
@@ -508,6 +525,7 @@ class WorldModelForInference(WorldModel):
                 cache_pos=cache_pos,
                 cache_seq_length=cache_seq_length,
                 input_mask=input_mask,
+                action_t=action_t,
             )
             velocity = model_output["sample"]
             if cfg > 0.0:
@@ -536,8 +554,11 @@ class WorldModelForInference(WorldModel):
                 cache_pos=cache_pos,
                 cache_seq_length=cache_seq_length,
                 input_mask=input_mask,
+                action_t=action_t,
             )
             model_output["plan"] = clean_output["plan"]
+            if "action" in clean_output:
+                model_output["action"] = clean_output["action"]
 
         return x, model_output, torch.stack(trajectory, dim=1) if trajectory is not None else None
 
@@ -558,6 +579,7 @@ class WorldModelForInference(WorldModel):
         cfg: float = 0.0,
         return_trajectory: bool = False,
         kv_cache_dtype: KVCacheDType | None = None,
+        action_t: torch.Tensor | None = None,
         **scheduler_kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         self._ensure_plan_head_float32()
@@ -594,12 +616,15 @@ class WorldModelForInference(WorldModel):
                 ref_augment_from_augments_euler,
                 pose_mask,
                 fidxs,
+                action_t=action_t,
             )
             start = max(0, num_prefill_frames - 1)
             output_latents = self.unscale_latents(latents[:, start:])
             outputs = {"latents": output_latents}
             if "plan" in model_output:
                 outputs["plan"] = model_output["plan"]
+            if "action" in model_output:
+                outputs["action"] = model_output["action"]
             if return_trajectory:
                 outputs["trajectory"] = output_latents.unsqueeze(1)
             return outputs
@@ -643,6 +668,7 @@ class WorldModelForInference(WorldModel):
             num_prefill_frames=num_prefill_frames,
             cache_seq_length=cache_seq_length,
             prefill_mask=prefill_mask,
+            action_t=action_t,
         )
 
         decode_frames = latents[:, num_prefill_frames:]
@@ -664,6 +690,7 @@ class WorldModelForInference(WorldModel):
             scheduler=scheduler,
             steps=steps,
             return_trajectory=return_trajectory,
+            action_t=action_t,
         )
 
         if not is_meta and not all(torch.isfinite(value).all() for value in model_output.values()):
@@ -673,6 +700,8 @@ class WorldModelForInference(WorldModel):
         outputs = {"latents": self.unscale_latents(decode_frames)}
         if "plan" in model_output:
             outputs["plan"] = model_output["plan"]
+        if "action" in model_output:
+            outputs["action"] = model_output["action"]
         if trajectory is not None:
             outputs["trajectory"] = self.unscale_latents(trajectory)
         return outputs
@@ -689,6 +718,7 @@ class WorldModelForInference(WorldModel):
         num_prefill_frames: int,
         cache_seq_length: int,
         prefill_mask: TensorOrMask | None,
+        action_t: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if num_prefill_frames <= 0:
             return {}
@@ -710,6 +740,7 @@ class WorldModelForInference(WorldModel):
             cache_pos=prefix_pos,
             cache_seq_length=cache_seq_length,
             input_mask=prefill_mask,
+            action_t=action_t,
         )
 
 

@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import math
@@ -41,6 +47,7 @@ def compute_worldmodel_losses(
     targets: dict[str, torch.Tensor],
     *,
     plan_loss_weight: float,
+    action_loss_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     loss: torch.Tensor | None = None
     terms: dict[str, torch.Tensor] = {}
@@ -66,6 +73,16 @@ def compute_worldmodel_losses(
         terms["plan_loss"] = plan_loss.detach()
         terms["plan_mse"] = plan_mse.detach()
 
+    if "action" in outputs:
+        pred = outputs["action"].float()
+        target = targets["action"].to(device=pred.device, dtype=torch.float32)
+        values, err, mask = laplacian_density_loss(target, pred)
+        action_loss = values.mean(dim=-1)
+        weighted = action_loss_weight * action_loss
+        loss = weighted if loss is None else loss + weighted
+        terms["action_loss"] = action_loss.detach()
+        terms["action_mse"] = (err.square() * mask).sum(-1).div(mask.sum(-1).clamp_min(1)).detach()
+
     if loss is None:
         raise RuntimeError("worldmodel produced no trainable outputs")
     terms["loss"] = loss.detach()
@@ -78,6 +95,7 @@ class WorldModelLoss(BaseLoss):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLoss.Config):
         plan_loss_weight: float
+        action_loss_weight: float = 1.0
 
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
         plan_loss_weight = config.plan_loss_weight
@@ -90,6 +108,7 @@ class WorldModelLoss(BaseLoss):
                 outputs,
                 targets,
                 plan_loss_weight=plan_loss_weight,
+                action_loss_weight=config.action_loss_weight,
             )
 
         self.fn = loss_fn
