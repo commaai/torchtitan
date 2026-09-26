@@ -274,7 +274,7 @@ class WorldModelForInference(WorldModel):
             "pose_mask": (batch_size, frames),
             "fidxs": (batch_size, frames),
         }
-        if config.plan_head_transformer or config.plan_head_action:
+        if config.plan_head_transformer:
             shapes["action_t"] = (batch_size, 2)
         return shapes
 

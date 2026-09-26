@@ -611,22 +611,12 @@ class PlanHead(nn.Module):
         )
         self.head = linears.head.build()
         self.scale_layer = ScaleLayer(PLAN_SIZE)
-        self.action_t_encoder = nn.Linear(2, config.plan_head.n_embd) if config.plan_head_action else None
-        if self.action_t_encoder is not None:
-            self.action_head = nn.Linear(config.plan_head.n_embd, 4)
-            self.action_scale = ScaleLayer(4)
         self.init_weights()
 
-    def forward(self, x: torch.Tensor, action_t: torch.Tensor | None = None) -> torch.Tensor | dict[str, torch.Tensor]:
-        if self.action_t_encoder is not None:
-            assert action_t is not None
-            x = x + self.action_t_encoder(action_t.to(x.dtype))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for mlp in self.mlps:
             x = mlp(x)
-        plan = self.scale_layer(self.head(x))
-        if self.action_t_encoder is not None:
-            return {"plan": plan, "action": self.action_scale(self.action_head(x))}
-        return plan
+        return self.scale_layer(self.head(x))
 
     def init_weights(self) -> None:
         for module in self.mlps.modules():
@@ -636,11 +626,6 @@ class PlanHead(nn.Module):
         if self.head.bias is not None:
             _init_plan_bias_(self.head.bias)
         self.scale_layer.init_weights()
-        if self.action_t_encoder is not None:
-            init_transformer_linear_weights(self.action_t_encoder)
-            _init_normal_(self.action_head.weight, std=PLAN_HEAD_INIT_STD)
-            _init_plan_bias_(self.action_head.bias)
-            self.action_scale.init_weights()
 
 
 class PlanTransformerBlock(nn.Module):
@@ -792,7 +777,6 @@ class WorldModel(BaseModel):
         plan_head: TransformerConfig
         experimental_pose_only_xy: bool
         plan_head_transformer: bool = False
-        plan_head_action: bool = False
         x_embedder: PatchEmbedderLinearsConfig = field(init=False)
         augments_pos_ref_augment_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         ref_augment_from_augments_euler_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
@@ -1044,8 +1028,6 @@ class WorldModel(BaseModel):
             if isinstance(self.plan_head, TransformerPlanHead):
                 assert action_t is not None
                 outputs.update(self.plan_head(x, action_t, input_mask, cache_pos, cache_seq_length))
-            elif self.config.plan_head_action:
-                outputs.update(self.plan_head(x[:, -1, :], action_t))
             else:
                 outputs["plan"] = self.plan_head(x[:, -1, :])
         if self.final_layer is not None:
