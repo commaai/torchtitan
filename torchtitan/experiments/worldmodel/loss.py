@@ -61,27 +61,19 @@ def compute_worldmodel_losses(
         loss = diffusion_loss
         terms["diffusion_loss"] = diffusion_loss.detach()
 
-    if "plan" in outputs and "plan" in targets:
-        pred = outputs["plan"]
-        target = targets["plan"].to(device=pred.device, dtype=pred.dtype)
-        plan_loss_values, plan_err, plan_mask = laplacian_density_loss(target.float(), pred.float())
-        plan_loss = plan_loss_values.flatten(1).mean(dim=1)
-        flat_mask = plan_mask.flatten(1).float()
-        plan_mse = (plan_err.square().flatten(1) * flat_mask).sum(dim=1) / flat_mask.sum(dim=1).clamp_min(1.0)
-        weighted_plan_loss = (plan_loss_weight if "sample" in outputs else 1.0) * plan_loss
-        loss = weighted_plan_loss if loss is None else loss + weighted_plan_loss
-        terms["plan_loss"] = plan_loss.detach()
-        terms["plan_mse"] = plan_mse.detach()
-
-    if "action" in outputs:
-        pred = outputs["action"].float()
-        target = targets["action"].to(device=pred.device, dtype=torch.float32)
-        values, err, mask = laplacian_density_loss(target, pred)
-        action_loss = values.mean(dim=-1)
-        weighted = action_loss_weight * action_loss
+    for name, weight in (("plan", plan_loss_weight if "sample" in outputs else 1.0), ("action", action_loss_weight)):
+        if name not in outputs or (name == "plan" and name not in targets):
+            continue
+        pred = outputs[name]
+        target = targets[name].to(device=pred.device, dtype=pred.dtype if name == "plan" else torch.float32)
+        values, err, mask = laplacian_density_loss(target.float(), pred.float())
+        head_loss = values.flatten(1).mean(dim=1)
+        flat_mask = mask.flatten(1).float()
+        head_mse = (err.square().flatten(1) * flat_mask).sum(dim=1) / flat_mask.sum(dim=1).clamp_min(1.0)
+        weighted = weight * head_loss
         loss = weighted if loss is None else loss + weighted
-        terms["action_loss"] = action_loss.detach()
-        terms["action_mse"] = (err.square() * mask).sum(-1).div(mask.sum(-1).clamp_min(1)).detach()
+        terms[f"{name}_loss"] = head_loss.detach()
+        terms[f"{name}_mse"] = head_mse.detach()
 
     if loss is None:
         raise RuntimeError("worldmodel produced no trainable outputs")

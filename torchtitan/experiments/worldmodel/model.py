@@ -607,13 +607,29 @@ class PlanHead(nn.Module):
     def __init__(self, config: "WorldModel.Config", linears: PlanHeadLinearsConfig):
         super().__init__()
         self.mlps = nn.ModuleList(
-            residual_ffn(config.plan_head, linears.blocks[i]) for i in range(config.plan_head.n_layer)
+            [] if config.plan_head_transformer else [residual_ffn(config.plan_head, block) for block in linears.blocks]
         )
+        self.blocks = nn.ModuleList(
+            [PlanTransformerBlock(config.plan_head, block) for block in linears.blocks]
+            if config.plan_head_transformer
+            else []
+        )
+        if self.blocks:
+            self.action_t_encoder = nn.Linear(2, config.plan_head.n_embd)
         self.head = linears.head.build()
         self.scale_layer = ScaleLayer(PLAN_SIZE)
+        if self.blocks:
+            self.action_head = nn.Linear(config.plan_head.n_embd, 4)
+            self.action_scale = ScaleLayer(4)
         self.init_weights()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, action_t=None, input_mask=None, cache_pos=None, cache_seq_length=None):
+        if self.blocks:
+            x = x + self.action_t_encoder(action_t.to(x.dtype))[:, None]
+            for block in self.blocks:
+                x = block(x, input_mask, cache_pos, cache_seq_length)
+            x = x[:, -1].to(self.head.weight.dtype)
+            return {"plan": self.scale_layer(self.head(x)), "action": self.action_scale(self.action_head(x))}
         for mlp in self.mlps:
             x = mlp(x)
         return self.scale_layer(self.head(x))
@@ -622,10 +638,18 @@ class PlanHead(nn.Module):
         for module in self.mlps.modules():
             if isinstance(module, nn.Linear):
                 init_transformer_linear_weights(module)
+        for block in self.blocks:
+            block.init_weights()
+        if self.blocks:
+            init_transformer_linear_weights(self.action_t_encoder)
         _init_normal_(self.head.weight, std=PLAN_HEAD_INIT_STD)
         if self.head.bias is not None:
             _init_plan_bias_(self.head.bias)
         self.scale_layer.init_weights()
+        if self.blocks:
+            _init_normal_(self.action_head.weight, std=PLAN_HEAD_INIT_STD)
+            _init_plan_bias_(self.action_head.bias)
+            self.action_scale.init_weights()
 
 
 class PlanTransformerBlock(nn.Module):
@@ -646,37 +670,6 @@ class PlanTransformerBlock(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 init_transformer_linear_weights(module)
-
-
-class TransformerPlanHead(nn.Module):
-    def __init__(self, config: "WorldModel.Config", linears: PlanHeadLinearsConfig):
-        super().__init__()
-        width = config.plan_head.n_embd
-        self.mlps = nn.ModuleList()
-        self.blocks = nn.ModuleList(PlanTransformerBlock(config.plan_head, block) for block in linears.blocks)
-        self.action_t_encoder = nn.Linear(2, width)
-        self.head = linears.head.build()
-        self.scale_layer = ScaleLayer(PLAN_SIZE)
-        self.action_head = nn.Linear(width, 4)
-        self.action_scale = ScaleLayer(4)
-        self.init_weights()
-
-    def forward(self, x, action_t, input_mask=None, cache_pos=None, cache_seq_length=None):
-        x = x + self.action_t_encoder(action_t.to(x.dtype))[:, None]
-        for block in self.blocks:
-            x = block(x, input_mask, cache_pos, cache_seq_length)
-        x = x[:, -1].to(self.head.weight.dtype)
-        return {"plan": self.scale_layer(self.head(x)), "action": self.action_scale(self.action_head(x))}
-
-    def init_weights(self):
-        for block in self.blocks:
-            block.init_weights()
-        init_transformer_linear_weights(self.action_t_encoder)
-        for head in (self.head, self.action_head):
-            _init_normal_(head.weight, std=PLAN_HEAD_INIT_STD)
-            _init_plan_bias_(head.bias)
-        self.scale_layer.init_weights()
-        self.action_scale.init_weights()
 
 
 class DiTBlock(nn.Module):
@@ -905,8 +898,7 @@ class WorldModel(BaseModel):
         self.fidx_embedder = DiscreteEmbedder(50, config.transformer.n_embd, config.fidx_embedder)
         self.blocks = nn.ModuleList(DiTBlock(config, config.blocks[i]) for i in range(config.transformer.n_layer))
         self.final_layer = FinalLayer(config, config.final_layer) if config.final_layer is not None else None
-        head_cls = TransformerPlanHead if config.plan_head_transformer else PlanHead
-        self.plan_head = head_cls(config, config.plan_head_linears) if config.plan_head_linears is not None else None
+        self.plan_head = PlanHead(config, config.plan_head_linears) if config.plan_head_linears is not None else None
         self.register_buffer("pos_embed", torch.empty(1, config.num_patches, config.transformer.n_embd))
         self.mask: TensorOrMask | None = None
         self.init_states(buffer_device=self.pos_embed.device)
@@ -1025,7 +1017,7 @@ class WorldModel(BaseModel):
             x = block(x, t6, input_pos_t, input_mask, cache_pos, cache_seq_length)
         outputs = {}
         if return_plan and self.plan_head is not None:
-            if isinstance(self.plan_head, TransformerPlanHead):
+            if self.config.plan_head_transformer:
                 assert action_t is not None
                 outputs.update(self.plan_head(x, action_t, input_mask, cache_pos, cache_seq_length))
             else:
@@ -1099,10 +1091,9 @@ def _apply_activation_checkpointing(
         )
     if model.plan_head is not None:
         for name in ("mlps", "blocks"):
-            layers = getattr(model.plan_head, name, None)
-            if layers is not None:
-                for layer_id, block in layers.named_children():
-                    layers.register_module(layer_id, wrap(block, f"plan_head.{name}.{layer_id}"))
+            layers = getattr(model.plan_head, name)
+            for layer_id, block in layers.named_children():
+                layers.register_module(layer_id, wrap(block, f"plan_head.{name}.{layer_id}"))
     logger.info(f"Applied {mode} activation checkpointing to the worldmodel")
 
 
@@ -1125,11 +1116,8 @@ def _apply_compile(model: WorldModel, compile_config: CompileConfig) -> None:
     if model.final_layer is not None:
         model.final_layer.compile(backend=compile_config.backend, fullgraph=True)
     if model.plan_head is not None:
-        for block in model.plan_head.mlps:
+        for block in (*model.plan_head.mlps, *model.plan_head.blocks):
             block.compile(backend=compile_config.backend, fullgraph=True)
-        if isinstance(model.plan_head, TransformerPlanHead):
-            for block in model.plan_head.blocks:
-                block.compile(backend=compile_config.backend, fullgraph=True)
     logger.info("Compiling worldmodel components with torch.compile")
 
 
@@ -1175,11 +1163,8 @@ def _apply_fsdp(
     for block in model.blocks:
         fully_shard(block, **fsdp_config, reshard_after_forward=reshard_after_forward)
     if model.plan_head is not None:
-        for block in model.plan_head.mlps:
+        for block in (*model.plan_head.mlps, *model.plan_head.blocks):
             fully_shard(block, **fsdp_config, reshard_after_forward=reshard_after_forward)
-        if isinstance(model.plan_head, TransformerPlanHead):
-            for block in model.plan_head.blocks:
-                fully_shard(block, **fsdp_config, reshard_after_forward=reshard_after_forward)
         fully_shard(model.plan_head, **fsdp_config, reshard_after_forward=reshard_after_forward)
     if model.final_layer is not None:
         fully_shard(
