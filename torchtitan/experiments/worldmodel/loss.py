@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import math
@@ -41,30 +47,39 @@ def compute_worldmodel_losses(
     targets: dict[str, torch.Tensor],
     *,
     plan_loss_weight: float,
+    action_loss_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     loss: torch.Tensor | None = None
     terms: dict[str, torch.Tensor] = {}
 
-    if "sample" in outputs:
-        pred = outputs["sample"]
-        target = targets["v"].to(device=pred.device, dtype=pred.dtype)
-        mask = targets["mask"].to(device=pred.device).flatten(1).float()
+    for output, target_key, mask_key, weight, term in (
+        ("sample", "v", "mask", 1.0, "diffusion_loss"),
+        ("plan_v", "plan_v", "plan_mask", plan_loss_weight, "plan_diffusion_loss"),
+    ):
+        if output not in outputs:
+            continue
+        pred = outputs[output] if output == "sample" else outputs[output][:, -1]
+        target = targets[target_key].to(device=pred.device, dtype=pred.dtype)
+        mask = targets[mask_key].to(device=pred.device).flatten(1).float()
         mse = F.mse_loss(pred.float(), target.float(), reduction="none").flatten(1)
         diffusion_loss = (mse * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        loss = diffusion_loss
-        terms["diffusion_loss"] = diffusion_loss.detach()
+        weighted = weight * diffusion_loss
+        loss = weighted if loss is None else loss + weighted
+        terms[term] = diffusion_loss.detach()
 
-    if "plan" in outputs and "plan" in targets:
-        pred = outputs["plan"]
-        target = targets["plan"].to(device=pred.device, dtype=pred.dtype)
-        plan_loss_values, plan_err, plan_mask = laplacian_density_loss(target.float(), pred.float())
-        plan_loss = plan_loss_values.flatten(1).mean(dim=1)
-        flat_mask = plan_mask.flatten(1).float()
-        plan_mse = (plan_err.square().flatten(1) * flat_mask).sum(dim=1) / flat_mask.sum(dim=1).clamp_min(1.0)
-        weighted_plan_loss = (plan_loss_weight if "sample" in outputs else 1.0) * plan_loss
-        loss = weighted_plan_loss if loss is None else loss + weighted_plan_loss
-        terms["plan_loss"] = plan_loss.detach()
-        terms["plan_mse"] = plan_mse.detach()
+    for name, weight in (("plan", plan_loss_weight if "sample" in outputs else 1.0), ("action", action_loss_weight)):
+        if name not in outputs or (name == "plan" and name not in targets):
+            continue
+        pred = outputs[name]
+        target = targets[name].to(device=pred.device, dtype=pred.dtype if name == "plan" else torch.float32)
+        values, err, mask = laplacian_density_loss(target.float(), pred.float())
+        head_loss = values.flatten(1).mean(dim=1)
+        flat_mask = mask.flatten(1).float()
+        head_mse = (err.square().flatten(1) * flat_mask).sum(dim=1) / flat_mask.sum(dim=1).clamp_min(1.0)
+        weighted = weight * head_loss
+        loss = weighted if loss is None else loss + weighted
+        terms[f"{name}_loss"] = head_loss.detach()
+        terms[f"{name}_mse"] = head_mse.detach()
 
     if loss is None:
         raise RuntimeError("worldmodel produced no trainable outputs")
@@ -78,6 +93,7 @@ class WorldModelLoss(BaseLoss):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseLoss.Config):
         plan_loss_weight: float
+        action_loss_weight: float = 1.0
 
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
         plan_loss_weight = config.plan_loss_weight
@@ -90,6 +106,7 @@ class WorldModelLoss(BaseLoss):
                 outputs,
                 targets,
                 plan_loss_weight=plan_loss_weight,
+                action_loss_weight=config.action_loss_weight,
             )
 
         self.fn = loss_fn

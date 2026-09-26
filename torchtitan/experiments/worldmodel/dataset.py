@@ -34,6 +34,7 @@ class _DiffusionConfig:
     train_skip: int
     val_skip: int
     nan_engaged_plans: bool
+    action_targets: bool = False
 
     def skip(self, val: bool) -> int:
         return self.val_skip if val else self.train_skip
@@ -75,6 +76,13 @@ class _MockDataset:
             }
         )
         targets = {"plan": np.random.randn(batch, PLAN_SIZE).astype(np.float32)}
+        if cfg.action_targets:
+            from xx.training.path.dataloader import compute_action_target_from_plan
+
+            inputs["action_t"] = np.random.uniform(0, 1, (batch, 2)).astype(np.float32)
+            targets["action"] = compute_action_target_from_plan(
+                targets["plan"][:, :495].reshape(-1, 33, 15), inputs["action_t"]
+            )
         return inputs, targets
 
 
@@ -106,6 +114,7 @@ class WorldModelDataLoader(BaseDataLoader):
         limit: int | None
         mock_data: bool
         mock_segment_batch_size: int
+        action_targets: bool = False
 
         def __post_init__(self) -> None:
             total_frames = self.context_size_frames + self.future_size_frames
@@ -226,6 +235,7 @@ class WorldModelDataLoader(BaseDataLoader):
                 train_skip=config.train_skip,
                 val_skip=config.val_skip,
                 nan_engaged_plans=config.nan_engaged_plans,
+                action_targets=config.action_targets,
             ),
             val=val,
             local_rank=int(os.environ.get("LOCAL_RANK", "0")),
