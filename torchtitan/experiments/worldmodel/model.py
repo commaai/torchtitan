@@ -606,14 +606,10 @@ def residual_ffn(config: TransformerConfig, linears: FFNLinearsConfig) -> Residu
 class PlanHead(nn.Module):
     def __init__(self, config: "WorldModel.Config", linears: PlanHeadLinearsConfig):
         super().__init__()
-        self.mlps = nn.ModuleList(
-            [] if config.plan_head_transformer else [residual_ffn(config.plan_head, block) for block in linears.blocks]
-        )
-        self.blocks = nn.ModuleList(
-            [PlanTransformerBlock(config.plan_head, block) for block in linears.blocks]
-            if config.plan_head_transformer
-            else []
-        )
+        self.mlps, self.blocks = nn.ModuleList(), nn.ModuleList()
+        build_block = PlanTransformerBlock if config.plan_head_transformer else residual_ffn
+        layers = self.blocks if config.plan_head_transformer else self.mlps
+        layers.extend(build_block(config.plan_head, block) for block in linears.blocks)
         if self.blocks:
             self.action_t_encoder = nn.Linear(2, config.plan_head.n_embd)
         self.head = linears.head.build()

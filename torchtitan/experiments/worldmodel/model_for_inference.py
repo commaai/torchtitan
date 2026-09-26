@@ -247,20 +247,16 @@ class WorldModelForInference(WorldModel):
         return (args[0].float(), *args[1:])
 
     def _ensure_plan_head_float32(self) -> None:
-        if self.plan_head is None or getattr(self, "_plan_head_fp32_ready", False):
+        head = self.plan_head
+        if head is None or getattr(self, "_plan_head_fp32_ready", False):
             return
 
         if self.config.plan_head_transformer:
-            for module in (
-                self.plan_head.head,
-                self.plan_head.scale_layer,
-                self.plan_head.action_head,
-                self.plan_head.action_scale,
-            ):
+            for module in (head.head, head.scale_layer, head.action_head, head.action_scale):
                 module.float()
         else:
-            self.plan_head.float()
-            self.plan_head.register_forward_pre_hook(self._cast_plan_head_input_to_float32)
+            head.float()
+            head.register_forward_pre_hook(self._cast_plan_head_input_to_float32)
         self._plan_head_fp32_ready = True
 
     @staticmethod
@@ -556,9 +552,7 @@ class WorldModelForInference(WorldModel):
                 input_mask=input_mask,
                 action_t=action_t,
             )
-            model_output["plan"] = clean_output["plan"]
-            if "action" in clean_output:
-                model_output["action"] = clean_output["action"]
+            model_output.update({key: value for key, value in clean_output.items() if key != "sample"})
 
         return x, model_output, torch.stack(trajectory, dim=1) if trajectory is not None else None
 
@@ -621,10 +615,7 @@ class WorldModelForInference(WorldModel):
             start = max(0, num_prefill_frames - 1)
             output_latents = self.unscale_latents(latents[:, start:])
             outputs = {"latents": output_latents}
-            if "plan" in model_output:
-                outputs["plan"] = model_output["plan"]
-            if "action" in model_output:
-                outputs["action"] = model_output["action"]
+            outputs.update({key: value for key, value in model_output.items() if key != "sample"})
             if return_trajectory:
                 outputs["trajectory"] = output_latents.unsqueeze(1)
             return outputs
@@ -698,10 +689,7 @@ class WorldModelForInference(WorldModel):
             raise ValueError("model outputs contain inf/nan")
 
         outputs = {"latents": self.unscale_latents(decode_frames)}
-        if "plan" in model_output:
-            outputs["plan"] = model_output["plan"]
-        if "action" in model_output:
-            outputs["action"] = model_output["action"]
+        outputs.update({key: value for key, value in model_output.items() if key != "sample"})
         if trajectory is not None:
             outputs["trajectory"] = self.unscale_latents(trajectory)
         return outputs
