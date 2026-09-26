@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import io
@@ -16,6 +22,7 @@ class WorldModelTokenizer(BaseTokenizer):
     class Config(BaseTokenizer.Config):
         compressor_model: str = ""
         compressor_in_channels: Literal[3, 6, "auto"] = "auto"
+        plan_encoder: str = ""
 
     def __init__(
         self,
@@ -28,6 +35,14 @@ class WorldModelTokenizer(BaseTokenizer):
         self.config = config
         self._encoder: torch.nn.Module | None = None
         self._encoder_key: tuple[torch.device, torch.dtype] | None = None
+        self._plan_encoder: torch.nn.Module | None = None
+
+    @torch.no_grad()
+    def encode_plan(self, plan: torch.Tensor) -> torch.Tensor:
+        if self._plan_encoder is None:
+            self._plan_encoder = torch.export.load(self.config.plan_encoder).module().requires_grad_(False)
+        self._plan_encoder.to(device=plan.device)
+        return self._plan_encoder(plan.float())
 
     def encode(
         self,

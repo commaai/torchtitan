@@ -766,6 +766,7 @@ class WorldModel(BaseModel):
         plan_head: TransformerConfig
         experimental_pose_only_xy: bool
         plan_head_transformer: bool = False
+        plan_latent_shape: tuple[int, int] = (0, 0)
         x_embedder: PatchEmbedderLinearsConfig = field(init=False)
         augments_pos_ref_augment_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         ref_augment_from_augments_euler_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
@@ -785,19 +786,23 @@ class WorldModel(BaseModel):
             return self.input_size[0] // self.patch_size[0]
 
         @property
+        def num_frame_tokens(self) -> int:
+            return self.num_spatial_patches + self.plan_latent_shape[0]
+
+        @property
         def num_patches(self) -> int:
-            return self.num_spatial_patches * self.num_temporal_patches
+            return self.num_frame_tokens * self.num_temporal_patches
 
         def __post_init__(self) -> None:
             self._sync_derived_fields()
 
         def _sync_derived_fields(self) -> None:
             self.transformer.block_size = self.num_patches
-            self.transformer.attention_mask_mini_block_size = self.num_spatial_patches
+            self.transformer.attention_mask_mini_block_size = self.num_frame_tokens
             self.plan_head.n_embd = self.transformer.n_embd
             if self.plan_head_transformer:
                 self.plan_head.block_size = self.num_patches
-                self.plan_head.attention_mask_mini_block_size = self.num_spatial_patches
+                self.plan_head.attention_mask_mini_block_size = self.num_frame_tokens
             hidden = self.transformer.n_embd
             pose_half = self.pose_size // 2
             current_blocks = getattr(self, "blocks", [])
@@ -895,6 +900,14 @@ class WorldModel(BaseModel):
         self.blocks = nn.ModuleList(DiTBlock(config, config.blocks[i]) for i in range(config.transformer.n_layer))
         self.final_layer = FinalLayer(config, config.final_layer) if config.final_layer is not None else None
         self.plan_head = PlanHead(config, config.plan_head_linears) if config.plan_head_linears is not None else None
+        if config.plan_latent_shape[0]:
+            self.plan_embedder = nn.Linear(config.plan_latent_shape[1], config.transformer.n_embd)
+            self.plan_final_layer = FinalLayer(
+                config,
+                FinalLayerLinearsConfig(
+                    linear=linear_config(config.transformer.n_embd, config.plan_latent_shape[1], bias=True)
+                ),
+            )
         self.register_buffer("pos_embed", torch.empty(1, config.num_patches, config.transformer.n_embd))
         self.mask: TensorOrMask | None = None
         self.init_states(buffer_device=self.pos_embed.device)
@@ -917,11 +930,14 @@ class WorldModel(BaseModel):
             self.config.input_size[2] // self.config.patch_size[2],
         )
         spatial = torch.from_numpy(get_2d_sincos_pos_embed(self.pos_embed.shape[-1], spatial_grid))
+        if self.config.plan_latent_shape[0]:
+            plan_pos = get_1d_sincos_pos_embed(self.pos_embed.shape[-1], self.config.plan_latent_shape[0])
+            spatial = torch.cat((spatial, torch.from_numpy(plan_pos)), dim=0)
         spatial = spatial.to(dtype=self.pos_embed.dtype, device=self.pos_embed.device).unsqueeze(0)
         spatial = einops.repeat(spatial, "() n d -> () (t n) d", t=self.config.num_temporal_patches)
         temporal = torch.from_numpy(get_1d_sincos_pos_embed(self.pos_embed.shape[-1], self.config.num_temporal_patches))
         temporal = temporal.to(dtype=self.pos_embed.dtype, device=self.pos_embed.device).unsqueeze(0)
-        temporal = einops.repeat(temporal, "() t d -> () (t n) d", n=self.config.num_spatial_patches)
+        temporal = einops.repeat(temporal, "() t d -> () (t n) d", n=self.config.num_frame_tokens)
         self.pos_embed[:] = spatial + temporal
 
     def init_states(self, *, buffer_device: torch.device | None = None) -> None:
@@ -983,6 +999,7 @@ class WorldModel(BaseModel):
         cache_seq_length: int | None = None,
         input_mask: TensorOrMask | None = None,
         action_t: torch.Tensor | None = None,
+        plan_latents: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if input_pos is None:
             input_mask = self.mask
@@ -994,12 +1011,20 @@ class WorldModel(BaseModel):
             )
         pos_embed = self.pos_embed[:, input_pos] if input_pos is not None else self.pos_embed
         input_pos_t = (
-            input_pos[:: self.config.num_spatial_patches] // self.config.num_spatial_patches
+            input_pos[:: self.config.num_frame_tokens] // self.config.num_frame_tokens
             if input_pos is not None
             else None
         )
 
-        x = self.x_embedder(x) + pos_embed
+        batch, frames = x.shape[:2]
+        x = self.x_embedder(x)
+        if self.config.plan_latent_shape[0]:
+            if plan_latents is None:
+                plan_latents = x.new_zeros(batch, frames, *self.config.plan_latent_shape)
+            x = torch.cat(
+                (x.unflatten(1, (frames, self.config.num_spatial_patches)), self.plan_embedder(plan_latents)), dim=2
+            ).flatten(1, 2)
+        x = x + pos_embed
         augments_pos_ref_augment = self.position_scale(augments_pos_ref_augment)
         ref_augment_from_augments_euler = self.euler_scale(ref_augment_from_augments_euler)
         t6, t2 = self.t_embedder(t)
@@ -1018,6 +1043,12 @@ class WorldModel(BaseModel):
                 outputs.update(self.plan_head(x, action_t, input_mask, cache_pos, cache_seq_length))
             else:
                 outputs["plan"] = self.plan_head(x[:, -1, :])
+        if self.config.plan_latent_shape[0]:
+            x = x.unflatten(1, (frames, self.config.num_frame_tokens))
+            outputs["plan_v"] = self.plan_final_layer(
+                x[:, :, self.config.num_spatial_patches :].flatten(1, 2), t2, input_pos_t
+            ).unflatten(1, (frames, self.config.plan_latent_shape[0]))
+            x = x[:, :, : self.config.num_spatial_patches].flatten(1, 2)
         if self.final_layer is not None:
             outputs["sample"] = self.unpatchify(self.final_layer(x, t2, input_pos_t))
         return outputs

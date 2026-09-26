@@ -150,6 +150,18 @@ def _prepare_worldmodel_batch(
     }
     if "action_t" in input_dict:
         model_inputs["action_t"] = input_dict["action_t"].to(device=device, dtype=dtype)
+    if model.config.plan_latent_shape[0]:
+        plan = targets["plan"][:, :495]
+        valid = torch.isfinite(plan).all(dim=-1)
+        plan_latents = tokenizer.encode_plan(plan.masked_fill(~valid[:, None], 0))
+        plan_latents = plan_latents.reshape(batch_size, *model.config.plan_latent_shape)
+        plan_noise = torch.randn_like(plan_latents)
+        noisy_plan = scheduler.add_noise(plan_latents, plan_noise, fake_timesteps[:, -1])
+        # Historical plans would reveal the future, so only the target frame gets a plan latent.
+        model_inputs["plan_latents"] = latents.new_zeros(batch_size, num_frames, *model.config.plan_latent_shape)
+        model_inputs["plan_latents"][:, -1] = noisy_plan.to(dtype)
+        targets["plan_v"] = plan_latents - plan_noise
+        targets["plan_mask"] = valid[:, None, None].expand_as(plan_latents)
     return model_inputs, targets
 
 

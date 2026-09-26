@@ -52,14 +52,20 @@ def compute_worldmodel_losses(
     loss: torch.Tensor | None = None
     terms: dict[str, torch.Tensor] = {}
 
-    if "sample" in outputs:
-        pred = outputs["sample"]
-        target = targets["v"].to(device=pred.device, dtype=pred.dtype)
-        mask = targets["mask"].to(device=pred.device).flatten(1).float()
+    for output, target_key, mask_key, weight, term in (
+        ("sample", "v", "mask", 1.0, "diffusion_loss"),
+        ("plan_v", "plan_v", "plan_mask", plan_loss_weight, "plan_diffusion_loss"),
+    ):
+        if output not in outputs:
+            continue
+        pred = outputs[output] if output == "sample" else outputs[output][:, -1]
+        target = targets[target_key].to(device=pred.device, dtype=pred.dtype)
+        mask = targets[mask_key].to(device=pred.device).flatten(1).float()
         mse = F.mse_loss(pred.float(), target.float(), reduction="none").flatten(1)
         diffusion_loss = (mse * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-        loss = diffusion_loss
-        terms["diffusion_loss"] = diffusion_loss.detach()
+        weighted = weight * diffusion_loss
+        loss = weighted if loss is None else loss + weighted
+        terms[term] = diffusion_loss.detach()
 
     for name, weight in (("plan", plan_loss_weight if "sample" in outputs else 1.0), ("action", action_loss_weight)):
         if name not in outputs or (name == "plan" and name not in targets):
