@@ -315,6 +315,7 @@ class WorldModelTrainer(Trainer):
         no_noise_prefill_frames_prob: float
         fake_timesteps_prob: float
         enable_rollout_report: bool = True
+        reports: list[Report] = field(default_factory=list)
 
         def __post_init__(self) -> None:
             Trainer.Config.__post_init__(self)
@@ -347,8 +348,9 @@ class WorldModelTrainer(Trainer):
                 config.training.steps,
             }
         )
-        self.report_runner = ReportRunner(
-            [
+        reports = list(config.reports)
+        if config.enable_rollout_report:
+            reports.append(
                 Report(
                     test_cls=AnalyseWorldmodel,
                     test_config=AnalyseWorldmodelConfig(format=ReportFormat.HTML, save_tmp=False),
@@ -358,12 +360,14 @@ class WorldModelTrainer(Trainer):
                     steps=report_steps,
                     wait_for_ckpt_keys=["model.fp8.torchpackage", "model.fp8_nvfp4.torchpackage"],
                 )
-            ],
+            )
+        self.report_runner = ReportRunner(
+            reports,
             metrics_processor=self.metrics_processor,
             miniray={"codedir": config.codedir},
             training_id=training_id,
             enabled=(
-                config.enable_rollout_report
+                (config.enable_rollout_report or bool(config.reports))
                 and config.metrics.enable_reporterv2
                 and config.checkpoint.enable
                 and not config.checkpoint.load_only
