@@ -22,6 +22,8 @@ class WorldModelTokenizer(BaseTokenizer):
     class Config(BaseTokenizer.Config):
         compressor_model: str = ""
         compressor_in_channels: Literal[3, 6, "auto"] = "auto"
+        encode_batch_size: int | None = None
+        encode_dtype: Literal["float32", "bfloat16"] | None = None
         plan_encoder: str = ""
 
     def __init__(
@@ -54,7 +56,8 @@ class WorldModelTokenizer(BaseTokenizer):
         if "latents" in inputs:
             return inputs["latents"].to(device=device, dtype=dtype)
 
-        encoder = self._encoder_on(device=device, dtype=dtype)
+        encode_dtype = getattr(torch, self.config.encode_dtype) if self.config.encode_dtype else dtype
+        encoder = self._encoder_on(device=device, dtype=encode_dtype)
         imgs = inputs["imgs"]
         big_imgs = inputs["big_imgs"]
         batch, timesteps = imgs.shape[:2]
@@ -75,18 +78,20 @@ class WorldModelTokenizer(BaseTokenizer):
                 nc=2,
                 b=batch,
                 t=timesteps,
-            ).to(device=device, dtype=dtype)
+            ).to(device=device, dtype=encode_dtype)
             x = x.div(255.0).mul(2).sub(1).clamp(-1, 1)
-            latents = encoder(x)
-            if isinstance(latents, tuple):
-                latents = latents[0]
+            encoded = []
+            for chunk in x.split(self.config.encode_batch_size or x.shape[0]):
+                latents = encoder(chunk)
+                encoded.append(latents[0] if isinstance(latents, tuple) else latents)
+            latents = torch.cat(encoded) if len(encoded) > 1 else encoded[0]
             return einops.rearrange(
                 latents,
                 inverse_spec,
                 nc=2,
                 b=batch,
                 t=timesteps,
-            )
+            ).to(dtype=dtype)
 
     def decode(self, *args: Any, **kwargs: Any) -> str:
         return ""

@@ -34,6 +34,7 @@ class _DiffusionConfig:
     train_skip: int
     val_skip: int
     nan_engaged_plans: bool
+    image_size: tuple[int, int] = (128, 256)
     action_targets: bool = False
 
     def skip(self, val: bool) -> int:
@@ -235,6 +236,7 @@ class WorldModelDataLoader(BaseDataLoader):
                 train_skip=config.train_skip,
                 val_skip=config.val_skip,
                 nan_engaged_plans=config.nan_engaged_plans,
+                image_size=config.image_size,
                 action_targets=config.action_targets,
             ),
             val=val,
