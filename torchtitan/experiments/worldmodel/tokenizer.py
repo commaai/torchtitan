@@ -78,8 +78,8 @@ class WorldModelTokenizer(BaseTokenizer):
                 nc=2,
                 b=batch,
                 t=timesteps,
-            ).to(device=device, dtype=encode_dtype)
-            x = x.div(255.0).mul(2).sub(1).clamp(-1, 1)
+            ).to(device=device, dtype=torch.float32 if self.config.encode_dtype else dtype)
+            x = x.div(255.0).mul(2).sub(1).clamp(-1, 1).to(dtype=encode_dtype)
             encoded = []
             for chunk in x.split(self.config.encode_batch_size or x.shape[0]):
                 latents = encoder(chunk)
