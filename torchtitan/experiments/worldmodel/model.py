@@ -1048,17 +1048,17 @@ class WorldModel(BaseModel):
         t2 = t2 + pos2 + euler2 + pose_mask2 + fidx2
         for block in self.blocks:
             x = block(x, t6, input_pos_t, input_mask, cache_pos, cache_seq_length)
+        plan_x = x
+        for block in self.plan_blocks:
+            plan_x = block(plan_x, t6, input_pos_t, input_mask, cache_pos, cache_seq_length)
         outputs = {}
         if return_plan and self.plan_head is not None:
             if self.config.plan_head_transformer:
                 assert action_t is not None
-                outputs.update(self.plan_head(x, action_t, input_mask, cache_pos, cache_seq_length))
+                outputs.update(self.plan_head(plan_x, action_t, input_mask, cache_pos, cache_seq_length))
             else:
-                outputs["plan"] = self.plan_head(x[:, -1, :])
+                outputs["plan"] = self.plan_head(plan_x[:, -1, :])
         if self.config.plan_latent_shape[0]:
-            plan_x = x
-            for block in self.plan_blocks:
-                plan_x = block(plan_x, t6, input_pos_t, input_mask, cache_pos, cache_seq_length)
             plan_x = plan_x.unflatten(1, (frames, self.config.num_frame_tokens))
             x = x.unflatten(1, (frames, self.config.num_frame_tokens))
             outputs["plan_v"] = self.plan_final_layer(
