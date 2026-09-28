@@ -244,7 +244,7 @@ class WorldModelForInference(WorldModel):
         self.default_kv_cache_dtype = default_kv_cache_dtype
 
     def _attention_blocks(self):
-        return (*self.blocks, *getattr(self.plan_head, "blocks", ()))
+        return (*self.blocks, *self.plan_blocks, *getattr(self.plan_head, "blocks", ()))
 
     @staticmethod
     def _cast_plan_head_input_to_float32(
@@ -357,6 +357,7 @@ class WorldModelForInference(WorldModel):
 
         if weight_format == "fp8":
             quantize_(self.blocks, fp8_config)
+            quantize_(self.plan_blocks, fp8_config)
             return
 
         from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig
@@ -372,15 +373,17 @@ class WorldModelForInference(WorldModel):
             fp8_config,
             filter_fn=is_attention_linear,
         )
+        quantize_(self.plan_blocks, fp8_config, filter_fn=is_attention_linear)
         nvfp4_config = NVFP4DynamicActivationNVFP4WeightConfig(
             use_dynamic_per_tensor_scale=True,
             use_triton_kernel=False,
         )
-        for fqn, module in self.blocks.named_modules():
-            if is_mlp_linear(module, fqn):
-                module.to(device="cuda")
-                quantize_(module, nvfp4_config)
-                module.to(device="cpu")
+        for blocks in (self.blocks, self.plan_blocks):
+            for fqn, module in blocks.named_modules():
+                if is_mlp_linear(module, fqn):
+                    module.to(device="cuda")
+                    quantize_(module, nvfp4_config)
+                    module.to(device="cpu")
 
     @torch.no_grad()
     def get_inference_masks(

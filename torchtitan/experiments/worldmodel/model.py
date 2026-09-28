@@ -767,6 +767,7 @@ class WorldModel(BaseModel):
         experimental_pose_only_xy: bool
         plan_head_transformer: bool = False
         plan_latent_shape: tuple[int, int] = (0, 0)
+        plan_transformer_layers: int = 0
         x_embedder: PatchEmbedderLinearsConfig = field(init=False)
         augments_pos_ref_augment_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         ref_augment_from_augments_euler_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
@@ -774,6 +775,7 @@ class WorldModel(BaseModel):
         t_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         fidx_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         blocks: list[DiTBlockLinearsConfig] = field(init=False)
+        plan_blocks: list[DiTBlockLinearsConfig] = field(init=False)
         final_layer: FinalLayerLinearsConfig | None = field(init=False)
         plan_head_linears: PlanHeadLinearsConfig | None = field(init=False)
 
@@ -806,6 +808,7 @@ class WorldModel(BaseModel):
             hidden = self.transformer.n_embd
             pose_half = self.pose_size // 2
             current_blocks = getattr(self, "blocks", [])
+            current_plan_blocks = getattr(self, "plan_blocks", [])
             current_final = getattr(self, "final_layer", None)
             current_plan = getattr(self, "plan_head_linears", None)
             self.x_embedder = PatchEmbedderLinearsConfig(
@@ -836,6 +839,13 @@ class WorldModel(BaseModel):
                     current_blocks[i] if i < len(current_blocks) else None,
                 )
                 for i in range(self.transformer.n_layer)
+            ]
+            self.plan_blocks = [
+                dit_block_linears_config(
+                    self.transformer,
+                    current_plan_blocks[i] if i < len(current_plan_blocks) else None,
+                )
+                for i in range(self.plan_transformer_layers)
             ]
             self.final_layer = (
                 FinalLayerLinearsConfig(
@@ -880,7 +890,8 @@ class WorldModel(BaseModel):
         def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
             del seq_len
             nparams = sum(p.numel() for p in model.parameters())
-            return nparams, 6 * nparams + attn_flops(self.transformer) // max(1, self.num_patches)
+            plan_attn_flops = 12 * self.plan_transformer_layers * self.transformer.n_embd * self.num_patches**2
+            return nparams, 6 * nparams + (attn_flops(self.transformer) + plan_attn_flops) // max(1, self.num_patches)
 
     def __init__(self, config: Config):
         super().__init__()
@@ -898,6 +909,7 @@ class WorldModel(BaseModel):
         self.t_embedder = TimestepEmbedder(config.t_embedder, time_factor=config.time_factor)
         self.fidx_embedder = DiscreteEmbedder(50, config.transformer.n_embd, config.fidx_embedder)
         self.blocks = nn.ModuleList(DiTBlock(config, config.blocks[i]) for i in range(config.transformer.n_layer))
+        self.plan_blocks = nn.ModuleList(DiTBlock(config, block) for block in config.plan_blocks)
         self.final_layer = FinalLayer(config, config.final_layer) if config.final_layer is not None else None
         self.plan_head = PlanHead(config, config.plan_head_linears) if config.plan_head_linears is not None else None
         if config.plan_latent_shape[0]:
@@ -1044,9 +1056,13 @@ class WorldModel(BaseModel):
             else:
                 outputs["plan"] = self.plan_head(x[:, -1, :])
         if self.config.plan_latent_shape[0]:
+            plan_x = x
+            for block in self.plan_blocks:
+                plan_x = block(plan_x, t6, input_pos_t, input_mask, cache_pos, cache_seq_length)
+            plan_x = plan_x.unflatten(1, (frames, self.config.num_frame_tokens))
             x = x.unflatten(1, (frames, self.config.num_frame_tokens))
             outputs["plan_v"] = self.plan_final_layer(
-                x[:, :, self.config.num_spatial_patches :].flatten(1, 2), t2, input_pos_t
+                plan_x[:, :, self.config.num_spatial_patches :].flatten(1, 2), t2, input_pos_t
             ).unflatten(1, (frames, self.config.plan_latent_shape[0]))
             x = x[:, :, : self.config.num_spatial_patches].flatten(1, 2)
         if self.final_layer is not None:
@@ -1111,11 +1127,10 @@ def _apply_activation_checkpointing(
 
     mode = "full" if isinstance(ac_policy, FullAC) else "selective"
 
-    for layer_id, block in model.blocks.named_children():
-        model.blocks.register_module(
-            layer_id,
-            wrap(block, f"blocks.{layer_id}"),
-        )
+    for name in ("blocks", "plan_blocks"):
+        layers = getattr(model, name)
+        for layer_id, block in layers.named_children():
+            layers.register_module(layer_id, wrap(block, f"{name}.{layer_id}"))
     if model.plan_head is not None:
         for name in ("mlps", "blocks"):
             layers = getattr(model.plan_head, name)
@@ -1138,7 +1153,7 @@ def _apply_compile(model: WorldModel, compile_config: CompileConfig) -> None:
         model.fidx_embedder,
     ):
         module.compile(backend=compile_config.backend, fullgraph=True)
-    for block in model.blocks:
+    for block in (*model.blocks, *model.plan_blocks):
         block.compile(backend=compile_config.backend, fullgraph=True)
     if model.final_layer is not None:
         model.final_layer.compile(backend=compile_config.backend, fullgraph=True)
@@ -1187,7 +1202,7 @@ def _apply_fsdp(
     ):
         fully_shard(module, **fsdp_config, reshard_after_forward=reshard_after_forward)
 
-    for block in model.blocks:
+    for block in (*model.blocks, *model.plan_blocks):
         fully_shard(block, **fsdp_config, reshard_after_forward=reshard_after_forward)
     if model.plan_head is not None:
         for block in (*model.plan_head.mlps, *model.plan_head.blocks):
