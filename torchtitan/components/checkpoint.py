@@ -542,7 +542,6 @@ class CheckpointManager(Configurable):
         ret: Future | AsyncSaveResponse | Metadata
 
         storage_writer: StorageWriter | None = None
-        checkpoint_save_id: str | None = None
         fqn_to_index_mapping: dict[Any, int] | None = None
 
         # HF Format Conversion
@@ -569,21 +568,17 @@ class CheckpointManager(Configurable):
         else:
             storage_writer = FsspecWriter(checkpoint_id, timeout=CHECKPOINT_UPLOAD_TIMEOUT_SECONDS)
 
-        # Execution Dispatch
-        checkpoint_save_id = None if to_hf else checkpoint_id  # for HF the storage_writer handles the path
-
+        # The writer owns the path. Passing checkpoint_id again resets fsspec options.
         if async_mode == AsyncMode.ASYNC:
             ret = dcp.async_save(
                 state_dict,
                 storage_writer=storage_writer,
-                checkpoint_id=checkpoint_save_id,
                 process_group=self.pg,
             )
         elif async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
             ret = dcp.async_save(
                 state_dict,
                 storage_writer=storage_writer,
-                checkpoint_id=checkpoint_save_id,
                 process_group=self.pg,
                 async_checkpointer_type=AsyncCheckpointerType.PROCESS,
                 async_stager=self.stager,
@@ -592,7 +587,6 @@ class CheckpointManager(Configurable):
             ret = dcp.save(
                 state_dict,
                 storage_writer=storage_writer,
-                checkpoint_id=checkpoint_save_id,
             )
             if not to_hf:
                 self._log_dcp_size(ret)
