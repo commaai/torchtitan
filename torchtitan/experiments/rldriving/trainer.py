@@ -40,7 +40,7 @@ from torchtitan.trainer import Trainer
 
 from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
-from .model import RLDrivingModel
+from .model import actor_config, ResFiTPolicy, RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
 
 
@@ -192,10 +192,14 @@ class RLDrivingTrainer(Trainer):
         )
         self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
+        actor = self.model.actor
+        pretrained_policy = actor_config().build() if isinstance(actor, ResFiTPolicy) else actor
         dcp.load(
-            {"temporal_policy": self.model.actor},
+            {"temporal_policy": pretrained_policy},
             storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
         )
+        if isinstance(actor, ResFiTPolicy):
+            actor.load_pretrained(pretrained_policy)
         self.model.warm_start_critics_from_actor()
 
     # pyrefly: ignore [bad-override]
@@ -299,7 +303,8 @@ class RLDrivingTrainer(Trainer):
                 (self.model.critic, self.model.target_critic),
             ):
                 for online_param, target_param in zip(online.parameters(), target.parameters()):
-                    target_param.mul_(decay).add_(online_param, alpha=1.0 - decay)
+                    if online_param.requires_grad:
+                        target_param.mul_(decay).add_(online_param, alpha=1.0 - decay)
                 for online_buffer, target_buffer in zip(online.buffers(), target.buffers()):
                     target_buffer.copy_(online_buffer)
         self.lr_schedulers.step()

@@ -23,7 +23,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
-from .model import actor_config, critic_config, parallelize_rldriving, RLDrivingModel
+from .model import actor_config, critic_config, parallelize_rldriving, resfit_actor_config, RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
 from .trainer import RLDrivingLRSchedulersConfig, RLDrivingTrainer
 
@@ -181,6 +181,16 @@ def rldriving() -> RLDrivingTrainer.Config:
         miniray={"priority": 3},
         debug=DebugConfig(seed=0),
     )
+
+
+def rldriving_resfit() -> RLDrivingTrainer.Config:
+    config = rldriving()
+    model_spec = cast(ModelSpec, config.model_spec)
+    model = cast(RLDrivingModel.Config, model_spec.model)
+    model.actor = resfit_actor_config()
+    model_spec.flavor = "resfit"
+    config.optimizer.param_groups[0].pattern = r"^actor\.residual_hydra\.final_layer\."
+    return config
 
 
 def _checkpoint_config(
