@@ -195,7 +195,7 @@ def rldriving_resfit() -> RLDrivingTrainer.Config:
 
 def rldriving_resfit_action_mix() -> RLDrivingTrainer.Config:
     config = rldriving_resfit()
-    config.dataloader.exploration_std = (0.6, 0.3)
+    config.dataloader.dlataccel_scale = 2.0
     config.dataloader.interpolate_critic_action = True
     config.loss.interpolate_critic_action = True
     return config

@@ -50,6 +50,7 @@ class RLDrivingDataLoader(BaseDataLoader):
         interpolate_critic_action: bool = False
 
         zero_desire: bool = False
+        dlataccel_scale: float = 1.0
         photo_noise_model: Literal["NONE", "VISION"] = "VISION"
         pre_worldmodel_warmup_seconds: int = 7
         min_simulation_seconds: int = 6
@@ -103,6 +104,7 @@ class RLDrivingDataLoader(BaseDataLoader):
             interpolate_critic_action=config.interpolate_critic_action,
             fps=config.fps,
             zero_desire=config.zero_desire,
+            dlataccel_scale=config.dlataccel_scale,
             photo_noise_model=config.photo_noise_model,
             pre_worldmodel_warmup_seconds=config.pre_worldmodel_warmup_seconds,
             min_simulation_seconds=config.min_simulation_seconds,
