@@ -68,15 +68,12 @@ class Supercombo(torch.nn.Module):
         self.point_policy = config.point_policy.build()
         self.off_policy = config.temporal_policy.build()
         self.on_policy = ResFiTPolicy(actor_config()) if resfit else actor_config(scale=True).build()
-        output_size = SPATIAL_SIZE * self.vision.config.vision_features + sum(
-            hydra.final_layer[name].out_features
-            for hydra, names in (
-                (self.point_policy.hydra, VISION_OUTPUT_ORDER),
-                (self.off_policy.temporal_hydra, OFF_POLICY_OUTPUT_ORDER),
-                (self.on_policy.temporal_hydra, ON_POLICY_OUTPUT_ORDER),
-            )
-            for name in names
-        )
+        self.output_sizes = {
+            **{head.name: head.output_size for head in config.point_policy.hydra.heads},
+            **{head.name: head.output_size for head in config.temporal_policy.temporal_hydra.heads},
+            "hidden_state": SPATIAL_SIZE * config.vision.vision_features,
+        }
+        output_size = sum(self.output_sizes[name] for name in OUTPUT_ORDER)
         self.register_buffer("pad", torch.zeros(1, -output_size % 4), persistent=False)
         for summarizer in self.modules():
             if not isinstance(summarizer, TemporalSummarizer):

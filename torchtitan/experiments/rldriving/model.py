@@ -38,13 +38,12 @@ ActorOutputs = dict[str, torch.Tensor]
 
 
 def _policy_forward(policy: TemporalPolicy | ResFiTPolicy, inputs: TemporalInputs) -> ActorOutputs:
-    outputs = policy(
+    return policy(
         inputs[ModelInputs.FEATURES],
         inputs[ModelInputs.DESIRE],
         inputs[ModelInputs.TRAFFIC],
         inputs[ModelInputs.ACTION_T],
     )
-    return {ACTION_HEAD_NAME: outputs[ACTION_HEAD_NAME]}
 
 
 class ResFiTPolicy(Module):
@@ -66,16 +65,6 @@ class ResFiTPolicy(Module):
         self.residual_hydra = residual_hydra.build()
         self.action_encoder = _encoder(ACTION_LEN, dim).build()
 
-    @torch.no_grad()
-    def load_pretrained(self, policy: TemporalPolicy) -> None:
-        state = policy.state_dict()
-        # Absorb the pretrained scale into the output projection.
-        scale_A = state.pop("temporal_hydra.scale_layer.action.scale")
-        head = "temporal_hydra.final_layer.action"
-        state[f"{head}.weight"] = state[f"{head}.weight"] * scale_A[:, None]
-        state[f"{head}.bias"] = state[f"{head}.bias"] * scale_A
-        set_model_state_dict(self.off_policy, state, options=StateDictOptions(full_state_dict=True))
-
     def forward(
         self,
         features_BTSD: torch.Tensor,
@@ -84,8 +73,9 @@ class ResFiTPolicy(Module):
         action_t_BTA: torch.Tensor,
     ) -> ActorOutputs:
         with torch.no_grad():
-            outputs = self.off_policy(features_BTSD, desire_BTA, traffic_BTA, action_t_BTA)
-        off_policy_action_BA = outputs[ACTION_HEAD_NAME]
+            off_policy_action_BA = self.off_policy(features_BTSD, desire_BTA, traffic_BTA, action_t_BTA)[
+                ACTION_HEAD_NAME
+            ]
         dtype = features_BTSD.dtype
         summary_BD = self.temporal_summarizer(
             features_BTSD[:, self.history_idxs],
@@ -98,16 +88,12 @@ class ResFiTPolicy(Module):
         action_BA = torch.cat(
             (off_policy_action_BA[..., :ACTION_LEN] + residual_BA, off_policy_action_BA[..., ACTION_LEN:]), dim=-1
         )
-        return outputs | {ACTION_HEAD_NAME: action_BA}
+        return {ACTION_HEAD_NAME: action_BA}
 
     def train(self, mode: bool = True) -> ResFiTPolicy:
         super().train(mode)
         self.off_policy.eval()
         return self
-
-    @property
-    def temporal_hydra(self) -> Hydra:
-        return self.off_policy.temporal_hydra
 
 
 class Critic(Module):
@@ -273,6 +259,17 @@ class RLDrivingModel(BaseModel):
     def sync_targets(self) -> None:
         _copy_model_state(self.actor, self.target_actor)
         _copy_model_state(self.critic, self.target_critic)
+
+    @torch.no_grad()
+    def load_pretrained(self, policy: TemporalPolicy) -> None:
+        state = policy.state_dict()
+        # Absorb the pretrained scale into the output projection.
+        scale_A = state.pop("temporal_hydra.scale_layer.action.scale")
+        head = "temporal_hydra.final_layer.action"
+        state[f"{head}.weight"] = state[f"{head}.weight"] * scale_A[:, None]
+        state[f"{head}.bias"] = state[f"{head}.bias"] * scale_A
+        set_model_state_dict(self.actor.off_policy, state, options=StateDictOptions(full_state_dict=True))
+        self.warm_start_critics_from_actor()
 
     @torch.no_grad()
     def warm_start_critics_from_actor(self) -> None:
