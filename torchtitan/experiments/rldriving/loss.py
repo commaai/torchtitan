@@ -49,6 +49,9 @@ def _critic_loss(
 ) -> LossResult:
     action_reward_B = targets["action_reward"]
     rollout_action_BA = action_reward_B[:, 0:2]
+    if config.interpolate_critic_action:
+        mix_B1 = torch.rand_like(rollout_action_BA[:, :1])
+        rollout_action_BA = torch.lerp(rollout_action_BA, targets["requested_action"], mix_B1)
     rewards_BN = targets["n_step_reward"]
 
     q1_rollout_B, q2_rollout_B = online_critic(
@@ -158,6 +161,7 @@ class RLDrivingLoss(BaseLoss):
         curv_rate_cost: float = 0.0
         action_bound: float = 10.0
         action_bound_loss_weight: float = 1.0
+        interpolate_critic_action: bool = False
 
     def __init__(
         self,

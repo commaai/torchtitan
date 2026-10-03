@@ -193,6 +193,14 @@ def rldriving_resfit() -> RLDrivingTrainer.Config:
     return config
 
 
+def rldriving_resfit_action_mix() -> RLDrivingTrainer.Config:
+    config = rldriving_resfit()
+    config.dataloader.exploration_std = (0.6, 0.3)
+    config.dataloader.interpolate_critic_action = True
+    config.loss.interpolate_critic_action = True
+    return config
+
+
 def _checkpoint_config(
     model: RLDrivingModel.Config,
     *,

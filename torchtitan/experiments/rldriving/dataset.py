@@ -46,6 +46,8 @@ class RLDrivingDataLoader(BaseDataLoader):
         steps_per_epoch: int = 1
         save_cache: bool = False
         load_caches: list[str] = field(default_factory=list)
+        exploration_std: tuple[float, float] = (0.3, 0.3)
+        interpolate_critic_action: bool = False
 
         zero_desire: bool = False
         photo_noise_model: Literal["NONE", "VISION"] = "VISION"
@@ -97,6 +99,8 @@ class RLDrivingDataLoader(BaseDataLoader):
             steps_per_epoch=config.steps_per_epoch,
             save_cache=config.save_cache,
             load_caches=list(config.load_caches),
+            exploration_std=config.exploration_std,
+            interpolate_critic_action=config.interpolate_critic_action,
             fps=config.fps,
             zero_desire=config.zero_desire,
             photo_noise_model=config.photo_noise_model,
