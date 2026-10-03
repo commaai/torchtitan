@@ -48,19 +48,23 @@ def _policy_forward(policy: TemporalPolicy | ResFiTPolicy, inputs: TemporalInput
 
 
 class ResFiTPolicy(Module):
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        off_policy: TemporalPolicy.Config
-        residual_policy: TemporalPolicy.Config
-        action_encoder: LinearEncoder.Config
-
-    def __init__(self, config: Config):
+    def __init__(self, config: TemporalPolicy.Config):
         super().__init__()
-        self.off_policy = config.off_policy.build().requires_grad_(False).eval()
-        self.temporal_summarizer = config.residual_policy.temporal_summarizer.build()
-        self.history_idxs = config.residual_policy.history_idxs
-        self.residual_hydra = config.residual_policy.temporal_hydra.build()
-        self.action_encoder = config.action_encoder.build()
+        self.off_policy = config.build().requires_grad_(False).eval()
+        self.temporal_summarizer = config.temporal_summarizer.build()
+        self.history_idxs = config.history_idxs
+        dim = config.temporal_summarizer.temporal_pos_embedding.embedding_dim
+        residual_hydra = _hydra(
+            (PathHead(name=RESIDUAL_ACTION_HEAD_NAME, output_size=ACTION_LEN, mlp=True, scale=False),),
+            in_features=dim,
+            mlp_mult=2,
+        )
+        residual_hydra.final_layers[RESIDUAL_ACTION_HEAD_NAME].param_init = {
+            "weight": nn.init.zeros_,
+            "bias": nn.init.zeros_,
+        }
+        self.residual_hydra = residual_hydra.build()
+        self.action_encoder = _encoder(ACTION_LEN, dim).build()
 
     @torch.no_grad()
     def load_pretrained(self, policy: TemporalPolicy) -> None:
@@ -106,24 +110,6 @@ class ResFiTPolicy(Module):
         return self.off_policy.temporal_hydra
 
 
-def resfit_actor_config() -> ResFiTPolicy.Config:
-    residual = temporal_policy_config(
-        heads=(PathHead(name=RESIDUAL_ACTION_HEAD_NAME, output_size=ACTION_LEN, mlp=True, scale=False),),
-        dropout=0.0,
-        dense_training_outputs=False,
-    )
-    residual.temporal_hydra.final_layers[RESIDUAL_ACTION_HEAD_NAME].param_init = {
-        "weight": nn.init.zeros_,
-        "bias": nn.init.zeros_,
-    }
-    dim = residual.temporal_summarizer.temporal_pos_embedding.embedding_dim
-    return ResFiTPolicy.Config(
-        off_policy=actor_config(scale=False),
-        residual_policy=residual,
-        action_encoder=_encoder(ACTION_LEN, dim),
-    )
-
-
 class Critic(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -159,7 +145,7 @@ class Critic(Module):
         return q_B1.squeeze(-1).clone()
 
 
-def actor_config(*, scale: bool = True) -> TemporalPolicy.Config:
+def actor_config(*, scale: bool = False) -> TemporalPolicy.Config:
     action_heads = tuple(replace(head, scale=scale) for head in TEMPORAL_HEADS if head.name == ACTION_HEAD_NAME)
     return temporal_policy_config(heads=action_heads, dropout=0.0, dense_training_outputs=False)
 
@@ -198,7 +184,7 @@ class TwinCritic(nn.Module):
 class RLDrivingModel(BaseModel):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseModel.Config):
-        actor: TemporalPolicy.Config | ResFiTPolicy.Config
+        actor: TemporalPolicy.Config
         critic: Critic.Config
 
         def update_from_config(self, *, config, **kwargs) -> None:
@@ -236,25 +222,23 @@ class RLDrivingModel(BaseModel):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.actor = config.actor.build()
+        self.actor = ResFiTPolicy(config.actor)
         self.critic = TwinCritic(config.critic)
-        self.target_actor = config.actor.build()
+        self.target_actor = ResFiTPolicy(config.actor)
         self.target_critic = TwinCritic(config.critic)
 
         self.target_actor.requires_grad_(False).eval()
         self.target_critic.requires_grad_(False).eval()
-        if isinstance(self.actor, ResFiTPolicy):
-            for critic in (self.critic.critic1, self.critic.critic2):
-                for name in ("desire_encoder", "traffic_encoder", "action_t_encoder"):
-                    getattr(critic.temporal_summarizer, name).requires_grad_(False)
+        for critic in (self.critic.critic1, self.critic.critic2):
+            for name in ("desire_encoder", "traffic_encoder", "action_t_encoder"):
+                getattr(critic.temporal_summarizer, name).requires_grad_(False)
 
     @staticmethod
     def input_shapes(
         config: RLDrivingModel.Config,
         batch_size: int = 1,
     ) -> dict[str, tuple[int, ...]]:
-        actor = config.actor.off_policy if isinstance(config.actor, ResFiTPolicy.Config) else config.actor
-        summarizer = actor.temporal_summarizer
+        summarizer = config.actor.temporal_summarizer
         temporal_len = max(summarizer.desire_window_starts) + summarizer.desire_window_len
         desire_dim = summarizer.desire_encoder.in_layer.in_features // summarizer.desire_window_len
         return {
@@ -292,12 +276,11 @@ class RLDrivingModel(BaseModel):
 
     @torch.no_grad()
     def warm_start_critics_from_actor(self) -> None:
-        actor = self.actor.off_policy if isinstance(self.actor, ResFiTPolicy) else self.actor
         for destination in (
             self.critic.critic1.temporal_summarizer,
             self.critic.critic2.temporal_summarizer,
         ):
-            _copy_model_state(actor.temporal_summarizer, destination)
+            _copy_model_state(self.actor.off_policy.temporal_summarizer, destination)
         self.sync_targets()
 
     def train(self, mode: bool = True) -> RLDrivingModel:
@@ -359,8 +342,7 @@ def parallelize_rldriving(
             module.transformer.apply_fsdp(shard, reshard_after_forward)
 
     for actor in (model.actor, model.target_actor):
-        if isinstance(actor, ResFiTPolicy):
-            shard(actor.off_policy)
+        shard(actor.off_policy)
 
     shard(model.actor)
     shard(model.target_actor)

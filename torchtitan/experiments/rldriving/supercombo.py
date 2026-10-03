@@ -12,7 +12,7 @@ from xx.training.path.model_constants import ModelInputs, SPATIAL_SIZE
 
 import torch
 
-from .model import actor_config, resfit_actor_config
+from .model import actor_config, ResFiTPolicy
 
 
 VISION_OUTPUT_ORDER = tuple(
@@ -55,7 +55,7 @@ def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
 # some micro optimizations can be made but not worth it for now
 # there are some Unsqueeze -> Gather that can be bipassed (traffic_convention, action_t)
 class Supercombo(torch.nn.Module):
-    def __init__(self, *, resfit: bool = False) -> None:
+    def __init__(self, *, resfit: bool = True) -> None:
         super().__init__()
         config = model_config("convnext_xlarge")
         config.temporal_policy.temporal_summarizer.dense_training_outputs = False
@@ -67,7 +67,7 @@ class Supercombo(torch.nn.Module):
         self.vision.encoder.norm_pre = _TinygradContiguous()
         self.point_policy = config.point_policy.build()
         self.off_policy = config.temporal_policy.build()
-        self.on_policy = (resfit_actor_config() if resfit else actor_config()).build()
+        self.on_policy = ResFiTPolicy(actor_config()) if resfit else actor_config(scale=True).build()
         output_size = SPATIAL_SIZE * self.vision.config.vision_features + sum(
             hydra.final_layer[name].out_features
             for hydra, names in (

@@ -23,7 +23,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
-from .model import actor_config, critic_config, parallelize_rldriving, resfit_actor_config, RLDrivingModel
+from .model import actor_config, critic_config, parallelize_rldriving, RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
 from .trainer import RLDrivingLRSchedulersConfig, RLDrivingTrainer
 
@@ -33,7 +33,7 @@ def model_registry() -> ModelSpec:
     critic = critic_config(actor)
     return ModelSpec(
         name="rldriving",
-        flavor="default",
+        flavor="resfit",
         model=RLDrivingModel.Config(actor=actor, critic=critic),
         parallelize_fn=parallelize_rldriving,
         pipelining_fn=None,
@@ -116,7 +116,7 @@ def rldriving() -> RLDrivingTrainer.Config:
             implementation="fused",
             param_groups=[
                 ParamGroupConfig(
-                    pattern=r"^actor\.temporal_hydra\.(final_layer|scale_layer)\.",
+                    pattern=r"^actor\.residual_hydra\.final_layer\.",
                     optimizer_name="AdamW",
                     optimizer_kwargs={**actor_optim, "weight_decay": 0.0},
                 ),
@@ -181,16 +181,6 @@ def rldriving() -> RLDrivingTrainer.Config:
         miniray={"priority": 3},
         debug=DebugConfig(seed=0),
     )
-
-
-def rldriving_resfit() -> RLDrivingTrainer.Config:
-    config = rldriving()
-    model_spec = cast(ModelSpec, config.model_spec)
-    model = cast(RLDrivingModel.Config, model_spec.model)
-    model.actor = resfit_actor_config()
-    model_spec.flavor = "resfit"
-    config.optimizer.param_groups[0].pattern = r"^actor\.residual_hydra\.final_layer\."
-    return config
 
 
 def _checkpoint_config(
