@@ -6,13 +6,13 @@
 
 from types import MethodType
 
-from xx.training.path.model import PathSelfAttention
+from xx.training.path.model import PathSelfAttention, TemporalSummarizer
 from xx.training.path.model_config import model_config
 from xx.training.path.model_constants import ModelInputs, SPATIAL_SIZE
 
 import torch
 
-from .model import actor_config
+from .model import actor_config, ResFiTPolicy
 
 
 VISION_OUTPUT_ORDER = tuple(
@@ -55,7 +55,7 @@ def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
 # some micro optimizations can be made but not worth it for now
 # there are some Unsqueeze -> Gather that can be bipassed (traffic_convention, action_t)
 class Supercombo(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, *, resfit: bool = True) -> None:
         super().__init__()
         config = model_config("convnext_xlarge")
         config.temporal_policy.temporal_summarizer.dense_training_outputs = False
@@ -67,21 +67,19 @@ class Supercombo(torch.nn.Module):
         self.vision.encoder.norm_pre = _TinygradContiguous()
         self.point_policy = config.point_policy.build()
         self.off_policy = config.temporal_policy.build()
-        self.on_policy = actor_config().build()
-        output_size = SPATIAL_SIZE * self.vision.config.vision_features + sum(
-            hydra.final_layer[name].out_features
-            for hydra, names in (
-                (self.point_policy.hydra, VISION_OUTPUT_ORDER),
-                (self.off_policy.temporal_hydra, OFF_POLICY_OUTPUT_ORDER),
-                (self.on_policy.temporal_hydra, ON_POLICY_OUTPUT_ORDER),
-            )
-            for name in names
-        )
+        self.on_policy = ResFiTPolicy(actor_config()) if resfit else actor_config(scale=True).build()
+        self.output_sizes = {
+            **{head.name: head.output_size for head in config.point_policy.hydra.heads},
+            **{head.name: head.output_size for head in config.temporal_policy.temporal_hydra.heads},
+            "hidden_state": SPATIAL_SIZE * config.vision.vision_features,
+        }
+        output_size = sum(self.output_sizes[name] for name in OUTPUT_ORDER)
         self.register_buffer("pad", torch.zeros(1, -output_size % 4), persistent=False)
-        for policy in (self.off_policy, self.on_policy):
-            summarizer = policy.temporal_summarizer
+        for summarizer in self.modules():
+            if not isinstance(summarizer, TemporalSummarizer):
+                continue
             n_tokens = summarizer.temporal_size * summarizer.spatial_size
-            for layer in policy.temporal_summarizer.transformer.layers:
+            for layer in summarizer.transformer.layers:
                 attention = layer.attention
                 mask = torch.ones(1, 1, n_tokens, n_tokens, dtype=torch.bool)
                 attention.register_buffer("_supercombo_mask", mask.tril(), persistent=False)

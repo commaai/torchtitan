@@ -7,11 +7,10 @@
 from __future__ import annotations
 
 import copy
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 from xx.training.path.model import Hydra, LinearEncoder, PathHead, PathMLP, TemporalPolicy, TemporalSummarizer
-from xx.training.path.model_config import TEMPORAL_HEADS, temporal_policy_config
+from xx.training.path.model_config import _encoder, _hydra, _mlp, TEMPORAL_HEADS, temporal_policy_config
 from xx.training.path.model_constants import ACTION_LEN, ModelInputs
 
 import torch
@@ -24,7 +23,6 @@ from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP,
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
-from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
@@ -33,19 +31,69 @@ from torchtitan.tools.logging import logger
 # B: batch, T: temporal steps, S: spatial tokens, D: model width, A: action components.
 ACTION_HEAD_NAME = "action"
 Q_HEAD_NAME = "q"
+RESIDUAL_ACTION_HEAD_NAME = "residual_action"
 
 TemporalInputs = dict[str, torch.Tensor]
 ActorOutputs = dict[str, torch.Tensor]
 
 
-def _policy_forward(policy: TemporalPolicy, inputs: TemporalInputs) -> ActorOutputs:
-    outputs = policy(
+def _policy_forward(policy: TemporalPolicy | ResFiTPolicy, inputs: TemporalInputs) -> ActorOutputs:
+    return policy(
         inputs[ModelInputs.FEATURES],
         inputs[ModelInputs.DESIRE],
         inputs[ModelInputs.TRAFFIC],
         inputs[ModelInputs.ACTION_T],
     )
-    return {ACTION_HEAD_NAME: outputs[ACTION_HEAD_NAME]}
+
+
+class ResFiTPolicy(Module):
+    def __init__(self, config: TemporalPolicy.Config):
+        super().__init__()
+        self.off_policy = config.build().requires_grad_(False).eval()
+        self.temporal_summarizer = config.temporal_summarizer.build()
+        self.history_idxs = config.history_idxs
+        dim = config.temporal_summarizer.temporal_pos_embedding.embedding_dim
+        residual_hydra = _hydra(
+            (PathHead(name=RESIDUAL_ACTION_HEAD_NAME, output_size=ACTION_LEN, mlp=True, scale=False),),
+            in_features=dim,
+            mlp_mult=2,
+        )
+        residual_hydra.final_layers[RESIDUAL_ACTION_HEAD_NAME].param_init = {
+            "weight": nn.init.zeros_,
+            "bias": nn.init.zeros_,
+        }
+        self.residual_hydra = residual_hydra.build()
+        self.action_encoder = _encoder(ACTION_LEN, dim).build()
+
+    def forward(
+        self,
+        features_BTSD: torch.Tensor,
+        desire_BTA: torch.Tensor,
+        traffic_BTA: torch.Tensor,
+        action_t_BTA: torch.Tensor,
+    ) -> ActorOutputs:
+        with torch.no_grad():
+            off_policy_action_BA = self.off_policy(features_BTSD, desire_BTA, traffic_BTA, action_t_BTA)[
+                ACTION_HEAD_NAME
+            ]
+        dtype = features_BTSD.dtype
+        summary_BD = self.temporal_summarizer(
+            features_BTSD[:, self.history_idxs],
+            desire_BTA.to(dtype),
+            traffic_BTA[:, -1].to(dtype),
+            action_t_BTA[:, -1].to(dtype),
+        )
+        summary_BD = summary_BD + self.action_encoder(off_policy_action_BA[..., :ACTION_LEN].to(dtype))
+        residual_BA = self.residual_hydra(summary_BD)[RESIDUAL_ACTION_HEAD_NAME].tanh()
+        action_BA = torch.cat(
+            (off_policy_action_BA[..., :ACTION_LEN] + residual_BA, off_policy_action_BA[..., ACTION_LEN:]), dim=-1
+        )
+        return {ACTION_HEAD_NAME: action_BA}
+
+    def train(self, mode: bool = True) -> ResFiTPolicy:
+        super().train(mode)
+        self.off_policy.eval()
+        return self
 
 
 class Critic(Module):
@@ -83,35 +131,24 @@ class Critic(Module):
         return q_B1.squeeze(-1).clone()
 
 
-def actor_config() -> TemporalPolicy.Config:
-    action_heads = tuple(head for head in TEMPORAL_HEADS if head.name == ACTION_HEAD_NAME)
+def actor_config(*, scale: bool = False) -> TemporalPolicy.Config:
+    action_heads = tuple(replace(head, scale=scale) for head in TEMPORAL_HEADS if head.name == ACTION_HEAD_NAME)
     return temporal_policy_config(heads=action_heads, dropout=0.0, dense_training_outputs=False)
 
 
 def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
     dim = actor.temporal_summarizer.temporal_pos_embedding.embedding_dim
-    hidden = 256 * math.ceil(2 * dim / 256)
-    post_action_mlp = PathMLP.Config(
-        norm=LayerNorm.Config(normalized_shape=dim),
-        c_fc=Linear.Config(in_features=dim, out_features=hidden, bias=False),
-        c_proj=Linear.Config(in_features=hidden, out_features=dim, bias=False),
-        act="gelu_tanh",
-        dropout=0.0,
-    )
+    post_action_mlp = _mlp(dim, mlp_mult=2, bias=False, dropout=0.0)
     return Critic.Config(
         temporal_summarizer=copy.deepcopy(actor.temporal_summarizer),
         history_idxs=actor.history_idxs,
-        action_encoder=LinearEncoder.Config(
-            in_layer=Linear.Config(in_features=ACTION_LEN, out_features=dim, bias=True),
-            out_layer=Linear.Config(in_features=dim, out_features=dim, bias=False),
-        ),
+        action_encoder=_encoder(ACTION_LEN, dim),
         post_action_mlp1=post_action_mlp,
         post_action_mlp2=copy.deepcopy(post_action_mlp),
-        q_hydra=Hydra.Config(
-            heads=(PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),),
-            head_mlps={},
-            final_layers={Q_HEAD_NAME: Linear.Config(in_features=dim, out_features=1, bias=True)},
-            scale_layers={},
+        q_hydra=_hydra(
+            (PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),),
+            in_features=dim,
+            mlp_mult=2,
         ),
     )
 
@@ -171,13 +208,16 @@ class RLDrivingModel(BaseModel):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.actor = config.actor.build()
+        self.actor = ResFiTPolicy(config.actor)
         self.critic = TwinCritic(config.critic)
-        self.target_actor = config.actor.build()
+        self.target_actor = ResFiTPolicy(config.actor)
         self.target_critic = TwinCritic(config.critic)
 
         self.target_actor.requires_grad_(False).eval()
         self.target_critic.requires_grad_(False).eval()
+        for critic in (self.critic.critic1, self.critic.critic2):
+            for name in ("desire_encoder", "traffic_encoder", "action_t_encoder"):
+                getattr(critic.temporal_summarizer, name).requires_grad_(False)
 
     @staticmethod
     def input_shapes(
@@ -221,12 +261,23 @@ class RLDrivingModel(BaseModel):
         _copy_model_state(self.critic, self.target_critic)
 
     @torch.no_grad()
+    def load_pretrained(self, policy: TemporalPolicy) -> None:
+        state = policy.state_dict()
+        # Absorb the pretrained scale into the output projection.
+        scale_A = state.pop("temporal_hydra.scale_layer.action.scale")
+        head = "temporal_hydra.final_layer.action"
+        state[f"{head}.weight"] = state[f"{head}.weight"] * scale_A[:, None]
+        state[f"{head}.bias"] = state[f"{head}.bias"] * scale_A
+        set_model_state_dict(self.actor.off_policy, state, options=StateDictOptions(full_state_dict=True))
+        self.warm_start_critics_from_actor()
+
+    @torch.no_grad()
     def warm_start_critics_from_actor(self) -> None:
         for destination in (
             self.critic.critic1.temporal_summarizer,
             self.critic.critic2.temporal_summarizer,
         ):
-            _copy_model_state(self.actor.temporal_summarizer, destination)
+            _copy_model_state(self.actor.off_policy.temporal_summarizer, destination)
         self.sync_targets()
 
     def train(self, mode: bool = True) -> RLDrivingModel:
@@ -283,15 +334,12 @@ def parallelize_rldriving(
     def shard(module: nn.Module, reshard: bool = reshard_after_forward) -> None:
         fully_shard(module, **fsdp_config, reshard_after_forward=reshard)
 
-    for temporal_summarizer in (
-        model.actor.temporal_summarizer,
-        model.critic.critic1.temporal_summarizer,
-        model.critic.critic2.temporal_summarizer,
-        model.target_actor.temporal_summarizer,
-        model.target_critic.critic1.temporal_summarizer,
-        model.target_critic.critic2.temporal_summarizer,
-    ):
-        temporal_summarizer.transformer.apply_fsdp(shard, reshard_after_forward)
+    for module in model.modules():
+        if isinstance(module, TemporalSummarizer):
+            module.transformer.apply_fsdp(shard, reshard_after_forward)
+
+    for actor in (model.actor, model.target_actor):
+        shard(actor.off_policy)
 
     shard(model.actor)
     shard(model.target_actor)
