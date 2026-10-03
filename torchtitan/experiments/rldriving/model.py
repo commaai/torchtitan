@@ -7,11 +7,10 @@
 from __future__ import annotations
 
 import copy
-import math
 from dataclasses import dataclass, replace
 from typing import Any, cast
 from xx.training.path.model import Hydra, LinearEncoder, PathHead, PathMLP, TemporalPolicy, TemporalSummarizer
-from xx.training.path.model_config import TEMPORAL_HEADS, temporal_policy_config
+from xx.training.path.model_config import _encoder, _hydra, _mlp, TEMPORAL_HEADS, temporal_policy_config
 from xx.training.path.model_constants import ACTION_LEN, ModelInputs
 
 import torch
@@ -24,7 +23,6 @@ from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP,
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
-from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
@@ -122,10 +120,7 @@ def resfit_actor_config() -> ResFiTPolicy.Config:
     return ResFiTPolicy.Config(
         off_policy=actor_config(scale=False),
         residual_policy=residual,
-        action_encoder=LinearEncoder.Config(
-            in_layer=Linear.Config(in_features=ACTION_LEN, out_features=dim, bias=True),
-            out_layer=Linear.Config(in_features=dim, out_features=dim, bias=False),
-        ),
+        action_encoder=_encoder(ACTION_LEN, dim),
     )
 
 
@@ -171,28 +166,17 @@ def actor_config(*, scale: bool = True) -> TemporalPolicy.Config:
 
 def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
     dim = actor.temporal_summarizer.temporal_pos_embedding.embedding_dim
-    hidden = 256 * math.ceil(2 * dim / 256)
-    post_action_mlp = PathMLP.Config(
-        norm=LayerNorm.Config(normalized_shape=dim),
-        c_fc=Linear.Config(in_features=dim, out_features=hidden, bias=False),
-        c_proj=Linear.Config(in_features=hidden, out_features=dim, bias=False),
-        act="gelu_tanh",
-        dropout=0.0,
-    )
+    post_action_mlp = _mlp(dim, mlp_mult=2, bias=False, dropout=0.0)
     return Critic.Config(
         temporal_summarizer=copy.deepcopy(actor.temporal_summarizer),
         history_idxs=actor.history_idxs,
-        action_encoder=LinearEncoder.Config(
-            in_layer=Linear.Config(in_features=ACTION_LEN, out_features=dim, bias=True),
-            out_layer=Linear.Config(in_features=dim, out_features=dim, bias=False),
-        ),
+        action_encoder=_encoder(ACTION_LEN, dim),
         post_action_mlp1=post_action_mlp,
         post_action_mlp2=copy.deepcopy(post_action_mlp),
-        q_hydra=Hydra.Config(
-            heads=(PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),),
-            head_mlps={},
-            final_layers={Q_HEAD_NAME: Linear.Config(in_features=dim, out_features=1, bias=True)},
-            scale_layers={},
+        q_hydra=_hydra(
+            (PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),),
+            in_features=dim,
+            mlp_mult=2,
         ),
     )
 
