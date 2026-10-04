@@ -31,6 +31,7 @@ from torchtitan.tools.logging import logger
 # B: batch, T: temporal steps, S: spatial tokens, D: model width, A: action components.
 ACTION_HEAD_NAME = "action"
 Q_HEAD_NAME = "q"
+OFF_POLICY_HEAD_NAME = "off_policy"
 RESIDUAL_ACTION_HEAD_NAME = "residual_action"
 
 TemporalInputs = dict[str, torch.Tensor]
@@ -115,7 +116,7 @@ class Critic(Module):
         self.post_action_mlp2 = config.post_action_mlp2.build()
         self.q_hydra = config.q_hydra.build()
 
-    def forward(self, inputs: TemporalInputs, action: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: TemporalInputs, action: torch.Tensor) -> dict[str, torch.Tensor]:
         features_BTSD = inputs[ModelInputs.FEATURES]
         dtype = features_BTSD.dtype
         critic_features_BD = self.temporal_summarizer(
@@ -127,8 +128,7 @@ class Critic(Module):
         critic_features_BD = critic_features_BD + self.post_action_mlp1(critic_features_BD)
         critic_features_BD = critic_features_BD + self.action_encoder(action.to(dtype))
         critic_features_BD = critic_features_BD + self.post_action_mlp2(critic_features_BD)
-        q_B1 = self.q_hydra(critic_features_BD)[Q_HEAD_NAME]
-        return q_B1.squeeze(-1).clone()
+        return {name: value_B1.squeeze(-1).clone() for name, value_B1 in self.q_hydra(critic_features_BD).items()}
 
 
 def actor_config() -> TemporalPolicy.Config:
@@ -146,7 +146,10 @@ def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
         post_action_mlp1=post_action_mlp,
         post_action_mlp2=copy.deepcopy(post_action_mlp),
         q_hydra=_hydra(
-            (PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),),
+            tuple(
+                PathHead(name=name, output_size=1, mlp=False, scale=False)
+                for name in (Q_HEAD_NAME, OFF_POLICY_HEAD_NAME)
+            ),
             in_features=dim,
             mlp_mult=2,
         ),
@@ -163,7 +166,7 @@ class TwinCritic(nn.Module):
         self,
         inputs: TemporalInputs,
         action: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         return self.critic1(inputs, action), self.critic2(inputs, action)
 
 

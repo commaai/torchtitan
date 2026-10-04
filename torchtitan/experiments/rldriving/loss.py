@@ -51,20 +51,25 @@ def _critic_loss(
     rollout_action_BA = action_reward_B[:, 0:2]
     rewards_BN = targets["n_step_reward"]
 
-    q1_rollout_B, q2_rollout_B = online_critic(
+    critic1, critic2 = online_critic(
         inputs=current_inputs,
         action=rollout_action_BA,
     )
+    q1_rollout_B, q2_rollout_B = critic1["q"], critic2["q"]
+    off_policy_B = targets["is_off_policy"].squeeze(-1)
+    # Equal GT/simulation batches retain the mean RL loss over simulated samples.
+    on_policy_weight_B = 2.0 * (1.0 - off_policy_B)
 
     with torch.no_grad():
         bootstrap_action_BA = _sample_fixed_noise_policy(
             bootstrap_actor_outputs[ACTION_OUTPUT],
             action_noise_A,
         )
-        q1_target_B, q2_target_B = target_critic(
+        target1, target2 = target_critic(
             inputs=bootstrap_inputs,
             action=bootstrap_action_BA,
         )
+        q1_target_B, q2_target_B = target1["q"], target2["q"]
         bootstrap_B = torch.minimum(q1_target_B, q2_target_B)
         discounts_N = config.gamma ** torch.arange(
             rewards_BN.shape[1], device=rewards_BN.device, dtype=rewards_BN.dtype
@@ -89,7 +94,29 @@ def _critic_loss(
         "q_target_abs_gap": q_target_abs_gap_B.detach(),
         "q_target_clip_correction": q_target_clip_correction_B.detach(),
     }
-    return critic_loss_B, metrics
+    metrics = {name: value * on_policy_weight_B for name, value in metrics.items()}
+    source_loss_B = 0.5 * (
+        F.binary_cross_entropy_with_logits(critic1["off_policy"], off_policy_B, reduction="none")
+        + F.binary_cross_entropy_with_logits(critic2["off_policy"], off_policy_B, reduction="none")
+    )
+    with torch.no_grad():
+        probability1_B = critic1["off_policy"].sigmoid()
+        probability2_B = critic2["off_policy"].sigmoid()
+        probability_B = 0.5 * (probability1_B + probability2_B)
+        metrics.update(
+            {
+                "source_loss": source_loss_B.detach(),
+                "source_accuracy": 0.5
+                * (
+                    ((probability1_B >= 0.5) == off_policy_B.bool()).float()
+                    + ((probability2_B >= 0.5) == off_policy_B.bool()).float()
+                ),
+                "off_policy_probability_on_policy": probability_B * on_policy_weight_B,
+                "off_policy_probability_gt": probability_B * 2.0 * off_policy_B,
+                "gt_fraction": off_policy_B,
+            }
+        )
+    return critic_loss_B * on_policy_weight_B + config.source_loss_weight * source_loss_B, metrics
 
 
 def _actor_loss(
@@ -103,10 +130,11 @@ def _actor_loss(
 ) -> LossResult:
     action_pred_BA = actor_outputs[ACTION_OUTPUT]
     next_action_pred_BA = next_actor_outputs[ACTION_OUTPUT]
-    q1_new_B, q2_new_B = online_critic(
+    critic1, critic2 = online_critic(
         inputs=current_inputs,
         action=action_pred_BA[:, :2],
     )
+    q1_new_B, q2_new_B = critic1["q"], critic2["q"]
     actor_pi_B = -q1_new_B
     actor_q_abs_gap_B = torch.abs(q1_new_B - q2_new_B)
 
@@ -144,7 +172,8 @@ def _actor_loss(
         "actor_action_bound_max_abs": action_abs_BA.max(dim=-1).values.detach(),
         "actor_action_bound_max_excess": action_bound_excess_BA.max(dim=-1).values.detach(),
     }
-    return loss_B, metrics
+    on_policy_weight_B = 2.0 * (1.0 - targets["is_off_policy"].squeeze(-1))
+    return loss_B * on_policy_weight_B, {name: value * on_policy_weight_B for name, value in metrics.items()}
 
 
 class RLDrivingLoss(BaseLoss):
@@ -158,6 +187,7 @@ class RLDrivingLoss(BaseLoss):
         curv_rate_cost: float = 0.0
         action_bound: float = 10.0
         action_bound_loss_weight: float = 1.0
+        source_loss_weight: float = 1.0
 
     def __init__(
         self,
