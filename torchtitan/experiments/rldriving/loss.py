@@ -57,7 +57,7 @@ def _critic_loss(
     )
     q1_rollout_B, q2_rollout_B = critic1["q"], critic2["q"]
     off_policy_B = targets["is_off_policy"].squeeze(-1)
-    # Equal GT/simulation batches retain the mean RL loss over simulated samples.
+    # Equal reference/actor batches retain the mean RL loss over actor samples.
     on_policy_weight_B = 2.0 * (1.0 - off_policy_B)
 
     with torch.no_grad():
@@ -112,8 +112,8 @@ def _critic_loss(
                     + ((probability2_B >= 0.5) == off_policy_B.bool()).float()
                 ),
                 "off_policy_probability_on_policy": probability_B * on_policy_weight_B,
-                "off_policy_probability_gt": probability_B * 2.0 * off_policy_B,
-                "gt_fraction": off_policy_B,
+                "off_policy_probability_reference": probability_B * 2.0 * off_policy_B,
+                "off_policy_fraction": off_policy_B,
             }
         )
     return critic_loss_B * on_policy_weight_B + config.source_loss_weight * source_loss_B, metrics

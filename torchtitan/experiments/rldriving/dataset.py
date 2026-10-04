@@ -72,7 +72,7 @@ class RLDrivingDataLoader(BaseDataLoader):
         from gigashuffle import DataloaderConfig
 
         if local_batch_size % 2:
-            raise ValueError("GT/simulation training requires an even local batch size")
+            raise ValueError("Reference/actor training requires an even local batch size")
         local_batch_size //= 2
         local_rank = int(os.environ.get("LOCAL_RANK", dp_rank))
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", dp_world_size))
@@ -110,8 +110,8 @@ class RLDrivingDataLoader(BaseDataLoader):
             worldmodel_context_size_seconds=config.worldmodel_context_size_seconds,
         )
         self.datasets = [
-            get_dataset(xx_config.replace(ground_truth=ground_truth), local_rank=local_rank)
-            for ground_truth in (False, True)
+            get_dataset(xx_config.replace(worldmodel_reference=reference), local_rank=local_rank)
+            for reference in (False, True)
         ]
         loader_config = DataloaderConfig(
             bs=local_batch_size,
@@ -127,7 +127,7 @@ class RLDrivingDataLoader(BaseDataLoader):
             queue_name=f"{config.training_id or 'rldriving'}-train-node{node_rank}",
         )
         self._loader_configs = [
-            replace(loader_config, queue_name=f"{loader_config.queue_name}-{source}") for source in ("sim", "gt")
+            replace(loader_config, queue_name=f"{loader_config.queue_name}-{source}") for source in ("sim", "wm")
         ]
         self.loaders: list[Any] = []
         self._iterators: list[Any] = []
@@ -140,22 +140,22 @@ class RLDrivingDataLoader(BaseDataLoader):
             self.loaders = [DataLoader(dataset, config) for dataset, config in zip(self.datasets, self._loader_configs)]
         self._iterators = [iter(loader) for loader in self.loaders]
         try:
-            for sim, gt in zip(*self._iterators):
+            for sim, reference in zip(*self._iterators):
                 inputs, targets = (
                     {name: torch.cat((left[name], right[name])) for name in left.keys() & right.keys()}
-                    for left, right in zip(sim[:2], gt[:2])
+                    for left, right in zip(sim[:2], reference[:2])
                 )
-                # RawVideoEnv's zero lag must not reveal the sample source.
+                # The reference's zero lag must not reveal the sample source.
                 for name in ("action_t", "next_action_t"):
                     inputs[name] = torch.cat((sim[0][name], sim[0][name]))
                 metadata = {
                     name: torch.cat(
                         (
-                            sim[2][name] if name in sim[2] else torch.full_like(gt[2][name], float("nan")),
-                            gt[2][name] if name in gt[2] else torch.full_like(sim[2][name], float("nan")),
+                            sim[2][name] if name in sim[2] else torch.full_like(reference[2][name], float("nan")),
+                            reference[2][name] if name in reference[2] else torch.full_like(sim[2][name], float("nan")),
                         )
                     )
-                    for name in sim[2].keys() | gt[2].keys()
+                    for name in sim[2].keys() | reference[2].keys()
                 }
                 yield inputs, targets, metadata
         finally:
