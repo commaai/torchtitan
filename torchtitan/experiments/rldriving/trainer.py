@@ -196,7 +196,7 @@ class RLDrivingTrainer(Trainer):
             {"temporal_policy": self.model.actor.off_policy},
             storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
         )
-        self.model.warm_start_critics_from_actor()
+        self.model.sync_targets()
 
     # pyrefly: ignore [bad-override]
     def batch_generator(self, data_iterable: Iterable[Batch]) -> Iterator[Batch]:

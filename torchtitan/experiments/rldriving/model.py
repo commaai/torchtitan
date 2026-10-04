@@ -215,9 +215,6 @@ class RLDrivingModel(BaseModel):
 
         self.target_actor.requires_grad_(False).eval()
         self.target_critic.requires_grad_(False).eval()
-        for critic in (self.critic.critic1, self.critic.critic2):
-            for name in ("desire_encoder", "traffic_encoder", "action_t_encoder"):
-                getattr(critic.temporal_summarizer, name).requires_grad_(False)
 
     @staticmethod
     def input_shapes(
