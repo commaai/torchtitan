@@ -145,16 +145,7 @@ class RLDrivingDataLoader(BaseDataLoader):
                     {name: torch.cat((left[name], right[name])) for name in left.keys() & right.keys()}
                     for left, right in zip(sim[:2], reference[:2])
                 )
-                metadata = {
-                    name: torch.cat(
-                        (
-                            sim[2][name] if name in sim[2] else torch.full_like(reference[2][name], float("nan")),
-                            reference[2][name] if name in reference[2] else torch.full_like(sim[2][name], float("nan")),
-                        )
-                    )
-                    for name in sim[2].keys() | reference[2].keys()
-                }
-                yield inputs, targets, metadata
+                yield inputs, targets, sim[2]
         finally:
             for iterator in self._iterators:
                 iterator.close()
