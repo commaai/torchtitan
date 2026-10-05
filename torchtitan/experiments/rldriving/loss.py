@@ -51,20 +51,25 @@ def _critic_loss(
     rollout_action_BA = action_reward_B[:, 0:2]
     rewards_BN = targets["n_step_reward"]
 
-    q1_rollout_B, q2_rollout_B = online_critic(
+    critic1, critic2 = online_critic(
         inputs=current_inputs,
         action=rollout_action_BA,
     )
+    q1_rollout_B, q2_rollout_B = critic1["q"], critic2["q"]
+    off_policy_B = targets["is_off_policy"].squeeze(-1)
+    on_policy_weight_B = 2.0 * (1.0 - off_policy_B)
+    off_policy_weight_B = 2.0 * off_policy_B
 
     with torch.no_grad():
         bootstrap_action_BA = _sample_fixed_noise_policy(
             bootstrap_actor_outputs[ACTION_OUTPUT],
             action_noise_A,
         )
-        q1_target_B, q2_target_B = target_critic(
+        target1, target2 = target_critic(
             inputs=bootstrap_inputs,
             action=bootstrap_action_BA,
         )
+        q1_target_B, q2_target_B = target1["q"], target2["q"]
         bootstrap_B = torch.minimum(q1_target_B, q2_target_B)
         discounts_N = config.gamma ** torch.arange(
             rewards_BN.shape[1], device=rewards_BN.device, dtype=rewards_BN.dtype
@@ -89,7 +94,22 @@ def _critic_loss(
         "q_target_abs_gap": q_target_abs_gap_B.detach(),
         "q_target_clip_correction": q_target_clip_correction_B.detach(),
     }
-    return critic_loss_B, metrics
+    metrics = {name: value * on_policy_weight_B for name, value in metrics.items()}
+    noise_loss_BA = 0.5 * (
+        F.mse_loss(critic1["noise_scale"], targets["noise_scale"], reduction="none")
+        + F.mse_loss(critic2["noise_scale"], targets["noise_scale"], reduction="none")
+    )
+    noise_loss_B = noise_loss_BA.mean(dim=-1) * off_policy_weight_B
+    with torch.no_grad():
+        noise_scale_BA = 0.5 * (critic1["noise_scale"] + critic2["noise_scale"])
+        metrics["noise_loss"] = noise_loss_B.detach()
+        metrics["off_policy_fraction"] = off_policy_B
+        for index, axis in enumerate(("lat", "long")):
+            metrics[f"{axis}_noise_scale_on_policy"] = noise_scale_BA[:, index] * on_policy_weight_B
+            metrics[f"{axis}_noise_scale_off_policy"] = noise_scale_BA[:, index] * off_policy_weight_B
+            metrics[f"{axis}_noise_scale_target"] = targets["noise_scale"][:, index] * off_policy_weight_B
+            metrics[f"{axis}_noise_mse"] = noise_loss_BA[:, index] * off_policy_weight_B
+    return critic_loss_B * on_policy_weight_B + noise_loss_B, metrics
 
 
 def _actor_loss(
@@ -103,10 +123,11 @@ def _actor_loss(
 ) -> LossResult:
     action_pred_BA = actor_outputs[ACTION_OUTPUT]
     next_action_pred_BA = next_actor_outputs[ACTION_OUTPUT]
-    q1_new_B, q2_new_B = online_critic(
+    critic1, critic2 = online_critic(
         inputs=current_inputs,
         action=action_pred_BA[:, :2],
     )
+    q1_new_B, q2_new_B = critic1["q"], critic2["q"]
     actor_pi_B = -q1_new_B
     actor_q_abs_gap_B = torch.abs(q1_new_B - q2_new_B)
 
@@ -144,7 +165,8 @@ def _actor_loss(
         "actor_action_bound_max_abs": action_abs_BA.max(dim=-1).values.detach(),
         "actor_action_bound_max_excess": action_bound_excess_BA.max(dim=-1).values.detach(),
     }
-    return loss_B, metrics
+    on_policy_weight_B = 2.0 * (1.0 - targets["is_off_policy"].squeeze(-1))
+    return loss_B * on_policy_weight_B, {name: value * on_policy_weight_B for name, value in metrics.items()}
 
 
 class RLDrivingLoss(BaseLoss):

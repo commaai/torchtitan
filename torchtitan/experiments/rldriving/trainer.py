@@ -333,8 +333,8 @@ class RLDrivingTrainer(Trainer):
         )
 
         metadata_averages = {}
-        for name, value in metadata.items():
-            value = value.float()
+        for name in sorted(metadata):
+            value = metadata[name].float()
             finite = torch.isfinite(value)
             value_sum = torch.where(finite, value, 0.0).sum()
             value_count = finite.sum()
