@@ -98,6 +98,8 @@ def rldriving() -> RLDrivingTrainer.Config:
             smooth_lat_cost=0.15,
             smooth_long_cost=0.05,
             curv_rate_cost=20.0,
+            environment_reward_weight=0.0,
+            source_reward_weight=1.0,
         ),
         warm_start_checkpoint=os.getenv(
             "RLDRIVING_WARM_START_CHECKPOINT",
