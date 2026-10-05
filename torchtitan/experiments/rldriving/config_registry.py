@@ -33,7 +33,7 @@ def model_registry() -> ModelSpec:
     critic = critic_config(actor)
     return ModelSpec(
         name="rldriving",
-        flavor="resfit",
+        flavor="default",
         model=RLDrivingModel.Config(actor=actor, critic=critic),
         parallelize_fn=parallelize_rldriving,
         pipelining_fn=None,

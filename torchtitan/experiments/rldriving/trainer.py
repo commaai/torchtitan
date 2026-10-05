@@ -40,7 +40,7 @@ from torchtitan.trainer import Trainer
 
 from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
-from .model import actor_config, RLDrivingModel
+from .model import RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
 
 
@@ -192,12 +192,11 @@ class RLDrivingTrainer(Trainer):
         )
         self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
-        pretrained_policy = actor_config(scale=True).build()
         dcp.load(
-            {"temporal_policy": pretrained_policy},
+            {"temporal_policy": self.model.actor.off_policy},
             storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
         )
-        self.model.load_pretrained(pretrained_policy)
+        self.model.warm_start_critics_from_actor()
 
     # pyrefly: ignore [bad-override]
     def batch_generator(self, data_iterable: Iterable[Batch]) -> Iterator[Batch]:

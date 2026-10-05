@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, cast
 from xx.training.path.model import Hydra, LinearEncoder, PathHead, PathMLP, TemporalPolicy, TemporalSummarizer
 from xx.training.path.model_config import _encoder, _hydra, _mlp, TEMPORAL_HEADS, temporal_policy_config
@@ -131,8 +131,8 @@ class Critic(Module):
         return q_B1.squeeze(-1).clone()
 
 
-def actor_config(*, scale: bool = False) -> TemporalPolicy.Config:
-    action_heads = tuple(replace(head, scale=scale) for head in TEMPORAL_HEADS if head.name == ACTION_HEAD_NAME)
+def actor_config() -> TemporalPolicy.Config:
+    action_heads = tuple(head for head in TEMPORAL_HEADS if head.name == ACTION_HEAD_NAME)
     return temporal_policy_config(heads=action_heads, dropout=0.0, dense_training_outputs=False)
 
 
@@ -259,17 +259,6 @@ class RLDrivingModel(BaseModel):
     def sync_targets(self) -> None:
         _copy_model_state(self.actor, self.target_actor)
         _copy_model_state(self.critic, self.target_critic)
-
-    @torch.no_grad()
-    def load_pretrained(self, policy: TemporalPolicy) -> None:
-        state = policy.state_dict()
-        # Absorb the pretrained scale into the output projection.
-        scale_A = state.pop("temporal_hydra.scale_layer.action.scale")
-        head = "temporal_hydra.final_layer.action"
-        state[f"{head}.weight"] = state[f"{head}.weight"] * scale_A[:, None]
-        state[f"{head}.bias"] = state[f"{head}.bias"] * scale_A
-        set_model_state_dict(self.actor.off_policy, state, options=StateDictOptions(full_state_dict=True))
-        self.warm_start_critics_from_actor()
 
     @torch.no_grad()
     def warm_start_critics_from_actor(self) -> None:

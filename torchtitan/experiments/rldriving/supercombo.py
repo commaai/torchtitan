@@ -55,7 +55,7 @@ def _naive_attention(self: PathSelfAttention, x: torch.Tensor) -> torch.Tensor:
 # some micro optimizations can be made but not worth it for now
 # there are some Unsqueeze -> Gather that can be bipassed (traffic_convention, action_t)
 class Supercombo(torch.nn.Module):
-    def __init__(self, *, resfit: bool = True) -> None:
+    def __init__(self) -> None:
         super().__init__()
         config = model_config("convnext_xlarge")
         config.temporal_policy.temporal_summarizer.dense_training_outputs = False
@@ -67,7 +67,7 @@ class Supercombo(torch.nn.Module):
         self.vision.encoder.norm_pre = _TinygradContiguous()
         self.point_policy = config.point_policy.build()
         self.off_policy = config.temporal_policy.build()
-        self.on_policy = ResFiTPolicy(actor_config()) if resfit else actor_config(scale=True).build()
+        self.on_policy = ResFiTPolicy(actor_config())
         self.output_sizes = {
             **{head.name: head.output_size for head in config.point_policy.hydra.heads},
             **{head.name: head.output_size for head in config.temporal_policy.temporal_hydra.heads},
