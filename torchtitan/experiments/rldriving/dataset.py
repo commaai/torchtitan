@@ -145,9 +145,6 @@ class RLDrivingDataLoader(BaseDataLoader):
                     {name: torch.cat((left[name], right[name])) for name in left.keys() & right.keys()}
                     for left, right in zip(sim[:2], reference[:2])
                 )
-                # The reference's zero lag must not reveal the sample source.
-                for name in ("action_t", "next_action_t"):
-                    inputs[name] = torch.cat((sim[0][name], sim[0][name]))
                 metadata = {
                     name: torch.cat(
                         (
