@@ -7,17 +7,16 @@
 from __future__ import annotations
 
 import os
-from typing import cast
+from typing import cast, Literal
 
 from xx.comma_data.constants import BASE_DIR_GT, DEFAULT_TRAIN_LIST
 from xx.ml_tools.constants.model import SUPERCOMBO_FPS
 from xx.release_tests.lib.base_report import BaseReportConfig, ReportFormat
 from xx.training.lib.torchtitan.report_runner import Report
 from xx.training.rldriving.test import MODEL_REPORTS
+from xx.training.path.model_config import model_config as path_model_config
 
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
-from torchtitan.components.tokenizer import NoOpTokenizer
 from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -25,16 +24,25 @@ from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
 from .model import actor_config, critic_config, parallelize_rldriving, RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
+from .lora import LoRAConfig
+from .optimizer import RLDrivingOptimizers
+from .tokenizer import RLDrivingTokenizer
 from .trainer import RLDrivingLRSchedulersConfig, RLDrivingTrainer
 
 
-def model_registry() -> ModelSpec:
+def model_registry(scope: Literal["policy", "all"] = "policy") -> ModelSpec:
     actor = actor_config()
     critic = critic_config(actor)
+    path = path_model_config("convnext_xlarge", pretrained=False)
+    path.vision.drop_path_rate = 0.0
+    path.temporal_policy.temporal_summarizer.dense_training_outputs = False
     return ModelSpec(
         name="rldriving",
         flavor="default",
-        model=RLDrivingModel.Config(actor=actor, critic=critic),
+        model=RLDrivingModel.Config(
+            actor=actor, critic=critic, lora=LoRAConfig(scope=scope),
+            vision=path.vision, point_policy=path.point_policy, off_policy=path.temporal_policy,
+        ),
         parallelize_fn=parallelize_rldriving,
         pipelining_fn=None,
         post_optimizer_build_fn=None,
@@ -77,20 +85,33 @@ def _make_reports(*, fps: int, num_epochs: int, steps_per_epoch: int) -> list[Re
 
 
 def rldriving() -> RLDrivingTrainer.Config:
+    """Default: LoRA on the temporal action policy using cached vision features."""
+    return _rldriving("policy")
+
+
+def rldriving_lora_policy() -> RLDrivingTrainer.Config:
+    return _rldriving("policy")
+
+
+def rldriving_lora_all() -> RLDrivingTrainer.Config:
+    """LoRA on the vision encoder and temporal action policy."""
+    return _rldriving("all")
+
+
+def _rldriving(scope: Literal["policy", "all"]) -> RLDrivingTrainer.Config:
     fps = SUPERCOMBO_FPS
     num_epochs = 201
     steps_per_epoch = 64
-    model_spec = model_registry()
+    model_spec = model_registry(scope)
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     world_size = int(os.environ.get("WORLD_SIZE", str(local_world_size)))
     num_nodes = int(os.environ.get("GROUP_WORLD_SIZE", str(world_size // local_world_size)))
     reporterv2_host = os.getenv("REPORTERV2_HOST")
     reporterv2_training_id = os.getenv("REPORTERV2_TRAINING_ID")
     checkpoint_base_folder = f"{reporterv2_host.rstrip('/')}/checkpoint" if reporterv2_host else ""
-    actor_optim = {"lr": 4e-5, "betas": (0.9, 0.999), "eps": 1e-8}
-    critic_optim = {"lr": 2e-4, "betas": (0.9, 0.999), "eps": 1e-8}
     return RLDrivingTrainer.Config(
         model_spec=model_spec,
+        lora=cast(RLDrivingModel.Config, model_spec.model).lora,
         loss=RLDrivingLoss.Config(
             action_noise=(0.25, 0.25),
             gamma=0.95,
@@ -103,7 +124,7 @@ def rldriving() -> RLDrivingTrainer.Config:
             "RLDRIVING_WARM_START_CHECKPOINT",
             "b9facbcc-4d47-410e-b3ce-dfcbad12ba92/56320",
         ),
-        tokenizer=NoOpTokenizer.Config(),
+        tokenizer=RLDrivingTokenizer.Config(),
         dataloader=RLDrivingDataLoader.Config(
             dataset=DEFAULT_TRAIN_LIST,
             training_id=reporterv2_training_id or "",
@@ -112,31 +133,7 @@ def rldriving() -> RLDrivingTrainer.Config:
             steps_per_epoch=steps_per_epoch,
             fps=fps,
         ),
-        optimizer=OptimizersContainer.Config(
-            implementation="fused",
-            param_groups=[
-                ParamGroupConfig(
-                    pattern=r"^actor\.temporal_hydra\.(final_layer|scale_layer)\.",
-                    optimizer_name="AdamW",
-                    optimizer_kwargs={**actor_optim, "weight_decay": 0.0},
-                ),
-                ParamGroupConfig(
-                    pattern=r"^actor\.",
-                    optimizer_name="AdamW",
-                    optimizer_kwargs={**actor_optim, "weight_decay": 3e-2},
-                ),
-                ParamGroupConfig(
-                    pattern=r"^critic\.(critic1|critic2)\.q_hydra\.(final_layer|scale_layer)\.",
-                    optimizer_name="AdamW",
-                    optimizer_kwargs={**critic_optim, "weight_decay": 0.0},
-                ),
-                ParamGroupConfig(
-                    pattern=r"^critic\.",
-                    optimizer_name="AdamW",
-                    optimizer_kwargs={**critic_optim, "weight_decay": 3e-2},
-                ),
-            ],
-        ),
+        optimizer=RLDrivingOptimizers.Config(implementation="fused"),
         lr_scheduler=RLDrivingLRSchedulersConfig(
             steps_per_epoch=steps_per_epoch,
             num_epochs=num_epochs,

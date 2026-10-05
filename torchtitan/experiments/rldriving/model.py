@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import copy
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
-from xx.training.path.model import Hydra, LinearEncoder, PathHead, PathMLP, TemporalPolicy, TemporalSummarizer
+from xx.training.path.model import (
+    Hydra, LinearEncoder, PathHead, PathMLP, Policy, TemporalPolicy, TemporalSummarizer, Vision,
+)
 from xx.training.path.model_config import TEMPORAL_HEADS, temporal_policy_config
-from xx.training.path.model_constants import ACTION_LEN, ModelInputs
+from xx.training.path.model_constants import ACTION_LEN, ModelInputs, VISION_INPUTS_YUV
 
 import torch
 import torch.nn as nn
@@ -22,12 +24,14 @@ from torch.utils.flop_counter import FlopCounterMode
 
 from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig, FullAC
 from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
 from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
+
+from .lora import apply_lora, is_adapter, LoRAConfig
 
 
 # B: batch, T: temporal steps, S: spatial tokens, D: model width, A: action components.
@@ -135,8 +139,26 @@ class RLDrivingModel(BaseModel):
     class Config(BaseModel.Config):
         actor: TemporalPolicy.Config
         critic: Critic.Config
+        lora: LoRAConfig = field(default_factory=LoRAConfig)
+        vision: Vision.Config | None = None
+        point_policy: Policy.Config | None = None
+        off_policy: TemporalPolicy.Config | None = None
+        vision_batch_size: int = 288
+        checkpoint_vision: bool = True
 
         def update_from_config(self, *, config, **kwargs) -> None:
+            self.lora = config.lora
+            self.vision_batch_size = config.vision_batch_size
+            self.checkpoint_vision = config.checkpoint_vision
+            if self.vision is not None:
+                self.vision.flavor = config.vision_flavor
+            self.lora.validate()
+            if self.lora.scope == "all" and any(
+                value is None for value in (self.vision, self.point_policy, self.off_policy)
+            ):
+                raise ValueError("Full-model LoRA requires vision, point_policy and off_policy configs")
+            if self.vision_batch_size < 1:
+                raise ValueError("vision_batch_size must be positive")
             parallelism = config.parallelism
             if parallelism.spmd_backend == "full_dtensor":
                 raise ValueError("rldriving does not support full DTensor")
@@ -163,6 +185,12 @@ class RLDrivingModel(BaseModel):
             action_dim = self.critic.action_encoder.in_layer.in_features
             action_BA = torch.zeros((1, action_dim), dtype=torch.float32, device=device)
             with torch.no_grad(), FlopCounterMode(display=False) as counter:
+                if self.lora.scope == "all":
+                    vision_inputs = {
+                        name: torch.zeros((1, len(self.actor.history_idxs), channels * 2, height, width), device=device)
+                        for name, (channels, height, width) in VISION_INPUTS_YUV.items()
+                    }
+                    inputs = rldriving_model.encode_inputs(inputs | vision_inputs)
                 rldriving_model(inputs)
                 rldriving_model.critic(inputs, action_BA)
             # MFU convention estimates backward as twice the counted forward work.
@@ -175,6 +203,21 @@ class RLDrivingModel(BaseModel):
         self.critic = TwinCritic(config.critic)
         self.target_actor = config.actor.build()
         self.target_critic = TwinCritic(config.critic)
+
+        apply_lora(self.actor, config.lora, prefix="actor")
+        apply_lora(self.target_actor, config.lora, prefix="actor")
+        self.vision = self.target_vision = self.point_policy = self.off_policy = None
+        if config.lora.scope == "all":
+            if config.vision is None or config.point_policy is None or config.off_policy is None:
+                raise ValueError("Full-model LoRA requires PATH vision and auxiliary policies")
+            self.vision = config.vision.build()
+            self.target_vision = config.vision.build()
+            apply_lora(self.vision, config.lora, prefix="vision")
+            apply_lora(self.target_vision, config.lora, prefix="vision")
+            self.target_vision.requires_grad_(False).eval()
+            # Retain the other PATH outputs for rollout metrics and planners.
+            self.point_policy = config.point_policy.build().requires_grad_(False).eval()
+            self.off_policy = config.off_policy.build().requires_grad_(False).eval()
 
         self.target_actor.requires_grad_(False).eval()
         self.target_critic.requires_grad_(False).eval()
@@ -219,6 +262,8 @@ class RLDrivingModel(BaseModel):
     def sync_targets(self) -> None:
         _copy_model_state(self.actor, self.target_actor)
         _copy_model_state(self.critic, self.target_critic)
+        if self.vision is not None:
+            _copy_model_state(self.vision, self.target_vision)
 
     @torch.no_grad()
     def warm_start_critics_from_actor(self) -> None:
@@ -226,20 +271,53 @@ class RLDrivingModel(BaseModel):
             self.critic.critic1.temporal_summarizer,
             self.critic.critic2.temporal_summarizer,
         ):
-            _copy_model_state(self.actor.temporal_summarizer, destination)
+            options = StateDictOptions(full_state_dict=True)
+            actor_state = get_model_state_dict(self.actor.temporal_summarizer, options=options)
+            base_state = {k: v for k, v in actor_state.items() if not is_adapter(k)}
+            set_model_state_dict(destination, base_state, options=options)
         self.sync_targets()
 
     def train(self, mode: bool = True) -> RLDrivingModel:
         super().train(mode)
         self.target_actor.eval()
         self.target_critic.eval()
+        for module in (self.target_vision, self.point_policy, self.off_policy):
+            if module is not None:
+                module.eval()
         return self
 
-    def forward(self, inputs: TemporalInputs) -> ActorOutputs:
-        return _policy_forward(self.actor, inputs)
+    def encode_inputs(self, inputs: TemporalInputs, *, target: bool = False) -> TemporalInputs:
+        vision = self.target_vision if target else self.vision
+        if vision is None or ModelInputs.IMG not in inputs:
+            return inputs
+        images = {name: inputs[name].flatten(0, 1) for name in vision.config.input_frame_names}
+        batch = inputs[ModelInputs.IMG].shape[0]
+        chunks = []
+        for start in range(0, next(iter(images.values())).shape[0], self.config.vision_batch_size):
+            chunk = {name: image[start : start + self.config.vision_batch_size] for name, image in images.items()}
+            features = vision(chunk)
+            chunks.append(features)
+        features = torch.cat(chunks).unflatten(0, (batch, len(self.config.actor.history_idxs)))
+        # The policy keeps its pretrained temporal/desire indexing. Only the
+        # feature slots it reads are populated; no cached rollout features leak in.
+        temporal_len = inputs[ModelInputs.DESIRE].shape[1]
+        full_features = features.new_zeros(batch, temporal_len, *features.shape[2:])
+        indices = torch.tensor(self.config.actor.history_idxs, device=features.device) + temporal_len
+        full_features = full_features.index_copy(1, indices, features)
+        return {
+            ModelInputs.FEATURES: full_features,
+            **{name: inputs[name] for name in (ModelInputs.DESIRE, ModelInputs.TRAFFIC, ModelInputs.ACTION_T)},
+        }
+
+    def forward(
+        self, inputs: TemporalInputs, *, return_policy_inputs: bool = False
+    ) -> ActorOutputs | tuple[ActorOutputs, TemporalInputs]:
+        inputs = self.encode_inputs(inputs)
+        outputs = _policy_forward(self.actor, inputs)
+        return (outputs, inputs) if return_policy_inputs else outputs
 
     def target_forward(self, inputs: TemporalInputs) -> ActorOutputs:
-        return _policy_forward(self.target_actor, inputs)
+        return _policy_forward(self.target_actor, self.encode_inputs(inputs, target=True))
 
 
 def _copy_model_state(source: nn.Module, destination: nn.Module) -> None:
@@ -258,12 +336,23 @@ def parallelize_rldriving(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> RLDrivingModel:
+    if model.vision is not None and model.config.checkpoint_vision:
+        ac = FullAC.Config().build()
+        model.vision.encoder.apply_activation_checkpointing(
+            lambda module, fqn: ac._wrap_block(module, base_fqn=fqn), "full", "vision.encoder"
+        )
     if compile_config.enable and "model" in compile_config.components:
         torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
         model.actor.compile(backend=compile_config.backend)
         model.critic.compile(backend=compile_config.backend)
         model.target_actor.compile(backend=compile_config.backend)
         model.target_critic.compile(backend=compile_config.backend)
+        for vision in (model.vision, model.target_vision):
+            if vision is not None:
+                # Match PATH's compilation boundary; keep vision preprocessing
+                # and the FSDP/checkpoint entry point outside the compiled graph.
+                vision.encoder.compile(backend=compile_config.backend)
         logger.info("Compiling rldriving model components with torch.compile")
 
     names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
@@ -304,6 +393,15 @@ def parallelize_rldriving(
         shard(critic)
     shard(model.critic)
     shard(model.target_critic)
+    for vision in (model.vision, model.target_vision):
+        if vision is not None:
+            for stage in vision.encoder.stages:
+                for block in stage.blocks:
+                    shard(block)
+            shard(vision)
+    for module in (model.point_policy, model.off_policy):
+        if module is not None:
+            shard(module)
     fully_shard(model, **fsdp_config)
 
     if parallelism.enable_fsdp_symm_mem:

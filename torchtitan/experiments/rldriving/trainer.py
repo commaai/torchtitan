@@ -24,7 +24,6 @@ from xx.training.rldriving.dataloader import RolloutContext
 
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -41,7 +40,11 @@ from torchtitan.trainer import Trainer
 from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
 from .model import RLDrivingModel
+from .lora import LoRAConfig
+from .optimizer import RLDrivingOptimizers
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
+from .tokenizer import RLDrivingTokenizer
+from .warm_start import load_path_weights
 
 
 Batch = tuple[
@@ -111,7 +114,7 @@ class RLDrivingLRSchedulers(LRSchedulersContainer):
             epoch = current_step / config.steps_per_epoch
             max_epoch = config.num_epochs - 1.0
             cooldown_start = max_epoch * (1.0 - config.cooldown_fraction)
-            if phase == "actor":
+            if phase in ("actor", "vision"):
                 if epoch < config.actor_delay_epochs:
                     return 0.0
                 warmup_end = config.actor_delay_epochs + max_epoch * config.actor_warmup_fraction
@@ -136,10 +139,13 @@ class RLDrivingLRSchedulers(LRSchedulersContainer):
     def step_phase(self, phase: Literal["actor", "critic"]) -> None:
         all_param_groups = self.optimizer.param_groups
         self.optimizer.param_groups = [
-            group for group in all_param_groups if group["param_names"][0].startswith(f"{phase}.")
+            group for group in all_param_groups
+            if group["param_names"][0].startswith(("actor.", "vision.") if phase == "actor" else ("critic.",))
         ]
-        self.optimizer_container.step()
-        self.optimizer.param_groups = all_param_groups
+        try:
+            self.optimizer_container.step()
+        finally:
+            self.optimizer.param_groups = all_param_groups
 
 
 class RLDrivingTrainer(Trainer):
@@ -149,6 +155,12 @@ class RLDrivingTrainer(Trainer):
         dataloader: RLDrivingDataLoader.Config  # pyrefly: ignore [bad-override]
         checkpoint: RLDrivingOnnxCheckpointManager.Config  # pyrefly: ignore [bad-override]
         lr_scheduler: RLDrivingLRSchedulers.Config  # pyrefly: ignore [bad-override]
+        optimizer: RLDrivingOptimizers.Config = field(default_factory=RLDrivingOptimizers.Config)
+        tokenizer: RLDrivingTokenizer.Config = field(default_factory=RLDrivingTokenizer.Config)
+        lora: LoRAConfig = field(default_factory=LoRAConfig)
+        vision_flavor: str = "convnext_xlarge"
+        vision_batch_size: int = 288
+        checkpoint_vision: bool = True
         warm_start_checkpoint: str
         steps_per_epoch: int
         train_step_barrier_timeout_seconds: int
@@ -159,6 +171,7 @@ class RLDrivingTrainer(Trainer):
 
         def __post_init__(self) -> None:
             Trainer.Config.__post_init__(self)
+            self.lora.validate()
             if self.codedir:
                 self.dataloader.codedir = self.codedir
                 self.miniray["codedir"] = self.codedir
@@ -192,10 +205,17 @@ class RLDrivingTrainer(Trainer):
         )
         self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
-        dcp.load(
-            {"temporal_policy": self.model.actor},
-            storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
-        )
+        checkpoint_path = config.warm_start_checkpoint
+        if not os.path.isdir(checkpoint_path) and "://" not in checkpoint_path:
+            checkpoint_path = _get_path_checkpoint(checkpoint_path).url_or_file()
+        reader = FsspecReader(checkpoint_path)
+        load_path_weights(self.model.actor, "temporal_policy", reader)
+        if self.model.vision is not None:
+            if not isinstance(self.tokenizer, RLDrivingTokenizer):
+                raise ValueError("Full-model LoRA requires RLDrivingTokenizer")
+            load_path_weights(self.model.vision, "vision", reader)
+            load_path_weights(self.model.point_policy, "point_policy", reader)
+            load_path_weights(self.model.off_policy, "temporal_policy", reader)
         self.model.warm_start_critics_from_actor()
 
     # pyrefly: ignore [bad-override]
@@ -218,11 +238,16 @@ class RLDrivingTrainer(Trainer):
 
     def _prepare_n_step_batch(self, batch: Batch) -> NStepPreparedBatch:
         inputs, targets, metadata = batch
-        inputs = {name: value.to(self.device) for name, value in inputs.items()}
+        full_model = self.model.vision is not None
+        input_names = [name for name in TEMPORAL_INPUTS if not full_model or name != "features"]
+        needed = set(input_names) | {f"next_{name}" for name in input_names}
+        if full_model:
+            needed.update(("quantized_latents", "next_quantized_latents", "compressor_mean", "compressor_std"))
+        inputs = {name: value.to(self.device) for name, value in inputs.items() if name in needed}
         targets = {name: value.to(self.device) for name, value in targets.items()}
         metadata = {name: value.to(self.device) for name, value in metadata.items()}
-        current_inputs = {name: inputs[name].float() for name in TEMPORAL_INPUTS}
-        n_step = inputs[f"next_{next(iter(TEMPORAL_INPUTS))}"].shape[1]
+        current_inputs = {name: inputs[name].float() for name in input_names}
+        n_step = inputs["next_desire_pulse"].shape[1]
         next_inputs = {
             name: torch.cat((inputs[name][:, 1:], inputs[f"next_{name}"][:, :1]), dim=1).float()
             for name in current_inputs
@@ -231,6 +256,15 @@ class RLDrivingTrainer(Trainer):
             name: torch.cat((inputs[name][:, n_step:], inputs[f"next_{name}"]), dim=1).float()
             for name in current_inputs
         }
+        if full_model:
+            if inputs["next_quantized_latents"].shape[1] != n_step:
+                raise ValueError("Future latents and policy inputs must have the same bootstrap length")
+            images = self.tokenizer.reconstruct(
+                inputs, history_idxs=self.model.config.actor.history_idxs,
+                temporal_len=current_inputs["desire_pulse"].shape[1], device=self.device,
+            )
+            for window, image_inputs in zip((current_inputs, next_inputs, bootstrap_inputs), images, strict=True):
+                window.update(image_inputs)
         return current_inputs, next_inputs, bootstrap_inputs, targets, metadata
 
     # pyrefly: ignore [bad-override]
@@ -253,13 +287,16 @@ class RLDrivingTrainer(Trainer):
         if self.train_step_barrier_group is not None:
             dist.barrier(group=self.train_step_barrier_group)
         with self.train_context():
-            actor_outputs = self.model(current_inputs)
+            # Enter the FSDP root before invoking its vision/policy children.
+            actor_outputs, current_inputs = self.model(current_inputs, return_policy_inputs=True)
             next_actor_outputs = self.model(next_inputs)
             actor_loss_B, actor_metrics = self.loss_fn.actor_loss(
                 actor_outputs=actor_outputs,
                 next_actor_outputs=next_actor_outputs,
                 online_critic=self.model.critic,
-                current_inputs=current_inputs,
+                # Q's observation is fixed during policy optimization; vision
+                # receives policy gradients through the predicted action.
+                current_inputs={name: value.detach() for name, value in current_inputs.items()},
                 targets=targets,
             )
             actor_loss = actor_loss_B.sum() / local_samples
@@ -267,13 +304,16 @@ class RLDrivingTrainer(Trainer):
         actor_loss = actor_loss.detach()
         self._accumulate_metrics(metric_sums, actor_metrics)
         del actor_outputs, next_actor_outputs, actor_loss_B, actor_metrics
-        actor_grad_norm = self._clip_phase_grad_norm(self.model.actor)
+        actor_grad_norm = self._clip_phase_grad_norm(self.model.actor, self.model.vision)
         self.checkpointer.maybe_wait_for_staging()
         self.lr_schedulers.step_phase("actor")
 
         self.optimizers.zero_grad()
+        current_inputs = {name: value.detach() for name, value in current_inputs.items()}
+        del next_inputs
         with self.train_context():
             with torch.no_grad():
+                bootstrap_inputs = self.model.encode_inputs(bootstrap_inputs, target=True)
                 bootstrap_actor_outputs = self.model.target_forward(bootstrap_inputs)
             critic_loss_B, critic_metrics = self.loss_fn.critic_loss(
                 bootstrap_actor_outputs=bootstrap_actor_outputs,
@@ -297,9 +337,14 @@ class RLDrivingTrainer(Trainer):
             for online, target in (
                 (self.model.actor, self.model.target_actor),
                 (self.model.critic, self.model.target_critic),
+                (self.model.vision, self.model.target_vision),
             ):
+                if online is None:
+                    continue
                 for online_param, target_param in zip(online.parameters(), target.parameters()):
-                    target_param.mul_(decay).add_(online_param, alpha=1.0 - decay)
+                    # Frozen warm-start weights must remain bitwise unchanged.
+                    if online_param.requires_grad:
+                        target_param.mul_(decay).add_(online_param, alpha=1.0 - decay)
                 for online_buffer, target_buffer in zip(online.buffers(), target.buffers()):
                     target_buffer.copy_(online_buffer)
         self.lr_schedulers.step()
@@ -362,9 +407,9 @@ class RLDrivingTrainer(Trainer):
             },
         )
 
-    def _clip_phase_grad_norm(self, module: nn.Module) -> torch.Tensor:
+    def _clip_phase_grad_norm(self, *modules: nn.Module | None) -> torch.Tensor:
         return dist_utils.clip_grad_norm_(
-            module.parameters(),
+            [p for module in modules if module is not None for p in module.parameters() if p.requires_grad],
             self.config.training.max_norm,
             foreach=True,
         )
