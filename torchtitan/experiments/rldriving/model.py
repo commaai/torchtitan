@@ -260,15 +260,6 @@ class RLDrivingModel(BaseModel):
         _copy_model_state(self.actor, self.target_actor)
         _copy_model_state(self.critic, self.target_critic)
 
-    @torch.no_grad()
-    def warm_start_critics_from_actor(self) -> None:
-        for destination in (
-            self.critic.critic1.temporal_summarizer,
-            self.critic.critic2.temporal_summarizer,
-        ):
-            _copy_model_state(self.actor.off_policy.temporal_summarizer, destination)
-        self.sync_targets()
-
     def train(self, mode: bool = True) -> RLDrivingModel:
         super().train(mode)
         self.target_actor.eval()

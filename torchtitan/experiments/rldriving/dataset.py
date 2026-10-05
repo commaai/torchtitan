@@ -142,7 +142,7 @@ class RLDrivingDataLoader(BaseDataLoader):
         try:
             for sim, reference in zip(*self._iterators):
                 inputs, targets = (
-                    {name: torch.cat((left[name], right[name])) for name in left.keys() & right.keys()}
+                    {name: torch.cat((left[name], right[name])) for name in left}
                     for left, right in zip(sim[:2], reference[:2])
                 )
                 yield inputs, targets, sim[2]

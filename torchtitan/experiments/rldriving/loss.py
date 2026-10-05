@@ -69,13 +69,7 @@ def _critic_loss(
 ) -> LossResult:
     action_reward_B = targets["action_reward"]
     rollout_action_BA = action_reward_B[:, 0:2]
-    environment_rewards_BN = targets["n_step_reward"]
-    rewards_BN = config.environment_reward_weight * environment_rewards_BN
-    reward_metrics = {"environment_reward": environment_rewards_BN[:, 0].detach()}
-    if config.source_reward_weight:
-        source_rewards_BN = _source_rewards(target_critic, current_inputs, bootstrap_inputs, targets["n_step_action"])
-        rewards_BN = rewards_BN + config.source_reward_weight * source_rewards_BN
-        reward_metrics["source_reward"] = source_rewards_BN[:, 0]
+    rewards_BN = _source_rewards(target_critic, current_inputs, bootstrap_inputs, targets["n_step_action"])
 
     critic1, critic2 = online_critic(
         inputs=current_inputs,
@@ -111,7 +105,8 @@ def _critic_loss(
         F.mse_loss(q1_rollout_B, target_B, reduction="none") + F.mse_loss(q2_rollout_B, target_B, reduction="none")
     )
     metrics = {
-        **reward_metrics,
+        "environment_reward": targets["n_step_reward"][:, 0].detach(),
+        "source_reward": rewards_BN[:, 0],
         "critic_loss": critic_loss_B.detach(),
         "q1_rollout": q1_rollout_B.detach(),
         "q2_rollout": q2_rollout_B.detach(),
@@ -143,7 +138,7 @@ def _critic_loss(
                 "off_policy_fraction": off_policy_B,
             }
         )
-    return critic_loss_B * on_policy_weight_B + config.source_loss_weight * source_loss_B, metrics
+    return critic_loss_B * on_policy_weight_B + source_loss_B, metrics
 
 
 def _actor_loss(
@@ -214,9 +209,6 @@ class RLDrivingLoss(BaseLoss):
         curv_rate_cost: float = 0.0
         action_bound: float = 10.0
         action_bound_loss_weight: float = 1.0
-        source_loss_weight: float = 1.0
-        environment_reward_weight: float = 1.0
-        source_reward_weight: float = 0.0
 
     def __init__(
         self,
