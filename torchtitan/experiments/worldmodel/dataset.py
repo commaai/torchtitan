@@ -34,6 +34,7 @@ class _DiffusionConfig:
     train_skip: int
     val_skip: int
     nan_engaged_plans: bool
+    map_navigation: bool
 
     def skip(self, val: bool) -> int:
         return self.val_skip if val else self.train_skip
@@ -103,6 +104,7 @@ class WorldModelDataLoader(BaseDataLoader):
         train_skip: int
         val_skip: int
         nan_engaged_plans: bool
+        map_navigation: bool  # Online route-up maps and navigation per frame (nav_map, navigation).
         limit: int | None
         mock_data: bool
         mock_segment_batch_size: int
@@ -226,6 +228,7 @@ class WorldModelDataLoader(BaseDataLoader):
                 train_skip=config.train_skip,
                 val_skip=config.val_skip,
                 nan_engaged_plans=config.nan_engaged_plans,
+                map_navigation=config.map_navigation,
             ),
             val=val,
             local_rank=int(os.environ.get("LOCAL_RANK", "0")),
