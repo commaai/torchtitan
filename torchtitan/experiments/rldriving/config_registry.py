@@ -95,8 +95,8 @@ def rldriving() -> RLDrivingTrainer.Config:
             action_noise=(0.25, 0.25),
             gamma=0.95,
             fps=fps,
-            smooth_lat_cost=0.15,
-            smooth_long_cost=0.05,
+            smooth_lat_cost=0.0,
+            smooth_long_cost=0.0,
             curv_rate_cost=20.0,
         ),
         warm_start_checkpoint=os.getenv(
@@ -126,7 +126,7 @@ def rldriving() -> RLDrivingTrainer.Config:
                     optimizer_kwargs={**actor_optim, "weight_decay": 3e-2},
                 ),
                 ParamGroupConfig(
-                    pattern=r"^critic\.(critic1|critic2)\.q_hydra\.(final_layer|scale_layer)\.",
+                    pattern=r"^critic\.(critic1|critic2)\.(q_hydra|noise_hydra)\.(final_layer|scale_layer)\.",
                     optimizer_name="AdamW",
                     optimizer_kwargs={**critic_optim, "weight_decay": 0.0},
                 ),

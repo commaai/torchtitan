@@ -58,6 +58,7 @@ class Critic(Module):
         post_action_mlp1: PathMLP.Config
         post_action_mlp2: PathMLP.Config
         q_hydra: Hydra.Config
+        noise_hydra: Hydra.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -67,6 +68,7 @@ class Critic(Module):
         self.post_action_mlp1 = config.post_action_mlp1.build()
         self.post_action_mlp2 = config.post_action_mlp2.build()
         self.q_hydra = config.q_hydra.build()
+        self.noise_hydra = config.noise_hydra.build()
 
     def forward(self, inputs: TemporalInputs, action: torch.Tensor) -> dict[str, torch.Tensor]:
         features_BTSD = inputs[ModelInputs.FEATURES]
@@ -78,9 +80,13 @@ class Critic(Module):
             inputs[ModelInputs.ACTION_T][:, -1].to(dtype),
         )
         critic_features_BD = critic_features_BD + self.post_action_mlp1(critic_features_BD)
+        noise_scale_BA = self.noise_hydra(critic_features_BD)[NOISE_HEAD_NAME]
         critic_features_BD = critic_features_BD + self.action_encoder(action.to(dtype))
         critic_features_BD = critic_features_BD + self.post_action_mlp2(critic_features_BD)
-        return {name: value.squeeze(-1).clone() for name, value in self.q_hydra(critic_features_BD).items()}
+        return {
+            Q_HEAD_NAME: self.q_hydra(critic_features_BD)[Q_HEAD_NAME].squeeze(-1).clone(),
+            NOISE_HEAD_NAME: noise_scale_BA.clone(),
+        }
 
 
 def actor_config() -> TemporalPolicy.Config:
@@ -108,15 +114,15 @@ def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
         post_action_mlp1=post_action_mlp,
         post_action_mlp2=copy.deepcopy(post_action_mlp),
         q_hydra=Hydra.Config(
-            heads=(
-                PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),
-                PathHead(name=NOISE_HEAD_NAME, output_size=2, mlp=False, scale=False),
-            ),
+            heads=(PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),),
             head_mlps={},
-            final_layers={
-                name: Linear.Config(in_features=dim, out_features=size, bias=True)
-                for name, size in ((Q_HEAD_NAME, 1), (NOISE_HEAD_NAME, 2))
-            },
+            final_layers={Q_HEAD_NAME: Linear.Config(in_features=dim, out_features=1, bias=True)},
+            scale_layers={},
+        ),
+        noise_hydra=Hydra.Config(
+            heads=(PathHead(name=NOISE_HEAD_NAME, output_size=2, mlp=False, scale=False),),
+            head_mlps={},
+            final_layers={NOISE_HEAD_NAME: Linear.Config(in_features=dim, out_features=2, bias=True)},
             scale_layers={},
         ),
     )
