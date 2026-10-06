@@ -17,7 +17,7 @@ from typing import Any, cast, Literal
 
 from xx.common.helpers import parse_info
 from xx.ml_tools.constants.model import TEMPORAL_INPUTS
-from xx.training.lib.checkpoint import Checkpoint
+from xx.training.lib.checkpoint import Checkpoint, MODELS_HOST
 from xx.training.lib.torchtitan.report_runner import Report, ReportRunner
 from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
 from xx.training.rldriving.dataloader import RolloutContext
@@ -182,6 +182,15 @@ class RLDrivingTrainer(Trainer):
                 backend="gloo", timeout=timedelta(seconds=config.train_step_barrier_timeout_seconds)
             )
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
+        models_host: list[str | None] = [None]
+        server = self.checkpointer.checkpoint_server
+        if server is not None:
+            models_host[0] = f"{MODELS_HOST.rstrip('/')}/trainer/{server.origin}/{training_id}/{server.session}"
+        if dist.get_world_size() > 1:
+            dist.broadcast_object_list(models_host, src=0)
+        self.dataloader.dataset.config = self.dataloader.dataset.config.replace(
+            models_host=models_host[0]
+        )
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:rldriving:train")
         self.report_runner = ReportRunner(
             config.reports,
@@ -237,6 +246,8 @@ class RLDrivingTrainer(Trainer):
     def train_step(self, data_iterator: Iterator[Batch]) -> None:
         steps_per_epoch = self.config.steps_per_epoch
         rollout_epoch = ((self.step - 1) // steps_per_epoch) * steps_per_epoch + 1
+        if not self.config.dataloader.load_caches and self.checkpointer.checkpoint_server_latest_step is not None:
+            rollout_epoch = self.checkpointer.checkpoint_server_latest_step + 1
         self.dataloader.attach_training_context(RolloutContext(epoch=rollout_epoch))
         batch = next(data_iterator)
         info = batch[0].get("info")
@@ -385,6 +396,8 @@ class RLDrivingTrainer(Trainer):
         loaded = self.checkpointer.load(step=config.checkpoint.load_step)
         if not loaded:
             self.checkpointer.save(0)
+        else:
+            self.checkpointer.checkpoint_server_save(self.step, force=True)
         self.set_runtime_seed()
         loaded_step = self.step
         logger.info(f"Training starts at step {self.step + 1}")

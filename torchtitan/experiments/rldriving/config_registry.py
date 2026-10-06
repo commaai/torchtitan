@@ -164,7 +164,8 @@ def rldriving() -> RLDrivingTrainer.Config:
             cast(RLDrivingModel.Config, model_spec.model),
             base_folder=checkpoint_base_folder,
             folder=reporterv2_training_id or "checkpoint",
-            interval=steps_per_epoch,
+            interval=10 * steps_per_epoch,
+            checkpoint_server_interval=steps_per_epoch,
         ),
         steps_per_epoch=steps_per_epoch,
         train_step_barrier_timeout_seconds=60 * 60,
@@ -189,6 +190,7 @@ def _checkpoint_config(
     base_folder: str,
     folder: str,
     interval: int,
+    checkpoint_server_interval: int,
 ) -> RLDrivingOnnxCheckpointManager.Config:
     input_shapes = RLDrivingModel.input_shapes(model)
     return RLDrivingOnnxCheckpointManager.Config(
@@ -198,6 +200,8 @@ def _checkpoint_config(
         export_onnx=True,
         folder=folder,
         interval=interval,
+        checkpoint_server_path="/var/tmp/checkpoints",
+        checkpoint_server_interval=checkpoint_server_interval,
         input_names=list(input_shapes),
         input_shapes=[list(shape) for shape in input_shapes.values()],
         input_dtypes=["float32"] * len(input_shapes),
