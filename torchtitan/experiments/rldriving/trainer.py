@@ -193,7 +193,7 @@ class RLDrivingTrainer(Trainer):
         self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
         dcp.load(
-            {"temporal_policy": self.model.actor},
+            {"temporal_policy": self.model.actor.off_policy},
             storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
         )
         self.model.sync_targets()

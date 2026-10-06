@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, cast
 from xx.training.path.model import Hydra, LinearEncoder, PathHead, PathMLP, TemporalPolicy, TemporalSummarizer
-from xx.training.path.model_config import TEMPORAL_HEADS, temporal_policy_config
+from xx.training.path.model_config import _encoder, _hydra, TEMPORAL_HEADS, temporal_policy_config
 from xx.training.path.model_constants import ACTION_LEN, ModelInputs
 
 import torch
@@ -34,12 +34,13 @@ from torchtitan.tools.logging import logger
 ACTION_HEAD_NAME = "action"
 Q_HEAD_NAME = "q"
 NOISE_HEAD_NAME = "noise_scale"
+RESIDUAL_ACTION_HEAD_NAME = "residual_action"
 
 TemporalInputs = dict[str, torch.Tensor]
 ActorOutputs = dict[str, torch.Tensor]
 
 
-def _policy_forward(policy: TemporalPolicy, inputs: TemporalInputs) -> ActorOutputs:
+def _policy_forward(policy: ResFiTPolicy, inputs: TemporalInputs) -> ActorOutputs:
     outputs = policy(
         inputs[ModelInputs.FEATURES],
         inputs[ModelInputs.DESIRE],
@@ -47,6 +48,56 @@ def _policy_forward(policy: TemporalPolicy, inputs: TemporalInputs) -> ActorOutp
         inputs[ModelInputs.ACTION_T],
     )
     return {ACTION_HEAD_NAME: outputs[ACTION_HEAD_NAME]}
+
+
+class ResFiTPolicy(Module):
+    def __init__(self, config: TemporalPolicy.Config):
+        super().__init__()
+        self.off_policy = config.build().requires_grad_(False).eval()
+        self.temporal_summarizer = config.temporal_summarizer.build()
+        self.history_idxs = config.history_idxs
+        dim = config.temporal_summarizer.temporal_pos_embedding.embedding_dim
+        residual_hydra = _hydra(
+            (PathHead(name=RESIDUAL_ACTION_HEAD_NAME, output_size=ACTION_LEN, mlp=True, scale=False),),
+            in_features=dim,
+            mlp_mult=2,
+        )
+        residual_hydra.final_layers[RESIDUAL_ACTION_HEAD_NAME].param_init = {
+            "weight": nn.init.zeros_,
+            "bias": nn.init.zeros_,
+        }
+        self.residual_hydra = residual_hydra.build()
+        self.action_encoder = _encoder(ACTION_LEN, dim).build()
+
+    def forward(
+        self,
+        features_BTSD: torch.Tensor,
+        desire_BTA: torch.Tensor,
+        traffic_BTA: torch.Tensor,
+        action_t_BTA: torch.Tensor,
+    ) -> ActorOutputs:
+        with torch.no_grad():
+            off_policy_action_BA = self.off_policy(features_BTSD, desire_BTA, traffic_BTA, action_t_BTA)[
+                ACTION_HEAD_NAME
+            ]
+        dtype = features_BTSD.dtype
+        summary_BD = self.temporal_summarizer(
+            features_BTSD[:, self.history_idxs],
+            desire_BTA.to(dtype),
+            traffic_BTA[:, -1].to(dtype),
+            action_t_BTA[:, -1].to(dtype),
+        )
+        summary_BD = summary_BD + self.action_encoder(off_policy_action_BA[..., :ACTION_LEN].to(dtype))
+        residual_BA = 0.5 * self.residual_hydra(summary_BD)[RESIDUAL_ACTION_HEAD_NAME].tanh()
+        action_BA = torch.cat(
+            (off_policy_action_BA[..., :ACTION_LEN] + residual_BA, off_policy_action_BA[..., ACTION_LEN:]), dim=-1
+        )
+        return {ACTION_HEAD_NAME: action_BA}
+
+    def train(self, mode: bool = True) -> ResFiTPolicy:
+        super().train(mode)
+        self.off_policy.eval()
+        return self
 
 
 class Critic(Module):
@@ -183,9 +234,9 @@ class RLDrivingModel(BaseModel):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.actor = config.actor.build()
+        self.actor = ResFiTPolicy(config.actor)
         self.critic = TwinCritic(config.critic)
-        self.target_actor = config.actor.build()
+        self.target_actor = ResFiTPolicy(config.actor)
         self.target_critic = TwinCritic(config.critic)
 
         self.target_actor.requires_grad_(False).eval()
@@ -238,7 +289,7 @@ class RLDrivingModel(BaseModel):
             self.critic.critic1.temporal_summarizer,
             self.critic.critic2.temporal_summarizer,
         ):
-            _copy_model_state(self.actor.temporal_summarizer, destination)
+            _copy_model_state(self.actor.off_policy.temporal_summarizer, destination)
         self.sync_targets()
 
     def train(self, mode: bool = True) -> RLDrivingModel:
@@ -295,15 +346,12 @@ def parallelize_rldriving(
     def shard(module: nn.Module, reshard: bool = reshard_after_forward) -> None:
         fully_shard(module, **fsdp_config, reshard_after_forward=reshard)
 
-    for temporal_summarizer in (
-        model.actor.temporal_summarizer,
-        model.critic.critic1.temporal_summarizer,
-        model.critic.critic2.temporal_summarizer,
-        model.target_actor.temporal_summarizer,
-        model.target_critic.critic1.temporal_summarizer,
-        model.target_critic.critic2.temporal_summarizer,
-    ):
-        temporal_summarizer.transformer.apply_fsdp(shard, reshard_after_forward)
+    for module in model.modules():
+        if isinstance(module, TemporalSummarizer):
+            module.transformer.apply_fsdp(shard, reshard_after_forward)
+
+    for actor in (model.actor, model.target_actor):
+        shard(actor.off_policy)
 
     shard(model.actor)
     shard(model.target_actor)

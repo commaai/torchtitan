@@ -97,7 +97,7 @@ def rldriving() -> RLDrivingTrainer.Config:
             fps=fps,
             smooth_lat_cost=0.0,
             smooth_long_cost=0.0,
-            curv_rate_cost=20.0,
+            curv_rate_cost=0.0,
         ),
         warm_start_checkpoint=os.getenv(
             "RLDRIVING_WARM_START_CHECKPOINT",
@@ -116,7 +116,7 @@ def rldriving() -> RLDrivingTrainer.Config:
             implementation="fused",
             param_groups=[
                 ParamGroupConfig(
-                    pattern=r"^actor\.temporal_hydra\.(final_layer|scale_layer)\.",
+                    pattern=r"^actor\.residual_hydra\.final_layer\.",
                     optimizer_name="AdamW",
                     optimizer_kwargs={**actor_optim, "weight_decay": 0.0},
                 ),
