@@ -150,7 +150,6 @@ class RLDrivingTrainer(Trainer):
         checkpoint: RLDrivingOnnxCheckpointManager.Config  # pyrefly: ignore [bad-override]
         lr_scheduler: RLDrivingLRSchedulers.Config  # pyrefly: ignore [bad-override]
         warm_start_checkpoint: str
-        critic_warm_start_checkpoint: str
         steps_per_epoch: int
         train_step_barrier_timeout_seconds: int
         ema_tau: float
@@ -198,10 +197,6 @@ class RLDrivingTrainer(Trainer):
             storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
         )
         self.model.sync_targets()
-        dcp.load(
-            {"critic": self.model.critic, "target_critic": self.model.target_critic},
-            storage_reader=FsspecReader(_get_path_checkpoint(config.critic_warm_start_checkpoint).url_or_file()),
-        )
 
     # pyrefly: ignore [bad-override]
     def batch_generator(self, data_iterable: Iterable[Batch]) -> Iterator[Batch]:
