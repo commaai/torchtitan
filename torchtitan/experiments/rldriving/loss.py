@@ -36,6 +36,27 @@ def _sample_fixed_noise_policy(
     return action_mean_BA + torch.randn_like(action_mean_BA) * action_noise_A
 
 
+@torch.no_grad()
+def _noise_rewards(
+    target_critic: nn.Module,
+    current_inputs: ModelInputs,
+    bootstrap_inputs: ModelInputs,
+    actions_BNA: torch.Tensor,
+) -> torch.Tensor:
+    n_step = actions_BNA.shape[1]
+    history_length = next(iter(current_inputs.values())).shape[1]
+    sequence_inputs = {
+        name: torch.cat((value, bootstrap_inputs[name][:, -n_step:]), dim=1) for name, value in current_inputs.items()
+    }
+    rewards = []
+    for offset in range(n_step):
+        inputs = {name: value[:, offset : offset + history_length] for name, value in sequence_inputs.items()}
+        critic1, critic2 = target_critic(inputs=inputs, action=actions_BNA[:, offset])
+        noise_scale_BA = 0.5 * (critic1["noise_scale"].float() + critic2["noise_scale"].float())
+        rewards.append(2.0 - noise_scale_BA.clamp(0.0, 2.0).mean(dim=-1))
+    return torch.stack(rewards, dim=1)
+
+
 def _critic_loss(
     *,
     config: RLDrivingLoss.Config,
@@ -49,7 +70,7 @@ def _critic_loss(
 ) -> LossResult:
     action_reward_B = targets["action_reward"]
     rollout_action_BA = action_reward_B[:, 0:2]
-    rewards_BN = targets["n_step_reward"]
+    rewards_BN = _noise_rewards(target_critic, current_inputs, bootstrap_inputs, targets["n_step_action"])
 
     critic1, critic2 = online_critic(
         inputs=current_inputs,
@@ -85,6 +106,8 @@ def _critic_loss(
         F.mse_loss(q1_rollout_B, target_B, reduction="none") + F.mse_loss(q2_rollout_B, target_B, reduction="none")
     )
     metrics = {
+        "environment_reward": targets["n_step_reward"][:, 0].detach(),
+        "noise_reward": rewards_BN[:, 0],
         "critic_loss": critic_loss_B.detach(),
         "q1_rollout": q1_rollout_B.detach(),
         "q2_rollout": q2_rollout_B.detach(),
