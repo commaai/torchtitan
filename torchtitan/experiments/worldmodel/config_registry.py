@@ -47,7 +47,7 @@ __all__ = [
 def worldmodel() -> WorldModelTrainer.Config:
     local_batch_size = 16
     validation_freq = 512
-    steps = validation_freq * 30
+    steps = validation_freq * 15
     validation_steps = 8
     compile_config = CompileConfig(enable=True, components=["model", "loss"])
     optimizer = default_adamw(lr=2e-4, weight_decay=1e-2)
@@ -121,6 +121,7 @@ def worldmodel() -> WorldModelTrainer.Config:
             fake_timesteps_prob=0.0,
         ),
         pose_dropout=0.1,
+        nav_dropout=0.1,
         noise_scheduler_steps=10,
         no_noise_prefill_frames_prob=0.5,
         fake_timesteps_prob=0.5,

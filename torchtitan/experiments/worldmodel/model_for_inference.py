@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
+from xx.training.path.model_constants import MAP_SIZE, VALHALLA_COMMAND_COUNT
 
 from torchtitan.experiments.worldmodel.model import (
     _cast_if_autocast_enabled,
@@ -261,6 +262,9 @@ class WorldModelForInference(WorldModel):
             "ref_augment_from_augments_euler": (batch_size, frames, pose_size),
             "pose_mask": (batch_size, frames),
             "fidxs": (batch_size, frames),
+            "nav_map": (batch_size, frames, 1, MAP_SIZE, MAP_SIZE),
+            "navigation": (batch_size, frames, VALHALLA_COMMAND_COUNT + 1),
+            "nav_mask": (batch_size, frames),
         }
 
     @staticmethod
@@ -271,6 +275,9 @@ class WorldModelForInference(WorldModel):
             "ref_augment_from_augments_euler": dtype,
             "pose_mask": torch.int64,
             "fidxs": torch.int64,
+            "nav_map": torch.uint8,
+            "navigation": dtype,
+            "nav_mask": torch.int64,
         }
 
     @classmethod
@@ -283,7 +290,7 @@ class WorldModelForInference(WorldModel):
         device: torch.device | str = "meta",
     ) -> dict[str, torch.Tensor]:
         dtypes = cls.input_dtypes(dtype)
-        return {
+        inputs = {
             name: (
                 torch.randn(shape, dtype=dtypes[name], device=device)
                 if dtypes[name].is_floating_point
@@ -291,6 +298,10 @@ class WorldModelForInference(WorldModel):
             )
             for name, shape in cls.input_shapes(config, batch_size=batch_size).items()
         }
+        inputs["nav_map"][:, :-1] = 0
+        inputs["navigation"][:, :-1] = 0
+        inputs["nav_mask"][:, -1] = 0
+        return inputs
 
     def get_model_io(
         self,
@@ -476,6 +487,9 @@ class WorldModelForInference(WorldModel):
         pose_mask: torch.Tensor,
         fidxs: torch.Tensor,
         *,
+        nav_map: torch.Tensor | None = None,
+        navigation: torch.Tensor | None = None,
+        nav_mask: torch.Tensor | None = None,
         semantic_pos: torch.Tensor,
         cache_pos: torch.Tensor,
         cache_seq_length: int,
@@ -488,6 +502,13 @@ class WorldModelForInference(WorldModel):
         device = x.device
         batch, frames = x.shape[:2]
         trajectory = [x.clone()] if return_trajectory else None
+        navigation_inputs = {}
+        for name, value in (("nav_map", nav_map), ("navigation", navigation), ("nav_mask", nav_mask)):
+            if value is not None:
+                if cfg > 0.0:
+                    unconditional = torch.ones_like(value) if name == "nav_mask" else torch.zeros_like(value)
+                    value = torch.cat((unconditional, value), dim=1)
+                navigation_inputs[name] = value
 
         dummy_timestep = torch.ones(batch, frames, device=device, dtype=torch.float32)
         model_output: dict[str, torch.Tensor] = {}
@@ -508,6 +529,7 @@ class WorldModelForInference(WorldModel):
                 cache_pos=cache_pos,
                 cache_seq_length=cache_seq_length,
                 input_mask=input_mask,
+                **navigation_inputs,
             )
             velocity = model_output["sample"]
             if cfg > 0.0:
@@ -536,6 +558,7 @@ class WorldModelForInference(WorldModel):
                 cache_pos=cache_pos,
                 cache_seq_length=cache_seq_length,
                 input_mask=input_mask,
+                **navigation_inputs,
             )
             model_output["plan"] = clean_output["plan"]
 
@@ -550,6 +573,9 @@ class WorldModelForInference(WorldModel):
         pose_mask: torch.Tensor,
         fidxs: torch.Tensor,
         *,
+        nav_map: torch.Tensor | None = None,
+        navigation: torch.Tensor | None = None,
+        nav_mask: torch.Tensor | None = None,
         steps: int = 15,
         num_prefill_frames: int | None = None,
         num_conditioning_frames: int | None = None,
@@ -576,6 +602,11 @@ class WorldModelForInference(WorldModel):
         latents = latents.to(dtype=dtype)
         device = latents.device
         is_meta = latents.is_meta
+        navigation_inputs = {
+            name: value
+            for name, value in (("nav_map", nav_map), ("navigation", navigation), ("nav_mask", nav_mask))
+            if value is not None
+        }
 
         if steps <= 0:
             self.cleanup_caches()
@@ -594,6 +625,7 @@ class WorldModelForInference(WorldModel):
                 ref_augment_from_augments_euler,
                 pose_mask,
                 fidxs,
+                **navigation_inputs,
             )
             start = max(0, num_prefill_frames - 1)
             output_latents = self.unscale_latents(latents[:, start:])
@@ -633,6 +665,7 @@ class WorldModelForInference(WorldModel):
         )
 
         latents[:, :num_prefill_frames] = self.scale_latents(latents[:, :num_prefill_frames])
+        # Navigation belongs only to the final context slot, which is always in the decode suffix.
         self._prefill(
             latents=latents,
             augments_pos_ref_augment=augments_pos_ref_augment,
@@ -664,6 +697,7 @@ class WorldModelForInference(WorldModel):
             scheduler=scheduler,
             steps=steps,
             return_trajectory=return_trajectory,
+            **{name: value[:, num_prefill_frames:] for name, value in navigation_inputs.items()},
         )
 
         if not is_meta and not all(torch.isfinite(value).all() for value in model_output.values()):

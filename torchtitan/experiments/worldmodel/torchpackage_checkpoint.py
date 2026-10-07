@@ -56,6 +56,8 @@ WORLD_MODEL_TRAINING_TORCH_PACKAGE_RECIPE = (
 )
 
 TORCH_EXPORT_INTERN_MODULES = [
+    "xx.training.path.convnext",
+    "xx.training.path.model_constants",
     "torchtitan.config.**",
     "torchtitan.distributed",
     "torchtitan.distributed.compile",
@@ -85,6 +87,7 @@ TORCH_EXPORT_EXTERN_MODULES = [
     "torchao.**",
     "numpy.**",
     "einops.**",
+    "timm.**",
     "spmd_types.**",
     "typing_extensions.**",
     "tyro.**",

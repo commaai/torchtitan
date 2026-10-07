@@ -93,6 +93,7 @@ def _prepare_worldmodel_batch(
     future_size_frames: int,
     no_noise_prefill_frames_prob: float,
     fake_timesteps_prob: float,
+    nav_dropout: float = 0.1,
     prefill_noise_prob: float = 0.0,
     train: bool,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -140,14 +141,25 @@ def _prepare_worldmodel_batch(
         noisy_latents = scheduler.add_noise(latents, noise, fake_timesteps)
         targets = {**targets, "v": latents - noise, "mask": mask}
 
-    return {
+    model_inputs = {
         "x": noisy_latents,
         "t": timesteps,
         "augments_pos_ref_augment": augments,
         "ref_augment_from_augments_euler": eulers,
         "pose_mask": pose_mask.to(dtype=torch.int64),
         "fidx": fidxs,
-    }, targets
+    }
+    if "nav_map" in input_dict:
+        nav_mask = input_dict["nav_mask"].to(device=device, dtype=torch.bool).clone()
+        nav_mask[:, :-1] = True
+        if train:
+            nav_mask |= torch.rand((batch_size, 1), device=device) < nav_dropout
+        model_inputs.update(
+            nav_map=input_dict["nav_map"].to(device=device).masked_fill(nav_mask[..., None, None, None], 0),
+            navigation=input_dict["navigation"].to(device=device, dtype=dtype).masked_fill(nav_mask[..., None], 0),
+            nav_mask=nav_mask.to(dtype=torch.int64),
+        )
+    return model_inputs, targets
 
 
 class WorldModelValidator(BaseValidator):
@@ -296,6 +308,7 @@ class WorldModelTrainer(Trainer):
         float8: WorldModelFloat8Config = field(default_factory=WorldModelFloat8Config)
         prefill_noise_prob: float = 0.0
         pose_dropout: float
+        nav_dropout: float = 0.1
         noise_scheduler_steps: int
         no_noise_prefill_frames_prob: float
         fake_timesteps_prob: float
@@ -392,6 +405,7 @@ class WorldModelTrainer(Trainer):
                 scheduler=self.train_noise_scheduler,
                 discrete_timesteps=self.discrete_timesteps,
                 pose_dropout=self.config.pose_dropout,
+                nav_dropout=self.config.nav_dropout,
                 inference_prefill_frames=self.config.dataloader.inference_prefill_frames,
                 future_size_frames=self.config.dataloader.future_size_frames,
                 no_noise_prefill_frames_prob=self.config.no_noise_prefill_frames_prob,
@@ -571,6 +585,8 @@ def _validate_worldmodel_config(config: WorldModelTrainer.Config) -> None:
         raise ValueError("model in_channels must match dataloader in_channels")
     if not 0.0 <= config.prefill_noise_prob <= 1.0:
         raise ValueError("prefill_noise_prob must be in [0, 1]")
+    if not 0.0 <= config.nav_dropout <= 1.0:
+        raise ValueError("nav_dropout must be in [0, 1]")
     if (
         config.parallelism.tensor_parallel_degree > 1
         or config.parallelism.pipeline_parallel_degree > 1

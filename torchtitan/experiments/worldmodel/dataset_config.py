@@ -38,7 +38,7 @@ def _dataloader_config(
     train_skip: int = 40,
     val_skip: int = 800,
     nan_engaged_plans: bool = False,
-    map_navigation: bool = False,
+    map_navigation: bool = True,
     limit: int | None = None,
     mock_data: bool = False,
     mock_segment_batch_size: int = 8,

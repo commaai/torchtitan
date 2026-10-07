@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
+from xx.training.path.model_constants import MAP_SIZE, VALHALLA_COMMAND_COUNT
 
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.tokenizer import BaseTokenizer
@@ -75,6 +76,14 @@ class _MockDataset:
                 "info": np.zeros((batch, 512), dtype=np.uint8),
             }
         )
+        if cfg.map_navigation:
+            inputs["nav_map"] = np.zeros((batch, frames, 1, MAP_SIZE, MAP_SIZE), dtype=np.uint8)
+            inputs["nav_map"][:, -1] = np.random.randint(0, 256, (batch, 1, MAP_SIZE, MAP_SIZE), dtype=np.uint8)
+            inputs["navigation"] = np.zeros((batch, frames, VALHALLA_COMMAND_COUNT + 1), dtype=np.float32)
+            inputs["navigation"][:, -1, 1] = 1.0
+            inputs["navigation"][:, -1, -1] = 2.0
+            inputs["nav_mask"] = np.ones((batch, frames), dtype=np.int64)
+            inputs["nav_mask"][:, -1] = 0
         targets = {"plan": np.random.randn(batch, PLAN_SIZE).astype(np.float32)}
         return inputs, targets
 
@@ -104,7 +113,7 @@ class WorldModelDataLoader(BaseDataLoader):
         train_skip: int
         val_skip: int
         nan_engaged_plans: bool
-        map_navigation: bool  # Online route-up maps and navigation per frame (nav_map, navigation).
+        map_navigation: bool  # Online map and navigation at the last context frame; other frames are masked.
         limit: int | None
         mock_data: bool
         mock_segment_batch_size: int
@@ -113,6 +122,8 @@ class WorldModelDataLoader(BaseDataLoader):
             total_frames = self.context_size_frames + self.future_size_frames
             if total_frames <= 0:
                 raise ValueError("context_size_frames + future_size_frames must be positive")
+            if self.map_navigation and self.context_size_frames <= 0:
+                raise ValueError("map_navigation requires at least one context frame")
             if self.inference_prefill_frames > total_frames:
                 raise ValueError("inference_prefill_frames must fit in total frames")
             if self.shuffle_size <= 0:

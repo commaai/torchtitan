@@ -23,6 +23,8 @@ from einops.layers.torch import Rearrange
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+from xx.training.path import convnext
+from xx.training.path.model_constants import MAP_FEATURES, MAP_SIZE, VALHALLA_COMMAND_COUNT, VISION_OUTPUT_STRIDE
 
 from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.config.configurable import Configurable
@@ -432,8 +434,9 @@ class PatchEmbedder(nn.Sequential):
 
 
 class ContinuousEmbedder(nn.Module):
-    def __init__(self, linears: ConditioningEmbedderLinearsConfig):
+    def __init__(self, linears: ConditioningEmbedderLinearsConfig, *, zero_init_output: bool = False):
         super().__init__()
+        self.zero_init_output = zero_init_output
         self.mlp = nn.Sequential(linears.mlp_in.build(), SiLU.Config().build(), linears.mlp_out.build())
         self.to_t6 = nn.Sequential(SiLU.Config().build(), linears.to_t6.build())
         self.to_t2 = nn.Sequential(SiLU.Config().build(), linears.to_t2.build())
@@ -445,8 +448,31 @@ class ContinuousEmbedder(nn.Module):
 
     def init_weights(self) -> None:
         init_mlp_weights(self.mlp)
-        init_mlp_weights(self.to_t6)
-        init_mlp_weights(self.to_t2)
+        output_std = 0.0 if self.zero_init_output else 0.02
+        init_mlp_weights(self.to_t6, std=output_std)
+        init_mlp_weights(self.to_t2, std=output_std)
+
+
+class MapEmbedder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = convnext.create_convnext(
+            "convnext_pico", pretrained=False, in_chans=1, num_classes=0, global_pool=""
+        )
+        # Copy the final LayerNorm2d view, as in PATH, so FSDP can attach its backward hook.
+        self.encoder.head.flatten = nn.Flatten(1)
+        self.projection = Linear.Config(
+            in_features=self.encoder.num_features * (MAP_SIZE // VISION_OUTPUT_STRIDE) ** 2,
+            out_features=MAP_FEATURES,
+            bias=True,
+        ).build()
+
+    def forward(self, maps: torch.Tensor) -> torch.Tensor:
+        return self.projection(self.encoder(maps))
+
+    def init_weights(self) -> None:
+        self.encoder.init_path_weights()
+        init_transformer_linear_weights(self.projection)
 
 
 class DiscreteEmbedder(nn.Module):
@@ -455,8 +481,11 @@ class DiscreteEmbedder(nn.Module):
         input_size: int,
         hidden_size: int,
         linears: ConditioningEmbedderLinearsConfig,
+        *,
+        zero_init_output: bool = False,
     ):
         super().__init__()
+        self.zero_init_output = zero_init_output
         self.mlp = nn.Sequential(
             Embedding.Config(num_embeddings=input_size, embedding_dim=hidden_size).build(),
             SiLU.Config().build(),
@@ -472,8 +501,9 @@ class DiscreteEmbedder(nn.Module):
 
     def init_weights(self) -> None:
         init_mlp_weights(self.mlp)
-        init_mlp_weights(self.to_t6)
-        init_mlp_weights(self.to_t2)
+        output_std = 0.0 if self.zero_init_output else 0.02
+        init_mlp_weights(self.to_t6, std=output_std)
+        init_mlp_weights(self.to_t2, std=output_std)
 
 
 class TimestepEmbedder(nn.Module):
@@ -729,6 +759,8 @@ class WorldModel(BaseModel):
         augments_pos_ref_augment_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         ref_augment_from_augments_euler_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         pose_mask_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
+        navigation_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
+        nav_mask_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         t_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         fidx_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         blocks: list[DiTBlockLinearsConfig] = field(init=False)
@@ -778,6 +810,12 @@ class WorldModel(BaseModel):
             )
             self.pose_mask_embedder = conditioning_embedder_linears_config(
                 2, hidden, getattr(self, "pose_mask_embedder", None)
+            )
+            self.navigation_embedder = conditioning_embedder_linears_config(
+                MAP_FEATURES + VALHALLA_COMMAND_COUNT + 1, hidden, getattr(self, "navigation_embedder", None)
+            )
+            self.nav_mask_embedder = conditioning_embedder_linears_config(
+                2, hidden, getattr(self, "nav_mask_embedder", None)
             )
             self.t_embedder = conditioning_embedder_linears_config(256, hidden, getattr(self, "t_embedder", None))
             self.fidx_embedder = conditioning_embedder_linears_config(50, hidden, getattr(self, "fidx_embedder", None))
@@ -846,6 +884,12 @@ class WorldModel(BaseModel):
             config.ref_augment_from_augments_euler_embedder
         )
         self.pose_mask_embedder = DiscreteEmbedder(2, config.transformer.n_embd, config.pose_mask_embedder)
+        self.map_embedder = MapEmbedder()
+        # New conditioning initially preserves the pretrained model's behavior.
+        self.navigation_embedder = ContinuousEmbedder(config.navigation_embedder, zero_init_output=True)
+        self.nav_mask_embedder = DiscreteEmbedder(
+            2, config.transformer.n_embd, config.nav_mask_embedder, zero_init_output=True
+        )
         self.t_embedder = TimestepEmbedder(config.t_embedder, time_factor=config.time_factor)
         self.fidx_embedder = DiscreteEmbedder(50, config.transformer.n_embd, config.fidx_embedder)
         self.blocks = nn.ModuleList(DiTBlock(config, config.blocks[i]) for i in range(config.transformer.n_layer))
@@ -938,6 +982,10 @@ class WorldModel(BaseModel):
         cache_pos: torch.Tensor | None = None,
         cache_seq_length: int | None = None,
         input_mask: TensorOrMask | None = None,
+        *,
+        nav_map: torch.Tensor | None = None,
+        navigation: torch.Tensor | None = None,
+        nav_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if input_pos is None:
             input_mask = self.mask
@@ -962,8 +1010,23 @@ class WorldModel(BaseModel):
         euler6, euler2 = self.ref_augment_from_augments_euler_embedder(ref_augment_from_augments_euler)
         pose_mask6, pose_mask2 = self.pose_mask_embedder(pose_mask)
         fidx6, fidx2 = self.fidx_embedder(fidx)
-        t6 = t6 + pos6 + euler6 + pose_mask6 + fidx6
-        t2 = t2 + pos2 + euler2 + pose_mask2 + fidx2
+        nav_mask = torch.ones_like(pose_mask, dtype=torch.bool) if nav_mask is None else nav_mask.bool()
+        frame_positions = torch.arange(t.shape[1], device=t.device) if input_pos_t is None else input_pos_t
+        nav_mask = nav_mask | (frame_positions != self.config.num_temporal_patches - 1)[None]
+        if nav_map is None or navigation is None:
+            nav_mask = torch.ones_like(nav_mask)
+            nav_features = x.new_zeros((*t.shape, MAP_FEATURES + VALHALLA_COMMAND_COUNT + 1))
+        else:
+            # Only the last context map is encoded, including for packed CFG copies.
+            # The unconditional copy is masked below; it never receives these features.
+            maps = nav_map[:, -1].to(dtype=x.dtype).div(255.0)
+            map_features = self.map_embedder(maps)[:, None].expand(-1, t.shape[1], -1)
+            nav_features = torch.cat((map_features, navigation.to(dtype=x.dtype)), dim=-1)
+            nav_features = nav_features.masked_fill(nav_mask[..., None], 0)
+        nav6, nav2 = self.navigation_embedder(nav_features)
+        nav_mask6, nav_mask2 = self.nav_mask_embedder(nav_mask.to(dtype=torch.int64))
+        t6 = t6 + pos6 + euler6 + pose_mask6 + fidx6 + nav6 + nav_mask6
+        t2 = t2 + pos2 + euler2 + pose_mask2 + fidx2 + nav2 + nav_mask2
         for block in self.blocks:
             x = block(x, t6, input_pos_t, input_mask, cache_pos, cache_seq_length)
         outputs = {}
@@ -1055,6 +1118,9 @@ def _apply_compile(model: WorldModel, compile_config: CompileConfig) -> None:
         model.augments_pos_ref_augment_embedder,
         model.ref_augment_from_augments_euler_embedder,
         model.pose_mask_embedder,
+        model.map_embedder,
+        model.navigation_embedder,
+        model.nav_mask_embedder,
         model.t_embedder,
         model.fidx_embedder,
     ):
@@ -1103,6 +1169,9 @@ def _apply_fsdp(
         model.augments_pos_ref_augment_embedder,
         model.ref_augment_from_augments_euler_embedder,
         model.pose_mask_embedder,
+        model.map_embedder,
+        model.navigation_embedder,
+        model.nav_mask_embedder,
         model.t_embedder,
         model.fidx_embedder,
     ):
