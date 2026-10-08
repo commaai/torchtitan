@@ -116,7 +116,7 @@ def rldriving() -> RLDrivingTrainer.Config:
             implementation="fused",
             param_groups=[
                 ParamGroupConfig(
-                    pattern=r"^actor\.temporal_hydra\.(final_layer|scale_layer)\.",
+                    pattern=r"^actor\.residual_hydra\.final_layer\.",
                     optimizer_name="AdamW",
                     optimizer_kwargs={**actor_optim, "weight_decay": 0.0},
                 ),

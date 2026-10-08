@@ -193,7 +193,7 @@ class RLDrivingTrainer(Trainer):
         self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
         dcp.load(
-            {"temporal_policy": self.model.actor},
+            {"temporal_policy": self.model.actor.off_policy},
             storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
         )
         self.model.warm_start_critics_from_actor()
@@ -299,7 +299,8 @@ class RLDrivingTrainer(Trainer):
                 (self.model.critic, self.model.target_critic),
             ):
                 for online_param, target_param in zip(online.parameters(), target.parameters()):
-                    target_param.mul_(decay).add_(online_param, alpha=1.0 - decay)
+                    if online_param.requires_grad:
+                        target_param.mul_(decay).add_(online_param, alpha=1.0 - decay)
                 for online_buffer, target_buffer in zip(online.buffers(), target.buffers()):
                     target_buffer.copy_(online_buffer)
         self.lr_schedulers.step()
