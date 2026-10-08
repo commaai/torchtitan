@@ -390,9 +390,8 @@ class RLDrivingTrainer(Trainer):
     def train(self) -> None:
         config = self.config
         sl.log_trace_instant("training_start")
-        loaded = self.checkpointer.load(step=config.checkpoint.load_step)
-        if not loaded:
-            self.checkpointer.save(0)
+        self.checkpointer.load(step=config.checkpoint.load_step)
+        self.checkpointer.save(self.step)
         self.set_runtime_seed()
         loaded_step = self.step
         logger.info(f"Training starts at step {self.step + 1}")
