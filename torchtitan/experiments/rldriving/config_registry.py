@@ -200,7 +200,7 @@ def _checkpoint_config(
         export_onnx=True,
         folder=folder,
         interval=interval,
-        checkpoint_dav_path="/tmp/checkpoints",
+        enable_checkpoint_dav=True,
         checkpoint_dav_interval=checkpoint_dav_interval,
         input_names=list(input_shapes),
         input_shapes=[list(shape) for shape in input_shapes.values()],

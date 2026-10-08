@@ -182,14 +182,8 @@ class RLDrivingTrainer(Trainer):
                 backend="gloo", timeout=timedelta(seconds=config.train_step_barrier_timeout_seconds)
             )
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
-        checkpoint_id: list[str | None] = [None]
-        publisher = self.checkpointer.checkpoint_dav
-        if publisher is not None:
-            checkpoint_id[0] = publisher.checkpoint_id
-        if dist.get_world_size() > 1:
-            dist.broadcast_object_list(checkpoint_id, src=0)
         self.dataloader.dataset.config = self.dataloader.dataset.config.replace(
-            checkpoint_id=checkpoint_id[0]
+            checkpoint_id=self.checkpointer.checkpoint_dav_id
         )
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:rldriving:train")
         self.report_runner = ReportRunner(
