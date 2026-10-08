@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Literal
 from xx.comma_data.constants import BASE_DIR_GT
 
@@ -71,9 +71,6 @@ class RLDrivingDataLoader(BaseDataLoader):
         del tokenizer, seq_len, snapshot_every_n_steps, validation_steps, kwargs
         from gigashuffle import DataloaderConfig
 
-        if local_batch_size % 2:
-            raise ValueError("Reference/actor training requires an even local batch size")
-        local_batch_size //= 2
         local_rank = int(os.environ.get("LOCAL_RANK", dp_rank))
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", dp_world_size))
         node_rank = int(os.environ.get("GROUP_RANK", dp_rank // local_world_size))
@@ -85,7 +82,7 @@ class RLDrivingDataLoader(BaseDataLoader):
             nproc_per_node=local_world_size,
             nnodes=dp_world_size // local_world_size,
             node_rank=node_rank,
-            shuffle_size=str(config.shuffle_size // 2),
+            shuffle_size=str(config.shuffle_size),
             min_mixing=config.min_mixing,
             num_writers=config.num_writers,
             num_readers=config.num_readers,
@@ -93,8 +90,8 @@ class RLDrivingDataLoader(BaseDataLoader):
             codedir=config.codedir,
             pipeline_dir=config.pipeline_dir,
             queue_priority=config.queue_priority,
-            max_queue_size=config.max_queue_size // 2,
-            max_fq_size=config.max_fq_size // 2,
+            max_queue_size=config.max_queue_size,
+            max_fq_size=config.max_fq_size,
             train_skip=config.train_skip,
             epochs=config.epochs,
             steps_per_epoch=config.steps_per_epoch,
@@ -109,13 +106,10 @@ class RLDrivingDataLoader(BaseDataLoader):
             worldmodel_future_size_seconds=config.worldmodel_future_size_seconds,
             worldmodel_context_size_seconds=config.worldmodel_context_size_seconds,
         )
-        self.datasets = [
-            get_dataset(xx_config.replace(worldmodel_reference=reference), local_rank=local_rank)
-            for reference in (False, True)
-        ]
-        loader_config = DataloaderConfig(
+        self.dataset = get_dataset(xx_config, local_rank=local_rank)
+        self._loader_config = DataloaderConfig(
             bs=local_batch_size,
-            shuffle_size=config.shuffle_size // 2,
+            shuffle_size=config.shuffle_size,
             min_mixing=config.min_mixing,
             num_writers=config.num_writers,
             num_readers=config.num_readers,
@@ -126,43 +120,36 @@ class RLDrivingDataLoader(BaseDataLoader):
             global_world_size=dp_world_size,
             queue_name=f"{config.training_id or 'rldriving'}-train-node{node_rank}",
         )
-        self._loader_configs = [
-            replace(loader_config, queue_name=f"{loader_config.queue_name}-{source}") for source in ("sim", "wm")
-        ]
-        self.loaders: list[Any] = []
-        self._iterators: list[Any] = []
+        self.loader: Any | None = None
+        self._iterator: Any | None = None
 
     # pyrefly: ignore [bad-override]
     def __iter__(
         self,
     ) -> Iterator[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]]:
-        if not self.loaders:
-            self.loaders = [DataLoader(dataset, config) for dataset, config in zip(self.datasets, self._loader_configs)]
-        self._iterators = [iter(loader) for loader in self.loaders]
+        if self.loader is None:
+            self.loader = DataLoader(self.dataset, self._loader_config)
+        iterator: Any = iter(self.loader)
+        self._iterator = iterator
         try:
-            for sim, reference in zip(*self._iterators):
-                inputs, targets = (
-                    {name: torch.cat((left[name], right[name])) for name in left}
-                    for left, right in zip(sim[:2], reference[:2])
-                )
-                yield inputs, targets, sim[2]
+            for inputs, targets, metadata in iterator:
+                yield inputs, targets, metadata
         finally:
-            for iterator in self._iterators:
-                iterator.close()
-            self._iterators = []
+            iterator.close()
+            if self._iterator is iterator:
+                self._iterator = None
 
     def attach_training_context(self, context: RolloutContext) -> None:
-        for dataset in self.datasets:
-            dataset.context = context
-        for loader in self.loaders:
-            loader.attach_training_context(context)
+        self.dataset.context = context
+        if self.loader is not None:
+            self.loader.attach_training_context(context)
 
     def close(self) -> None:
-        for iterator in self._iterators:
-            iterator.close()
-        self._iterators = []
-        for loader in self.loaders:
-            loader._shutdown_workers()
+        if self._iterator is not None:
+            self._iterator.close()
+            self._iterator = None
+        if self.loader is not None:
+            self.loader._shutdown_workers()
 
     def state_dict(self) -> dict[str, int]:
         return {}

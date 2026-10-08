@@ -18,7 +18,7 @@ from xx.training.rldriving.test import MODEL_REPORTS
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.components.tokenizer import NoOpTokenizer
-from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import CommConfig, CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .dataset import RLDrivingDataLoader
@@ -103,6 +103,7 @@ def rldriving() -> RLDrivingTrainer.Config:
             "RLDRIVING_WARM_START_CHECKPOINT",
             "b9facbcc-4d47-410e-b3ce-dfcbad12ba92/56320",
         ),
+        reward_predictor_checkpoint="3bab46b8-41fa-4027-a586-ea2e42e5d531/12864",
         tokenizer=NoOpTokenizer.Config(),
         dataloader=RLDrivingDataLoader.Config(
             dataset=DEFAULT_TRAIN_LIST,
@@ -126,7 +127,7 @@ def rldriving() -> RLDrivingTrainer.Config:
                     optimizer_kwargs={**actor_optim, "weight_decay": 3e-2},
                 ),
                 ParamGroupConfig(
-                    pattern=r"^critic\.(critic1|critic2)\.(q_hydra|noise_hydra)\.(final_layer|scale_layer)\.",
+                    pattern=r"^critic\.(critic1|critic2)\.q_hydra\.(final_layer|scale_layer)\.",
                     optimizer_name="AdamW",
                     optimizer_kwargs={**critic_optim, "weight_decay": 0.0},
                 ),
@@ -172,6 +173,7 @@ def rldriving() -> RLDrivingTrainer.Config:
         ema_tau=128.0,
         fps=fps,
         activation_checkpoint=None,
+        comm=CommConfig(train_timeout_seconds=600),
         compile=CompileConfig(enable=True, components=["model"]),
         metrics=MetricsProcessor.Config(
             log_freq=16,

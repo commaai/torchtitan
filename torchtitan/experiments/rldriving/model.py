@@ -33,7 +33,6 @@ from torchtitan.tools.logging import logger
 # B: batch, T: temporal steps, S: spatial tokens, D: model width, A: action components.
 ACTION_HEAD_NAME = "action"
 Q_HEAD_NAME = "q"
-NOISE_HEAD_NAME = "noise_scale"
 RESIDUAL_ACTION_HEAD_NAME = "residual_action"
 
 TemporalInputs = dict[str, torch.Tensor]
@@ -109,7 +108,6 @@ class Critic(Module):
         post_action_mlp1: PathMLP.Config
         post_action_mlp2: PathMLP.Config
         q_hydra: Hydra.Config
-        noise_hydra: Hydra.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -119,7 +117,6 @@ class Critic(Module):
         self.post_action_mlp1 = config.post_action_mlp1.build()
         self.post_action_mlp2 = config.post_action_mlp2.build()
         self.q_hydra = config.q_hydra.build()
-        self.noise_hydra = config.noise_hydra.build()
 
     def forward(self, inputs: TemporalInputs, action: torch.Tensor) -> dict[str, torch.Tensor]:
         features_BTSD = inputs[ModelInputs.FEATURES]
@@ -131,12 +128,10 @@ class Critic(Module):
             inputs[ModelInputs.ACTION_T][:, -1].to(dtype),
         )
         critic_features_BD = critic_features_BD + self.post_action_mlp1(critic_features_BD)
-        noise_scale_BA = self.noise_hydra(critic_features_BD)[NOISE_HEAD_NAME]
         critic_features_BD = critic_features_BD + self.action_encoder(action.to(dtype))
         critic_features_BD = critic_features_BD + self.post_action_mlp2(critic_features_BD)
         return {
             Q_HEAD_NAME: self.q_hydra(critic_features_BD)[Q_HEAD_NAME].squeeze(-1).clone(),
-            NOISE_HEAD_NAME: noise_scale_BA.clone(),
         }
 
 
@@ -168,12 +163,6 @@ def critic_config(actor: TemporalPolicy.Config) -> Critic.Config:
             heads=(PathHead(name=Q_HEAD_NAME, output_size=1, mlp=False, scale=False),),
             head_mlps={},
             final_layers={Q_HEAD_NAME: Linear.Config(in_features=dim, out_features=1, bias=True)},
-            scale_layers={},
-        ),
-        noise_hydra=Hydra.Config(
-            heads=(PathHead(name=NOISE_HEAD_NAME, output_size=2, mlp=False, scale=False),),
-            head_mlps={},
-            final_layers={NOISE_HEAD_NAME: Linear.Config(in_features=dim, out_features=2, bias=True)},
             scale_layers={},
         ),
     )

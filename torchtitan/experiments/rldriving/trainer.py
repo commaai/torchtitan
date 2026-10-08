@@ -20,6 +20,7 @@ from xx.ml_tools.constants.model import TEMPORAL_INPUTS
 from xx.training.lib.checkpoint import Checkpoint
 from xx.training.lib.torchtitan.report_runner import Report, ReportRunner
 from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
+from xx.training.noise_predictor.model import model_config as noise_predictor_config
 from xx.training.rldriving.dataloader import RolloutContext
 
 import torch
@@ -150,6 +151,7 @@ class RLDrivingTrainer(Trainer):
         checkpoint: RLDrivingOnnxCheckpointManager.Config  # pyrefly: ignore [bad-override]
         lr_scheduler: RLDrivingLRSchedulers.Config  # pyrefly: ignore [bad-override]
         warm_start_checkpoint: str
+        reward_predictor_checkpoint: str
         steps_per_epoch: int
         train_step_barrier_timeout_seconds: int
         ema_tau: float
@@ -197,6 +199,12 @@ class RLDrivingTrainer(Trainer):
             storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
         )
         self.model.sync_targets()
+        self.reward_predictor = noise_predictor_config().build().to(self.device).requires_grad_(False).eval()
+        state = self.reward_predictor.state_dict()
+        dcp.load(state, storage_reader=FsspecReader(Checkpoint(config.reward_predictor_checkpoint).url_or_file()))
+        self.reward_predictor.load_state_dict(state, strict=True)
+        if config.compile.enable and "model" in config.compile.components:
+            self.reward_predictor.compile(backend=config.compile.backend)
 
     # pyrefly: ignore [bad-override]
     def batch_generator(self, data_iterable: Iterable[Batch]) -> Iterator[Batch]:
@@ -280,6 +288,7 @@ class RLDrivingTrainer(Trainer):
                 targets=targets,
                 online_critic=self.model.critic,
                 target_critic=self.model.target_critic,
+                reward_predictor=self.reward_predictor,
                 current_inputs=current_inputs,
                 bootstrap_inputs=bootstrap_inputs,
             )
