@@ -15,14 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
-from torchtitan.experiments.worldmodel.model import (
-    _cast_if_autocast_enabled,
-    _dense_mask,
-    _mask_fn,
-    SelfAttention,
-    TensorOrMask,
-    WorldModel,
-)
+from torchtitan.experiments.worldmodel.model import _dense_mask, _mask_fn, SelfAttention, TensorOrMask, WorldModel
 from torchtitan.experiments.worldmodel.schedulers import RFScheduler
 
 
@@ -161,9 +154,7 @@ class InferenceSelfAttention(SelfAttention):
             raise ValueError("cache_seq_length is required when cache_pos is provided")
 
         batch, seq_len, emb_dim = x.shape
-        qkv = self.c_attn(self.layer_norm(x)).view(batch, seq_len, 3, self.config.n_head, self.head_dim)
-        q, k, v = qkv.unbind(2)
-        q, k = _cast_if_autocast_enabled(self.q_norm(q)), _cast_if_autocast_enabled(self.k_norm(k))
+        q, k, v = self.project_qkv(x)
 
         if self.training:
             raise RuntimeError("KV cache is only supported for inference")
@@ -172,9 +163,8 @@ class InferenceSelfAttention(SelfAttention):
         k, v = self.kv_cache.cache(cache_pos, k, v, cache_seq_length)
 
         if self.config.attention_impl == "FLEX":
-            assert self.flex_attention is not None
             if k.dtype == torch.float8_e4m3fn:
-                y = self.flex_attention(
+                y = self.inner_attention(
                     q.to(torch.float8_e4m3fn),
                     k,
                     v,
@@ -184,7 +174,7 @@ class InferenceSelfAttention(SelfAttention):
                 ).to(q.dtype)
             else:
                 k, v = self.upcast_kv(q, k, v)
-                y = self.flex_attention(q, k, v, attention_masks=input_mask, scale=1.0 / math.sqrt(self.head_dim))
+                y = self.inner_attention(q, k, v, attention_masks=input_mask, scale=1.0 / math.sqrt(self.head_dim))
         elif self.config.attention_impl == "SDPA":
             k, v = self.upcast_kv(q, k, v)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)

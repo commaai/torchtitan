@@ -18,7 +18,6 @@ import einops
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops.layers.torch import Rearrange
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
@@ -29,6 +28,7 @@ from torchtitan.config.configurable import Configurable
 from torchtitan.models.common.attention import create_attention_mask, FlexAttention, ScaledDotProductAttention
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.nn_modules import GELU, Identity, LayerNorm, Linear, RMSNorm, SiLU
+from torchtitan.models.common.transformer import MLP, SelfAttention as CommonSelfAttention
 from torchtitan.protocols.model import BaseModel
 from torchtitan.tools.logging import logger
 
@@ -229,19 +229,25 @@ def plan_head_linears_config(
     )
 
 
-def make_norm(name: str, normalized_shape: int, *, elementwise_affine: bool = True) -> nn.Module:
+def norm_config(
+    name: str, normalized_shape: int, *, elementwise_affine: bool = True
+) -> LayerNorm.Config | RMSNorm.Config:
     if name == "LayerNorm":
-        return LayerNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine).build()
+        return LayerNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine)
     if name == "RMSNorm":
-        return RMSNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine).build()
+        return RMSNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine)
     raise ValueError(f"unknown norm {name}")
 
 
-def make_activation(name: str) -> nn.Module:
+def make_norm(name: str, normalized_shape: int, *, elementwise_affine: bool = True) -> nn.Module:
+    return norm_config(name, normalized_shape, elementwise_affine=elementwise_affine).build()
+
+
+def activation_config(name: str) -> GELU.Config | SiLU.Config:
     if name == "GELU":
-        return GELU.Config(approximate="tanh").build()
+        return GELU.Config(approximate="tanh")
     if name == "SiLU":
-        return SiLU.Config().build()
+        return SiLU.Config()
     raise ValueError(f"unknown activation {name}")
 
 
@@ -322,12 +328,6 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
 def gate(x: torch.Tensor, gate_value: torch.Tensor) -> torch.Tensor:
     x = einops.rearrange(x, "b (t n) c -> b t n c", t=gate_value.shape[1])
     return einops.rearrange(gate_value * x, "b t n c -> b (t n) c")
-
-
-def _cast_if_autocast_enabled(tensor: torch.Tensor) -> torch.Tensor:
-    if torch.is_autocast_enabled():
-        return tensor.to(dtype=torch.get_autocast_dtype(tensor.device.type))
-    return tensor
 
 
 def _blockwise_lower_triangular_causal_mask(
@@ -530,68 +530,43 @@ class ScaleLayer(nn.Module):
         self.reset_parameters()
 
 
-class SelfAttention(nn.Module):
+class SelfAttention(CommonSelfAttention):
     def __init__(self, config: TransformerConfig, linears: SelfAttentionLinearsConfig):
-        super().__init__()
         if config.n_embd % config.n_head != 0:
             raise ValueError("n_embd must be divisible by n_head")
+        head_dim = config.n_embd // config.n_head
+        super().__init__(
+            CommonSelfAttention.Config(
+                norm=norm_config(config.norm, config.n_embd) if config.prenorm else Identity.Config(),
+                norm_name="layer_norm",
+                q_norm=norm_config(config.norm, head_dim) if config.qk_norm else None,
+                k_norm=norm_config(config.norm, head_dim) if config.qk_norm else None,
+                c_attn=linears.c_attn,
+                c_proj=linears.c_proj,
+                inner_attention={"FLEX": FlexAttention.Config, "SDPA": ScaledDotProductAttention.Config}[
+                    config.attention_impl
+                ](),
+                n_head=config.n_head,
+                head_dim=head_dim,
+                dropout=config.resid_pdrop,
+                is_causal=False,
+                attn_dropout=config.attn_pdrop,
+                cast_qk_to_autocast=True,
+            )
+        )
         self.config = config
-        self.head_dim = config.n_embd // config.n_head
-        self.layer_norm = make_norm(config.norm, config.n_embd) if config.prenorm else Identity.Config().build()
-        self.q_norm = make_norm(config.norm, self.head_dim) if config.qk_norm else Identity.Config().build()
-        self.k_norm = make_norm(config.norm, self.head_dim) if config.qk_norm else Identity.Config().build()
-        self.c_attn = linears.c_attn.build()
-        self.c_proj = linears.c_proj.build()
-        self.dropout = nn.Dropout(config.resid_pdrop)
-        self.flex_attention = FlexAttention.Config().build() if config.attention_impl == "FLEX" else None
-        self.sdpa = ScaledDotProductAttention.Config().build() if config.attention_impl == "SDPA" else None
         self.kv_cache: Any | None = None
 
-    def forward(self, x: torch.Tensor, input_mask: TensorOrMask | None = None) -> torch.Tensor:
-        batch, seq_len, emb_dim = x.shape
-        qkv = self.c_attn(self.layer_norm(x)).view(batch, seq_len, 3, self.config.n_head, self.head_dim)
-        q, k, v = qkv.unbind(2)
-        q, k = _cast_if_autocast_enabled(self.q_norm(q)), _cast_if_autocast_enabled(self.k_norm(k))
 
-        if self.config.attention_impl == "FLEX":
-            assert self.flex_attention is not None
-            y = self.flex_attention(
-                q,
-                k,
-                v,
-                attention_masks=input_mask,
-                scale=1.0 / math.sqrt(self.head_dim),
-            )
-        elif self.config.attention_impl == "SDPA" and input_mask is None:
-            assert self.sdpa is not None
-            y = self.sdpa(q, k, v, scale=1.0 / math.sqrt(self.head_dim), is_causal=False)
-        elif self.config.attention_impl == "SDPA":
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=input_mask,
-                dropout_p=self.config.attn_pdrop if self.training else 0.0,
-                scale=1.0 / math.sqrt(self.head_dim),
-            ).transpose(1, 2)
-        else:
-            raise ValueError(f"unknown attention_impl {self.config.attention_impl}")
-        return self.dropout(self.c_proj(y.reshape(batch, seq_len, emb_dim)))
-
-
-def build_ffn(config: TransformerConfig, linears: FFNLinearsConfig) -> nn.Sequential:
-    return nn.Sequential(
-        OrderedDict(
-            {
-                "layer_norm": make_norm(config.norm, config.n_embd) if config.prenorm else Identity.Config().build(),
-                "c_fc": linears.c_fc.build(),
-                "act": make_activation(config.act),
-                "c_proj": linears.c_proj.build(),
-                "dropout": nn.Dropout(config.resid_pdrop),
-            }
-        )
-    )
+def build_ffn(config: TransformerConfig, linears: FFNLinearsConfig) -> MLP:
+    return MLP.Config(
+        norm=norm_config(config.norm, config.n_embd) if config.prenorm else Identity.Config(),
+        norm_name="layer_norm",
+        c_fc=linears.c_fc,
+        act=activation_config(config.act),
+        c_proj=linears.c_proj,
+        dropout=config.resid_pdrop,
+    ).build()
 
 
 class ResidualSequential(nn.Sequential):
