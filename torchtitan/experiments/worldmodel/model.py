@@ -9,6 +9,7 @@ import itertools
 import math
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass, field
 from functools import partial
@@ -611,12 +612,16 @@ class PlanHead(nn.Module):
         )
         self.head = linears.head.build()
         self.scale_layer = ScaleLayer(PLAN_SIZE)
+        self.float()
         self.init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for mlp in self.mlps:
-            x = mlp(x)
-        return self.scale_layer(self.head(x))
+        # Small differences between predicted speeds must survive the head.
+        with nullcontext() if x.is_meta else torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            for mlp in self.mlps:
+                x = mlp(x)
+            return self.scale_layer(self.head(x))
 
     def init_weights(self) -> None:
         for module in self.mlps.modules():
@@ -1111,9 +1116,18 @@ def _apply_fsdp(
     for block in model.blocks:
         fully_shard(block, **fsdp_config, reshard_after_forward=reshard_after_forward)
     if model.plan_head is not None:
+        plan_fsdp_config = {
+            **fsdp_config,
+            "mp_policy": MixedPrecisionPolicy(
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.float32,
+                cast_forward_inputs=True,
+            ),
+        }
         for block in model.plan_head.mlps:
-            fully_shard(block, **fsdp_config, reshard_after_forward=reshard_after_forward)
-        fully_shard(model.plan_head, **fsdp_config, reshard_after_forward=reshard_after_forward)
+            fully_shard(block, **plan_fsdp_config, reshard_after_forward=reshard_after_forward)
+        fully_shard(model.plan_head, **plan_fsdp_config, reshard_after_forward=reshard_after_forward)
     if model.final_layer is not None:
         fully_shard(
             model.final_layer,

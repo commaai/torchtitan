@@ -55,9 +55,9 @@ def compute_worldmodel_losses(
         terms["diffusion_loss"] = diffusion_loss.detach()
 
     if "plan" in outputs and "plan" in targets:
-        pred = outputs["plan"]
-        target = targets["plan"].to(device=pred.device, dtype=pred.dtype)
-        plan_loss_values, plan_err, plan_mask = laplacian_density_loss(target.float(), pred.float())
+        pred = outputs["plan"].float()
+        target = targets["plan"].to(device=pred.device, dtype=torch.float32)
+        plan_loss_values, plan_err, plan_mask = laplacian_density_loss(target, pred)
         plan_loss = plan_loss_values.flatten(1).mean(dim=1)
         flat_mask = plan_mask.flatten(1).float()
         plan_mse = (plan_err.square().flatten(1) * flat_mask).sum(dim=1) / flat_mask.sum(dim=1).clamp_min(1.0)
