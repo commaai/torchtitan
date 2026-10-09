@@ -388,6 +388,7 @@ class RLDrivingTrainer(Trainer):
         loaded = self.checkpointer.load(step=config.checkpoint.load_step)
         if not loaded:
             self.checkpointer.save(0)
+            self.report_runner.submit(step=0)
         else:
             self.checkpointer.checkpoint_dav_save(self.step, force=True)
         self.set_runtime_seed()

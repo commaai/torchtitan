@@ -43,8 +43,8 @@ def model_registry() -> ModelSpec:
 
 
 def _make_reports(*, fps: int, num_epochs: int, steps_per_epoch: int) -> list[Report]:
-    frequent_steps = [(epoch + 1) * steps_per_epoch for epoch in range(0, num_epochs, num_epochs // 10)]
-    sparse_steps = [(epoch + 1) * steps_per_epoch for epoch in range(0, num_epochs, num_epochs // 2)]
+    frequent_steps = [epoch * steps_per_epoch for epoch in range(0, num_epochs + 1, 10)]
+    sparse_steps = [epoch * steps_per_epoch for epoch in range(0, num_epochs + 1, 50)]
     steps_by_report = {
         "analyse_lat.no_noise": frequent_steps,
         "analyse_lat.realistic_noise": frequent_steps,
@@ -78,7 +78,7 @@ def _make_reports(*, fps: int, num_epochs: int, steps_per_epoch: int) -> list[Re
 
 def rldriving() -> RLDrivingTrainer.Config:
     fps = SUPERCOMBO_FPS
-    num_epochs = 201
+    num_epochs = 200
     steps_per_epoch = 64
     model_spec = model_registry()
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
