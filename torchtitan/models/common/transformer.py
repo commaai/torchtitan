@@ -52,7 +52,6 @@ class SelfAttention(Module):
         c_proj: Linear.Config
         inner_attention: ScaledDotProductAttention.Config | FlexAttention.Config
         n_head: int
-        head_dim: int
         dropout: float
         is_causal: bool = True
         attn_dropout: float = 0.0
@@ -62,7 +61,7 @@ class SelfAttention(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.n_head = config.n_head
-        self.head_dim = config.head_dim
+        self.head_dim = config.c_proj.in_features // config.n_head
         self.is_causal = config.is_causal
         self.attn_dropout = config.attn_dropout
         self.cast_qk_to_autocast = config.cast_qk_to_autocast

@@ -106,7 +106,6 @@ def attention_config(config: TransformerConfig) -> SelfAttention.Config:
             config.attention_impl
         ](),
         n_head=config.n_head,
-        head_dim=head_dim,
         dropout=config.resid_pdrop,
         is_causal=False,
         attn_dropout=config.attn_pdrop,
@@ -152,10 +151,6 @@ def norm_config(
     if name == "RMSNorm":
         return RMSNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine)
     raise ValueError(f"unknown norm {name}")
-
-
-def make_norm(name: str, normalized_shape: int, *, elementwise_affine: bool = True) -> nn.Module:
-    return norm_config(name, normalized_shape, elementwise_affine=elementwise_affine).build()
 
 
 def activation_config(name: str) -> GELU.Config | SiLU.Config:
@@ -338,7 +333,7 @@ class PatchEmbedder(nn.Sequential):
                 pw=patch_size[2],
             ),
             linears.linear.build(),
-            make_norm(norm, linears.linear.out_features),
+            norm_config(norm, linears.linear.out_features).build(),
         )
         self.init_weights()
 
@@ -391,7 +386,7 @@ class DiscreteEmbedder(nn.Module):
         init_mlp_weights(self.to_t2)
 
 
-class TimestepEmbedder(nn.Module):
+class TimestepEmbedder(ContinuousEmbedder):
     def __init__(
         self,
         linears: ConditioningEmbedderLinearsConfig,
@@ -400,16 +395,12 @@ class TimestepEmbedder(nn.Module):
         max_period: int = 10000,
         time_factor: float = 1000.0,
     ):
-        super().__init__()
         if frequency_embedding_size % 2 != 0:
             raise ValueError("frequency_embedding_size must be even")
-        self.mlp = nn.Sequential(linears.mlp_in.build(), SiLU.Config().build(), linears.mlp_out.build())
-        self.to_t6 = nn.Sequential(SiLU.Config().build(), linears.to_t6.build())
-        self.to_t2 = nn.Sequential(SiLU.Config().build(), linears.to_t2.build())
+        super().__init__(linears)
         self.frequency_embedding_size = frequency_embedding_size
         self.max_period = max_period
         self.time_factor = time_factor
-        self.init_weights()
 
     def timestep_embedding(self, t: torch.Tensor) -> torch.Tensor:
         half = self.frequency_embedding_size // 2
@@ -420,13 +411,7 @@ class TimestepEmbedder(nn.Module):
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
     def forward(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        t_emb = self.mlp(self.timestep_embedding(t).to(self.mlp[0].weight.dtype))
-        return self.to_t6(t_emb), self.to_t2(t_emb)
-
-    def init_weights(self) -> None:
-        init_mlp_weights(self.mlp)
-        init_mlp_weights(self.to_t6)
-        init_mlp_weights(self.to_t2)
+        return super().forward(self.timestep_embedding(t).to(self.mlp[0].weight.dtype))
 
 
 class ScaleLayer(nn.Module):
@@ -471,9 +456,9 @@ class PlanHead(nn.Module):
 class DiTBlock(nn.Module):
     def __init__(self, config: "WorldModel.Config", linears: DiTBlockConfig):
         super().__init__()
-        self.norm1 = make_norm(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False)
+        self.norm1 = norm_config(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False).build()
         self.attn = linears.attn.build()
-        self.norm2 = make_norm(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False)
+        self.norm2 = norm_config(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False).build()
         self.mlp = linears.mlp.build()
         self.scale_shift_table = nn.Parameter(torch.empty(1, config.num_temporal_patches, 6, config.transformer.n_embd))
         self.init_weights()
@@ -522,7 +507,9 @@ class DiTBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, config: "WorldModel.Config", linears: FinalLayerLinearsConfig):
         super().__init__()
-        self.norm_final = make_norm(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False)
+        self.norm_final = norm_config(
+            config.transformer.norm, config.transformer.n_embd, elementwise_affine=False
+        ).build()
         self.linear = linears.linear.build()
         self.scale_shift_table = nn.Parameter(torch.empty(1, config.num_temporal_patches, 2, config.transformer.n_embd))
         self.init_weights()
