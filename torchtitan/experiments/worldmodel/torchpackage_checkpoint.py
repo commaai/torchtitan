@@ -69,6 +69,7 @@ TORCH_EXPORT_INTERN_MODULES = [
     "torchtitan.models.common.embedding",
     "torchtitan.models.common.nn_modules",
     "torchtitan.models.common.rope",
+    "torchtitan.models.common.transformer",
     "torchtitan.observability.**",
     "torchtitan.protocols.**",
     "torchtitan.tools.logging",

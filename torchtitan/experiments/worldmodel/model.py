@@ -7,7 +7,6 @@
 import argparse
 import itertools
 import math
-from collections import OrderedDict
 from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field
@@ -66,15 +65,15 @@ class TransformerConfig:
 
 @dataclass(kw_only=True, slots=True)
 class PatchEmbedderLinearsConfig(Configurable.Config):
-    linear: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
+    linear: Linear.Config
 
 
 @dataclass(kw_only=True, slots=True)
 class ConditioningEmbedderLinearsConfig(Configurable.Config):
-    mlp_in: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
-    mlp_out: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
-    to_t6: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
-    to_t2: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
+    mlp_in: Linear.Config
+    mlp_out: Linear.Config
+    to_t6: Linear.Config
+    to_t2: Linear.Config
 
 
 @dataclass(kw_only=True, slots=True)
@@ -85,36 +84,16 @@ class DiTBlockConfig(Configurable.Config):
 
 @dataclass(kw_only=True, slots=True)
 class FinalLayerLinearsConfig(Configurable.Config):
-    linear: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
+    linear: Linear.Config
 
 
 @dataclass(kw_only=True, slots=True)
 class PlanHeadConfig(Configurable.Config):
-    blocks: list[MLP.Config] = field(default_factory=list)
-    head: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
+    blocks: list[MLP.Config]
+    head: Linear.Config
 
 
-def linear_config(
-    in_features: int,
-    out_features: int,
-    *,
-    bias: bool = False,
-    current: Linear.Config | None = None,
-) -> Linear.Config:
-    if (
-        current is not None
-        and current.in_features == in_features
-        and current.out_features == out_features
-        and current.bias == bias
-    ):
-        return current
-    return Linear.Config(in_features=in_features, out_features=out_features, bias=bias)
-
-
-def attention_config(
-    config: TransformerConfig,
-    current: SelfAttention.Config | None = None,
-) -> SelfAttention.Config:
+def attention_config(config: TransformerConfig) -> SelfAttention.Config:
     if config.n_embd % config.n_head != 0:
         raise ValueError("n_embd must be divisible by n_head")
     head_dim = config.n_embd // config.n_head
@@ -132,94 +111,36 @@ def attention_config(
         is_causal=False,
         attn_dropout=config.attn_pdrop,
         cast_qk_to_autocast=True,
-        c_attn=linear_config(
-            config.n_embd,
-            3 * config.n_embd,
-            bias=config.biased_linears,
-            current=None if current is None else current.c_attn,
-        ),
-        c_proj=linear_config(
-            config.n_embd,
-            config.n_embd,
-            bias=config.biased_linears,
-            current=None if current is None else current.c_proj,
-        ),
+        c_attn=Linear.Config(in_features=config.n_embd, out_features=3 * config.n_embd, bias=config.biased_linears),
+        c_proj=Linear.Config(in_features=config.n_embd, out_features=config.n_embd, bias=config.biased_linears),
     )
 
 
-def mlp_config(
-    config: TransformerConfig,
-    current: MLP.Config | None = None,
-) -> MLP.Config:
+def mlp_config(config: TransformerConfig) -> MLP.Config:
     hidden = mlp_hidden_dim(config.n_embd, config.mlp_mult, config.mlp_multiple_of)
     return MLP.Config(
         norm=norm_config(config.norm, config.n_embd) if config.prenorm else Identity.Config(),
         norm_name="layer_norm",
         act=activation_config(config.act),
         dropout=config.resid_pdrop,
-        c_fc=linear_config(
-            config.n_embd,
-            hidden,
-            bias=config.biased_linears,
-            current=None if current is None else current.c_fc,
-        ),
-        c_proj=linear_config(
-            hidden,
-            config.n_embd,
-            bias=config.biased_linears,
-            current=None if current is None else current.c_proj,
-        ),
+        c_fc=Linear.Config(in_features=config.n_embd, out_features=hidden, bias=config.biased_linears),
+        c_proj=Linear.Config(in_features=hidden, out_features=config.n_embd, bias=config.biased_linears),
     )
 
 
-def conditioning_embedder_linears_config(
-    input_size: int,
-    hidden_size: int,
-    current: ConditioningEmbedderLinearsConfig | None = None,
-) -> ConditioningEmbedderLinearsConfig:
+def conditioning_embedder_linears_config(input_size: int, hidden_size: int) -> ConditioningEmbedderLinearsConfig:
     return ConditioningEmbedderLinearsConfig(
-        mlp_in=linear_config(
-            input_size,
-            hidden_size,
-            bias=True,
-            current=None if current is None else current.mlp_in,
-        ),
-        mlp_out=linear_config(
-            hidden_size,
-            hidden_size,
-            bias=True,
-            current=None if current is None else current.mlp_out,
-        ),
-        to_t6=linear_config(
-            hidden_size,
-            6 * hidden_size,
-            bias=True,
-            current=None if current is None else current.to_t6,
-        ),
-        to_t2=linear_config(
-            hidden_size,
-            2 * hidden_size,
-            bias=True,
-            current=None if current is None else current.to_t2,
-        ),
+        mlp_in=Linear.Config(in_features=input_size, out_features=hidden_size, bias=True),
+        mlp_out=Linear.Config(in_features=hidden_size, out_features=hidden_size, bias=True),
+        to_t6=Linear.Config(in_features=hidden_size, out_features=6 * hidden_size, bias=True),
+        to_t2=Linear.Config(in_features=hidden_size, out_features=2 * hidden_size, bias=True),
     )
 
 
-def plan_head_linears_config(
-    config: TransformerConfig,
-    current: PlanHeadConfig | None = None,
-) -> PlanHeadConfig:
-    current_blocks = [] if current is None else current.blocks
+def plan_head_linears_config(config: TransformerConfig) -> PlanHeadConfig:
     return PlanHeadConfig(
-        blocks=[
-            mlp_config(config, current_blocks[i] if i < len(current_blocks) else None) for i in range(config.n_layer)
-        ],
-        head=linear_config(
-            config.n_embd,
-            PLAN_SIZE,
-            bias=config.biased_linears,
-            current=None if current is None else current.head,
-        ),
+        blocks=[mlp_config(config) for _ in range(config.n_layer)],
+        head=Linear.Config(in_features=config.n_embd, out_features=PLAN_SIZE, bias=config.biased_linears),
     )
 
 
@@ -524,24 +445,17 @@ class ScaleLayer(nn.Module):
         self.reset_parameters()
 
 
-class ResidualSequential(nn.Sequential):
-    def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
-        return super().forward(input) + input
-
-
 class PlanHead(nn.Module):
     def __init__(self, linears: PlanHeadConfig):
         super().__init__()
-        self.mlps = nn.ModuleList(
-            ResidualSequential(OrderedDict(block.build().named_children())) for block in linears.blocks
-        )
+        self.mlps = nn.ModuleList(block.build() for block in linears.blocks)
         self.head = linears.head.build()
         self.scale_layer = ScaleLayer(PLAN_SIZE)
         self.init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for mlp in self.mlps:
-            x = mlp(x)
+            x = mlp(x) + x
         return self.scale_layer(self.head(x))
 
     def init_weights(self) -> None:
@@ -677,60 +591,45 @@ class WorldModel(BaseModel):
             self._sync_derived_fields()
 
         def _sync_derived_fields(self) -> None:
+            current = {}
+            if hasattr(self, "blocks"):
+                current = {name: layer for name, layer, _, _ in self.traverse(Linear.Config)}
             self.transformer.block_size = self.num_patches
             self.transformer.attention_mask_mini_block_size = self.num_spatial_patches
             self.plan_head.n_embd = self.transformer.n_embd
             hidden = self.transformer.n_embd
             pose_half = self.pose_size // 2
-            current_blocks = getattr(self, "blocks", [])
-            current_final = getattr(self, "final_layer", None)
-            current_plan = getattr(self, "plan_head_linears", None)
             self.x_embedder = PatchEmbedderLinearsConfig(
-                linear=linear_config(
-                    self.in_channels * math.prod(self.patch_size),
-                    hidden,
-                    current=getattr(getattr(self, "x_embedder", None), "linear", None),
-                )
+                linear=Linear.Config(in_features=self.in_channels * math.prod(self.patch_size), out_features=hidden)
             )
-            self.augments_pos_ref_augment_embedder = conditioning_embedder_linears_config(
-                pose_half,
-                hidden,
-                getattr(self, "augments_pos_ref_augment_embedder", None),
-            )
-            self.ref_augment_from_augments_euler_embedder = conditioning_embedder_linears_config(
-                pose_half,
-                hidden,
-                getattr(self, "ref_augment_from_augments_euler_embedder", None),
-            )
-            self.pose_mask_embedder = conditioning_embedder_linears_config(
-                2, hidden, getattr(self, "pose_mask_embedder", None)
-            )
-            self.t_embedder = conditioning_embedder_linears_config(256, hidden, getattr(self, "t_embedder", None))
-            self.fidx_embedder = conditioning_embedder_linears_config(50, hidden, getattr(self, "fidx_embedder", None))
+            self.augments_pos_ref_augment_embedder = conditioning_embedder_linears_config(pose_half, hidden)
+            self.ref_augment_from_augments_euler_embedder = conditioning_embedder_linears_config(pose_half, hidden)
+            self.pose_mask_embedder = conditioning_embedder_linears_config(2, hidden)
+            self.t_embedder = conditioning_embedder_linears_config(256, hidden)
+            self.fidx_embedder = conditioning_embedder_linears_config(50, hidden)
             self.blocks = [
-                DiTBlockConfig(
-                    attn=attention_config(
-                        self.transformer, current_blocks[i].attn if i < len(current_blocks) else None
-                    ),
-                    mlp=mlp_config(self.transformer, current_blocks[i].mlp if i < len(current_blocks) else None),
-                )
-                for i in range(self.transformer.n_layer)
+                DiTBlockConfig(attn=attention_config(self.transformer), mlp=mlp_config(self.transformer))
+                for _ in range(self.transformer.n_layer)
             ]
             self.final_layer = (
                 FinalLayerLinearsConfig(
-                    linear=linear_config(
-                        hidden,
-                        math.prod(self.patch_size) * self.out_channels,
-                        bias=True,
-                        current=None if current_final is None else current_final.linear,
+                    linear=Linear.Config(
+                        in_features=hidden, out_features=math.prod(self.patch_size) * self.out_channels, bias=True
                     )
                 )
                 if self.out_channels > 0
                 else None
             )
-            self.plan_head_linears = (
-                plan_head_linears_config(self.plan_head, current_plan) if self.plan_head.n_layer >= 0 else None
-            )
+            self.plan_head_linears = plan_head_linears_config(self.plan_head) if self.plan_head.n_layer >= 0 else None
+            # Retain converted linears when their dimensions still match.
+            for name, layer, parent, attr in self.traverse(Linear.Config):
+                previous = current.get(name)
+                if previous is not None and (previous.in_features, previous.out_features, previous.bias) == (
+                    layer.in_features,
+                    layer.out_features,
+                    layer.bias,
+                ):
+                    setattr(parent, attr, previous)
 
         def build(self, **kwargs: Any) -> "WorldModel":
             if kwargs:
