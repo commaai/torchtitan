@@ -7,7 +7,6 @@
 import argparse
 import itertools
 import math
-from collections import OrderedDict
 from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field
@@ -18,7 +17,6 @@ import einops
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops.layers.torch import Rearrange
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
@@ -29,6 +27,7 @@ from torchtitan.config.configurable import Configurable
 from torchtitan.models.common.attention import create_attention_mask, FlexAttention, ScaledDotProductAttention
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.nn_modules import GELU, Identity, LayerNorm, Linear, RMSNorm, SiLU
+from torchtitan.models.common.transformer import MLP, SelfAttention
 from torchtitan.protocols.model import BaseModel
 from torchtitan.tools.logging import logger
 
@@ -65,183 +64,100 @@ class TransformerConfig:
 
 
 @dataclass(kw_only=True, slots=True)
-class SelfAttentionLinearsConfig(Configurable.Config):
-    c_attn: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
-    c_proj: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
-
-
-@dataclass(kw_only=True, slots=True)
-class MLPLinearsConfig(Configurable.Config):
-    c_fc: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
-    c_proj: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
-
-
-FFNLinearsConfig = MLPLinearsConfig
-
-
-@dataclass(kw_only=True, slots=True)
 class PatchEmbedderLinearsConfig(Configurable.Config):
-    linear: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
+    linear: Linear.Config
 
 
 @dataclass(kw_only=True, slots=True)
 class ConditioningEmbedderLinearsConfig(Configurable.Config):
-    mlp_in: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
-    mlp_out: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
-    to_t6: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
-    to_t2: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
+    mlp_in: Linear.Config
+    mlp_out: Linear.Config
+    to_t6: Linear.Config
+    to_t2: Linear.Config
 
 
 @dataclass(kw_only=True, slots=True)
-class DiTBlockLinearsConfig(Configurable.Config):
-    attn: SelfAttentionLinearsConfig = field(default_factory=SelfAttentionLinearsConfig)
-    mlp: FFNLinearsConfig = field(default_factory=MLPLinearsConfig)
+class DiTBlockConfig(Configurable.Config):
+    attn: SelfAttention.Config
+    mlp: MLP.Config
 
 
 @dataclass(kw_only=True, slots=True)
 class FinalLayerLinearsConfig(Configurable.Config):
-    linear: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
+    linear: Linear.Config
 
 
 @dataclass(kw_only=True, slots=True)
-class PlanHeadLinearsConfig(Configurable.Config):
-    blocks: list[FFNLinearsConfig] = field(default_factory=list)
-    head: Linear.Config = field(default_factory=lambda: linear_config(1, 1))
+class PlanHeadConfig(Configurable.Config):
+    blocks: list[MLP.Config]
+    head: Linear.Config
 
 
-def linear_config(
-    in_features: int,
-    out_features: int,
-    *,
-    bias: bool = False,
-    current: Linear.Config | None = None,
-) -> Linear.Config:
-    if (
-        current is not None
-        and current.in_features == in_features
-        and current.out_features == out_features
-        and current.bias == bias
-    ):
-        return current
-    return Linear.Config(in_features=in_features, out_features=out_features, bias=bias)
-
-
-def self_attention_linears_config(
-    config: TransformerConfig,
-    current: SelfAttentionLinearsConfig | None = None,
-) -> SelfAttentionLinearsConfig:
-    return SelfAttentionLinearsConfig(
-        c_attn=linear_config(
-            config.n_embd,
-            3 * config.n_embd,
-            bias=config.biased_linears,
-            current=None if current is None else current.c_attn,
-        ),
-        c_proj=linear_config(
-            config.n_embd,
-            config.n_embd,
-            bias=config.biased_linears,
-            current=None if current is None else current.c_proj,
-        ),
+def attention_config(config: TransformerConfig) -> SelfAttention.Config:
+    if config.n_embd % config.n_head != 0:
+        raise ValueError("n_embd must be divisible by n_head")
+    head_dim = config.n_embd // config.n_head
+    return SelfAttention.Config(
+        norm=norm_config(config.norm, config.n_embd) if config.prenorm else Identity.Config(),
+        norm_name="layer_norm",
+        q_norm=norm_config(config.norm, head_dim) if config.qk_norm else None,
+        k_norm=norm_config(config.norm, head_dim) if config.qk_norm else None,
+        inner_attention={"FLEX": FlexAttention.Config, "SDPA": ScaledDotProductAttention.Config}[
+            config.attention_impl
+        ](),
+        n_head=config.n_head,
+        dropout=config.resid_pdrop,
+        is_causal=False,
+        attn_dropout=config.attn_pdrop,
+        cast_qk_to_autocast=True,
+        c_attn=Linear.Config(in_features=config.n_embd, out_features=3 * config.n_embd, bias=config.biased_linears),
+        c_proj=Linear.Config(in_features=config.n_embd, out_features=config.n_embd, bias=config.biased_linears),
     )
 
 
-def ffn_linears_config(
-    config: TransformerConfig,
-    current: FFNLinearsConfig | None = None,
-) -> FFNLinearsConfig:
+def mlp_config(config: TransformerConfig) -> MLP.Config:
     hidden = mlp_hidden_dim(config.n_embd, config.mlp_mult, config.mlp_multiple_of)
-    return MLPLinearsConfig(
-        c_fc=linear_config(
-            config.n_embd,
-            hidden,
-            bias=config.biased_linears,
-            current=None if current is None else current.c_fc,
-        ),
-        c_proj=linear_config(
-            hidden,
-            config.n_embd,
-            bias=config.biased_linears,
-            current=None if current is None else current.c_proj,
-        ),
+    return MLP.Config(
+        norm=norm_config(config.norm, config.n_embd) if config.prenorm else Identity.Config(),
+        norm_name="layer_norm",
+        act=activation_config(config.act),
+        dropout=config.resid_pdrop,
+        c_fc=Linear.Config(in_features=config.n_embd, out_features=hidden, bias=config.biased_linears),
+        c_proj=Linear.Config(in_features=hidden, out_features=config.n_embd, bias=config.biased_linears),
     )
 
 
-def conditioning_embedder_linears_config(
-    input_size: int,
-    hidden_size: int,
-    current: ConditioningEmbedderLinearsConfig | None = None,
-) -> ConditioningEmbedderLinearsConfig:
+def conditioning_embedder_linears_config(input_size: int, hidden_size: int) -> ConditioningEmbedderLinearsConfig:
     return ConditioningEmbedderLinearsConfig(
-        mlp_in=linear_config(
-            input_size,
-            hidden_size,
-            bias=True,
-            current=None if current is None else current.mlp_in,
-        ),
-        mlp_out=linear_config(
-            hidden_size,
-            hidden_size,
-            bias=True,
-            current=None if current is None else current.mlp_out,
-        ),
-        to_t6=linear_config(
-            hidden_size,
-            6 * hidden_size,
-            bias=True,
-            current=None if current is None else current.to_t6,
-        ),
-        to_t2=linear_config(
-            hidden_size,
-            2 * hidden_size,
-            bias=True,
-            current=None if current is None else current.to_t2,
-        ),
+        mlp_in=Linear.Config(in_features=input_size, out_features=hidden_size, bias=True),
+        mlp_out=Linear.Config(in_features=hidden_size, out_features=hidden_size, bias=True),
+        to_t6=Linear.Config(in_features=hidden_size, out_features=6 * hidden_size, bias=True),
+        to_t2=Linear.Config(in_features=hidden_size, out_features=2 * hidden_size, bias=True),
     )
 
 
-def dit_block_linears_config(
-    config: TransformerConfig,
-    current: DiTBlockLinearsConfig | None = None,
-) -> DiTBlockLinearsConfig:
-    return DiTBlockLinearsConfig(
-        attn=self_attention_linears_config(config, None if current is None else current.attn),
-        mlp=ffn_linears_config(config, None if current is None else current.mlp),
+def plan_head_linears_config(config: TransformerConfig) -> PlanHeadConfig:
+    return PlanHeadConfig(
+        blocks=[mlp_config(config) for _ in range(config.n_layer)],
+        head=Linear.Config(in_features=config.n_embd, out_features=PLAN_SIZE, bias=config.biased_linears),
     )
 
 
-def plan_head_linears_config(
-    config: TransformerConfig,
-    current: PlanHeadLinearsConfig | None = None,
-) -> PlanHeadLinearsConfig:
-    current_blocks = [] if current is None else current.blocks
-    return PlanHeadLinearsConfig(
-        blocks=[
-            ffn_linears_config(config, current_blocks[i] if i < len(current_blocks) else None)
-            for i in range(config.n_layer)
-        ],
-        head=linear_config(
-            config.n_embd,
-            PLAN_SIZE,
-            bias=config.biased_linears,
-            current=None if current is None else current.head,
-        ),
-    )
-
-
-def make_norm(name: str, normalized_shape: int, *, elementwise_affine: bool = True) -> nn.Module:
+def norm_config(
+    name: str, normalized_shape: int, *, elementwise_affine: bool = True
+) -> LayerNorm.Config | RMSNorm.Config:
     if name == "LayerNorm":
-        return LayerNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine).build()
+        return LayerNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine)
     if name == "RMSNorm":
-        return RMSNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine).build()
+        return RMSNorm.Config(normalized_shape=normalized_shape, elementwise_affine=elementwise_affine)
     raise ValueError(f"unknown norm {name}")
 
 
-def make_activation(name: str) -> nn.Module:
+def activation_config(name: str) -> GELU.Config | SiLU.Config:
     if name == "GELU":
-        return GELU.Config(approximate="tanh").build()
+        return GELU.Config(approximate="tanh")
     if name == "SiLU":
-        return SiLU.Config().build()
+        return SiLU.Config()
     raise ValueError(f"unknown activation {name}")
 
 
@@ -322,12 +238,6 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
 def gate(x: torch.Tensor, gate_value: torch.Tensor) -> torch.Tensor:
     x = einops.rearrange(x, "b (t n) c -> b t n c", t=gate_value.shape[1])
     return einops.rearrange(gate_value * x, "b t n c -> b (t n) c")
-
-
-def _cast_if_autocast_enabled(tensor: torch.Tensor) -> torch.Tensor:
-    if torch.is_autocast_enabled():
-        return tensor.to(dtype=torch.get_autocast_dtype(tensor.device.type))
-    return tensor
 
 
 def _blockwise_lower_triangular_causal_mask(
@@ -423,7 +333,7 @@ class PatchEmbedder(nn.Sequential):
                 pw=patch_size[2],
             ),
             linears.linear.build(),
-            make_norm(norm, linears.linear.out_features),
+            norm_config(norm, linears.linear.out_features).build(),
         )
         self.init_weights()
 
@@ -476,7 +386,7 @@ class DiscreteEmbedder(nn.Module):
         init_mlp_weights(self.to_t2)
 
 
-class TimestepEmbedder(nn.Module):
+class TimestepEmbedder(ContinuousEmbedder):
     def __init__(
         self,
         linears: ConditioningEmbedderLinearsConfig,
@@ -485,16 +395,12 @@ class TimestepEmbedder(nn.Module):
         max_period: int = 10000,
         time_factor: float = 1000.0,
     ):
-        super().__init__()
         if frequency_embedding_size % 2 != 0:
             raise ValueError("frequency_embedding_size must be even")
-        self.mlp = nn.Sequential(linears.mlp_in.build(), SiLU.Config().build(), linears.mlp_out.build())
-        self.to_t6 = nn.Sequential(SiLU.Config().build(), linears.to_t6.build())
-        self.to_t2 = nn.Sequential(SiLU.Config().build(), linears.to_t2.build())
+        super().__init__(linears)
         self.frequency_embedding_size = frequency_embedding_size
         self.max_period = max_period
         self.time_factor = time_factor
-        self.init_weights()
 
     def timestep_embedding(self, t: torch.Tensor) -> torch.Tensor:
         half = self.frequency_embedding_size // 2
@@ -505,13 +411,7 @@ class TimestepEmbedder(nn.Module):
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
     def forward(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        t_emb = self.mlp(self.timestep_embedding(t).to(self.mlp[0].weight.dtype))
-        return self.to_t6(t_emb), self.to_t2(t_emb)
-
-    def init_weights(self) -> None:
-        init_mlp_weights(self.mlp)
-        init_mlp_weights(self.to_t6)
-        init_mlp_weights(self.to_t2)
+        return super().forward(self.timestep_embedding(t).to(self.mlp[0].weight.dtype))
 
 
 class ScaleLayer(nn.Module):
@@ -530,92 +430,17 @@ class ScaleLayer(nn.Module):
         self.reset_parameters()
 
 
-class SelfAttention(nn.Module):
-    def __init__(self, config: TransformerConfig, linears: SelfAttentionLinearsConfig):
-        super().__init__()
-        if config.n_embd % config.n_head != 0:
-            raise ValueError("n_embd must be divisible by n_head")
-        self.config = config
-        self.head_dim = config.n_embd // config.n_head
-        self.layer_norm = make_norm(config.norm, config.n_embd) if config.prenorm else Identity.Config().build()
-        self.q_norm = make_norm(config.norm, self.head_dim) if config.qk_norm else Identity.Config().build()
-        self.k_norm = make_norm(config.norm, self.head_dim) if config.qk_norm else Identity.Config().build()
-        self.c_attn = linears.c_attn.build()
-        self.c_proj = linears.c_proj.build()
-        self.dropout = nn.Dropout(config.resid_pdrop)
-        self.flex_attention = FlexAttention.Config().build() if config.attention_impl == "FLEX" else None
-        self.sdpa = ScaledDotProductAttention.Config().build() if config.attention_impl == "SDPA" else None
-        self.kv_cache: Any | None = None
-
-    def forward(self, x: torch.Tensor, input_mask: TensorOrMask | None = None) -> torch.Tensor:
-        batch, seq_len, emb_dim = x.shape
-        qkv = self.c_attn(self.layer_norm(x)).view(batch, seq_len, 3, self.config.n_head, self.head_dim)
-        q, k, v = qkv.unbind(2)
-        q, k = _cast_if_autocast_enabled(self.q_norm(q)), _cast_if_autocast_enabled(self.k_norm(k))
-
-        if self.config.attention_impl == "FLEX":
-            assert self.flex_attention is not None
-            y = self.flex_attention(
-                q,
-                k,
-                v,
-                attention_masks=input_mask,
-                scale=1.0 / math.sqrt(self.head_dim),
-            )
-        elif self.config.attention_impl == "SDPA" and input_mask is None:
-            assert self.sdpa is not None
-            y = self.sdpa(q, k, v, scale=1.0 / math.sqrt(self.head_dim), is_causal=False)
-        elif self.config.attention_impl == "SDPA":
-            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=input_mask,
-                dropout_p=self.config.attn_pdrop if self.training else 0.0,
-                scale=1.0 / math.sqrt(self.head_dim),
-            ).transpose(1, 2)
-        else:
-            raise ValueError(f"unknown attention_impl {self.config.attention_impl}")
-        return self.dropout(self.c_proj(y.reshape(batch, seq_len, emb_dim)))
-
-
-def build_ffn(config: TransformerConfig, linears: FFNLinearsConfig) -> nn.Sequential:
-    return nn.Sequential(
-        OrderedDict(
-            {
-                "layer_norm": make_norm(config.norm, config.n_embd) if config.prenorm else Identity.Config().build(),
-                "c_fc": linears.c_fc.build(),
-                "act": make_activation(config.act),
-                "c_proj": linears.c_proj.build(),
-                "dropout": nn.Dropout(config.resid_pdrop),
-            }
-        )
-    )
-
-
-class ResidualSequential(nn.Sequential):
-    def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
-        return super().forward(input) + input
-
-
-def residual_ffn(config: TransformerConfig, linears: FFNLinearsConfig) -> ResidualSequential:
-    return ResidualSequential(OrderedDict(build_ffn(config, linears).named_children()))
-
-
 class PlanHead(nn.Module):
-    def __init__(self, config: "WorldModel.Config", linears: PlanHeadLinearsConfig):
+    def __init__(self, linears: PlanHeadConfig):
         super().__init__()
-        self.mlps = nn.ModuleList(
-            residual_ffn(config.plan_head, linears.blocks[i]) for i in range(config.plan_head.n_layer)
-        )
+        self.mlps = nn.ModuleList(block.build() for block in linears.blocks)
         self.head = linears.head.build()
         self.scale_layer = ScaleLayer(PLAN_SIZE)
         self.init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for mlp in self.mlps:
-            x = mlp(x)
+            x = mlp(x) + x
         return self.scale_layer(self.head(x))
 
     def init_weights(self) -> None:
@@ -629,12 +454,12 @@ class PlanHead(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, config: "WorldModel.Config", linears: DiTBlockLinearsConfig):
+    def __init__(self, config: "WorldModel.Config", linears: DiTBlockConfig):
         super().__init__()
-        self.norm1 = make_norm(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False)
-        self.attn = SelfAttention(config.transformer, linears.attn)
-        self.norm2 = make_norm(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False)
-        self.mlp = build_ffn(config.transformer, linears.mlp)
+        self.norm1 = norm_config(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False).build()
+        self.attn = linears.attn.build()
+        self.norm2 = norm_config(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False).build()
+        self.mlp = linears.mlp.build()
         self.scale_shift_table = nn.Parameter(torch.empty(1, config.num_temporal_patches, 6, config.transformer.n_embd))
         self.init_weights()
 
@@ -682,7 +507,9 @@ class DiTBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, config: "WorldModel.Config", linears: FinalLayerLinearsConfig):
         super().__init__()
-        self.norm_final = make_norm(config.transformer.norm, config.transformer.n_embd, elementwise_affine=False)
+        self.norm_final = norm_config(
+            config.transformer.norm, config.transformer.n_embd, elementwise_affine=False
+        ).build()
         self.linear = linears.linear.build()
         self.scale_shift_table = nn.Parameter(torch.empty(1, config.num_temporal_patches, 2, config.transformer.n_embd))
         self.init_weights()
@@ -731,9 +558,9 @@ class WorldModel(BaseModel):
         pose_mask_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         t_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
         fidx_embedder: ConditioningEmbedderLinearsConfig = field(init=False)
-        blocks: list[DiTBlockLinearsConfig] = field(init=False)
+        blocks: list[DiTBlockConfig] = field(init=False)
         final_layer: FinalLayerLinearsConfig | None = field(init=False)
-        plan_head_linears: PlanHeadLinearsConfig | None = field(init=False)
+        plan_head_linears: PlanHeadConfig | None = field(init=False)
 
         @property
         def num_spatial_patches(self) -> int:
@@ -751,58 +578,45 @@ class WorldModel(BaseModel):
             self._sync_derived_fields()
 
         def _sync_derived_fields(self) -> None:
+            current = {}
+            if hasattr(self, "blocks"):
+                current = {name: layer for name, layer, _, _ in self.traverse(Linear.Config)}
             self.transformer.block_size = self.num_patches
             self.transformer.attention_mask_mini_block_size = self.num_spatial_patches
             self.plan_head.n_embd = self.transformer.n_embd
             hidden = self.transformer.n_embd
             pose_half = self.pose_size // 2
-            current_blocks = getattr(self, "blocks", [])
-            current_final = getattr(self, "final_layer", None)
-            current_plan = getattr(self, "plan_head_linears", None)
             self.x_embedder = PatchEmbedderLinearsConfig(
-                linear=linear_config(
-                    self.in_channels * math.prod(self.patch_size),
-                    hidden,
-                    current=getattr(getattr(self, "x_embedder", None), "linear", None),
-                )
+                linear=Linear.Config(in_features=self.in_channels * math.prod(self.patch_size), out_features=hidden)
             )
-            self.augments_pos_ref_augment_embedder = conditioning_embedder_linears_config(
-                pose_half,
-                hidden,
-                getattr(self, "augments_pos_ref_augment_embedder", None),
-            )
-            self.ref_augment_from_augments_euler_embedder = conditioning_embedder_linears_config(
-                pose_half,
-                hidden,
-                getattr(self, "ref_augment_from_augments_euler_embedder", None),
-            )
-            self.pose_mask_embedder = conditioning_embedder_linears_config(
-                2, hidden, getattr(self, "pose_mask_embedder", None)
-            )
-            self.t_embedder = conditioning_embedder_linears_config(256, hidden, getattr(self, "t_embedder", None))
-            self.fidx_embedder = conditioning_embedder_linears_config(50, hidden, getattr(self, "fidx_embedder", None))
+            self.augments_pos_ref_augment_embedder = conditioning_embedder_linears_config(pose_half, hidden)
+            self.ref_augment_from_augments_euler_embedder = conditioning_embedder_linears_config(pose_half, hidden)
+            self.pose_mask_embedder = conditioning_embedder_linears_config(2, hidden)
+            self.t_embedder = conditioning_embedder_linears_config(256, hidden)
+            self.fidx_embedder = conditioning_embedder_linears_config(50, hidden)
             self.blocks = [
-                dit_block_linears_config(
-                    self.transformer,
-                    current_blocks[i] if i < len(current_blocks) else None,
-                )
-                for i in range(self.transformer.n_layer)
+                DiTBlockConfig(attn=attention_config(self.transformer), mlp=mlp_config(self.transformer))
+                for _ in range(self.transformer.n_layer)
             ]
             self.final_layer = (
                 FinalLayerLinearsConfig(
-                    linear=linear_config(
-                        hidden,
-                        math.prod(self.patch_size) * self.out_channels,
-                        bias=True,
-                        current=None if current_final is None else current_final.linear,
+                    linear=Linear.Config(
+                        in_features=hidden, out_features=math.prod(self.patch_size) * self.out_channels, bias=True
                     )
                 )
                 if self.out_channels > 0
                 else None
             )
-            self.plan_head_linears = (
-                plan_head_linears_config(self.plan_head, current_plan) if self.plan_head.n_layer >= 0 else None
-            )
+            self.plan_head_linears = plan_head_linears_config(self.plan_head) if self.plan_head.n_layer >= 0 else None
+            # Retain converted linears when their dimensions still match.
+            for name, layer, parent, attr in self.traverse(Linear.Config):
+                previous = current.get(name)
+                if previous is not None and (previous.in_features, previous.out_features, previous.bias) == (
+                    layer.in_features,
+                    layer.out_features,
+                    layer.bias,
+                ):
+                    setattr(parent, attr, previous)
 
         def build(self, **kwargs: Any) -> "WorldModel":
             if kwargs:
@@ -850,7 +664,7 @@ class WorldModel(BaseModel):
         self.fidx_embedder = DiscreteEmbedder(50, config.transformer.n_embd, config.fidx_embedder)
         self.blocks = nn.ModuleList(DiTBlock(config, config.blocks[i]) for i in range(config.transformer.n_layer))
         self.final_layer = FinalLayer(config, config.final_layer) if config.final_layer is not None else None
-        self.plan_head = PlanHead(config, config.plan_head_linears) if config.plan_head_linears is not None else None
+        self.plan_head = PlanHead(config.plan_head_linears) if config.plan_head_linears is not None else None
         self.register_buffer("pos_embed", torch.empty(1, config.num_patches, config.transformer.n_embd))
         self.mask: TensorOrMask | None = None
         self.init_states(buffer_device=self.pos_embed.device)

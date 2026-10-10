@@ -15,15 +15,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 
-from torchtitan.experiments.worldmodel.model import (
-    _cast_if_autocast_enabled,
-    _dense_mask,
-    _mask_fn,
-    SelfAttention,
-    TensorOrMask,
-    WorldModel,
-)
+from torchtitan.experiments.worldmodel.model import _dense_mask, _mask_fn, TensorOrMask, WorldModel
 from torchtitan.experiments.worldmodel.schedulers import RFScheduler
+from torchtitan.models.common.attention import FlexAttention
+from torchtitan.models.common.transformer import SelfAttention
 
 
 KVCacheDType = Literal["bfloat16", "float8_e4m3fn"]
@@ -140,6 +135,8 @@ def _fp8_score_mod(
 
 
 class InferenceSelfAttention(SelfAttention):
+    kv_cache: KVCache | None
+
     def upcast_kv(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if k.dtype != q.dtype:
             return k.to(q.dtype), v.to(q.dtype)
@@ -161,9 +158,7 @@ class InferenceSelfAttention(SelfAttention):
             raise ValueError("cache_seq_length is required when cache_pos is provided")
 
         batch, seq_len, emb_dim = x.shape
-        qkv = self.c_attn(self.layer_norm(x)).view(batch, seq_len, 3, self.config.n_head, self.head_dim)
-        q, k, v = qkv.unbind(2)
-        q, k = _cast_if_autocast_enabled(self.q_norm(q)), _cast_if_autocast_enabled(self.k_norm(k))
+        q, k, v = self.project_qkv(x)
 
         if self.training:
             raise RuntimeError("KV cache is only supported for inference")
@@ -171,10 +166,9 @@ class InferenceSelfAttention(SelfAttention):
             raise RuntimeError("KV cache must be initialized before using cache_pos")
         k, v = self.kv_cache.cache(cache_pos, k, v, cache_seq_length)
 
-        if self.config.attention_impl == "FLEX":
-            assert self.flex_attention is not None
+        if isinstance(self.inner_attention, FlexAttention):
             if k.dtype == torch.float8_e4m3fn:
-                y = self.flex_attention(
+                y = self.inner_attention(
                     q.to(torch.float8_e4m3fn),
                     k,
                     v,
@@ -184,8 +178,8 @@ class InferenceSelfAttention(SelfAttention):
                 ).to(q.dtype)
             else:
                 k, v = self.upcast_kv(q, k, v)
-                y = self.flex_attention(q, k, v, attention_masks=input_mask, scale=1.0 / math.sqrt(self.head_dim))
-        elif self.config.attention_impl == "SDPA":
+                y = self.inner_attention(q, k, v, attention_masks=input_mask, scale=1.0 / math.sqrt(self.head_dim))
+        else:
             k, v = self.upcast_kv(q, k, v)
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             y = F.scaled_dot_product_attention(
@@ -193,14 +187,9 @@ class InferenceSelfAttention(SelfAttention):
                 k,
                 v,
                 attn_mask=input_mask,
-                dropout_p=self.config.attn_pdrop if self.training else 0.0,
+                dropout_p=self.attn_dropout if self.training else 0.0,
                 scale=1.0 / math.sqrt(self.head_dim),
-            )
-        else:
-            raise ValueError(f"unknown attention_impl {self.config.attention_impl}")
-
-        if self.config.attention_impl == "SDPA":
-            y = y.transpose(1, 2)
+            ).transpose(1, 2)
         return self.dropout(self.c_proj(y.reshape(batch, seq_len, emb_dim)))
 
 
@@ -230,6 +219,7 @@ class WorldModelForInference(WorldModel):
         super().__init__(config)
         for block in self.blocks:
             block.attn.__class__ = InferenceSelfAttention
+            block.attn.kv_cache = None
         self.inference_masks: dict[tuple[str, int, int, bool], tuple[TensorOrMask | None, TensorOrMask | None]] = {}
         self.max_batch_size = -1
         self.max_seq_length = -1
