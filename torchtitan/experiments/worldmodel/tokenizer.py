@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from __future__ import annotations
 
 import io
@@ -16,6 +22,9 @@ class WorldModelTokenizer(BaseTokenizer):
     class Config(BaseTokenizer.Config):
         compressor_model: str = ""
         compressor_in_channels: Literal[3, 6, "auto"] = "auto"
+        encode_batch_size: int | None = None
+        encode_dtype: Literal["float32", "bfloat16"] | None = None
+        plan_encoder: str = ""
 
     def __init__(
         self,
@@ -28,6 +37,14 @@ class WorldModelTokenizer(BaseTokenizer):
         self.config = config
         self._encoder: torch.nn.Module | None = None
         self._encoder_key: tuple[torch.device, torch.dtype] | None = None
+        self._plan_encoder: torch.nn.Module | None = None
+
+    @torch.no_grad()
+    def encode_plan(self, plan: torch.Tensor) -> torch.Tensor:
+        if self._plan_encoder is None:
+            self._plan_encoder = torch.export.load(self.config.plan_encoder).module().requires_grad_(False)
+        self._plan_encoder.to(device=plan.device)
+        return self._plan_encoder(plan.float())
 
     def encode(
         self,
@@ -39,7 +56,8 @@ class WorldModelTokenizer(BaseTokenizer):
         if "latents" in inputs:
             return inputs["latents"].to(device=device, dtype=dtype)
 
-        encoder = self._encoder_on(device=device, dtype=dtype)
+        encode_dtype = getattr(torch, self.config.encode_dtype) if self.config.encode_dtype else dtype
+        encoder = self._encoder_on(device=device, dtype=encode_dtype)
         imgs = inputs["imgs"]
         big_imgs = inputs["big_imgs"]
         batch, timesteps = imgs.shape[:2]
@@ -60,18 +78,20 @@ class WorldModelTokenizer(BaseTokenizer):
                 nc=2,
                 b=batch,
                 t=timesteps,
-            ).to(device=device, dtype=dtype)
-            x = x.div(255.0).mul(2).sub(1).clamp(-1, 1)
-            latents = encoder(x)
-            if isinstance(latents, tuple):
-                latents = latents[0]
+            ).to(device=device, dtype=torch.float32 if self.config.encode_dtype else dtype)
+            x = x.div(255.0).mul(2).sub(1).clamp(-1, 1).to(dtype=encode_dtype)
+            encoded = []
+            for chunk in x.split(self.config.encode_batch_size or x.shape[0]):
+                latents = encoder(chunk)
+                encoded.append(latents[0] if isinstance(latents, tuple) else latents)
+            latents = torch.cat(encoded) if len(encoded) > 1 else encoded[0]
             return einops.rearrange(
                 latents,
                 inverse_spec,
                 nc=2,
                 b=batch,
                 t=timesteps,
-            )
+            ).to(dtype=dtype)
 
     def decode(self, *args: Any, **kwargs: Any) -> str:
         return ""
