@@ -101,7 +101,7 @@ def rldriving() -> RLDrivingTrainer.Config:
         ),
         warm_start_checkpoint=os.getenv(
             "RLDRIVING_WARM_START_CHECKPOINT",
-            "b9facbcc-4d47-410e-b3ce-dfcbad12ba92/56320",
+            "f22e06e5-3b3f-48d2-a6b9-2f32dc20e707/56320",
         ),
         tokenizer=NoOpTokenizer.Config(),
         dataloader=RLDrivingDataLoader.Config(
