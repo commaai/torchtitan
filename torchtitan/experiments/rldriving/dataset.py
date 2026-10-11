@@ -29,7 +29,7 @@ class RLDrivingDataLoader(BaseDataLoader):
         dataset: str
         fps: int
         training_id: str = ""
-        shuffle_size: int = 50_000
+        shuffle_size: int = 200_000
         min_mixing: float = 0.9
         num_writers: int = 1
         num_readers: int = 1
@@ -41,7 +41,7 @@ class RLDrivingDataLoader(BaseDataLoader):
         max_queue_size: int = 256
         max_fq_size: int = 8192
 
-        train_skip: int = 1
+        train_skip: int = 2
         epochs: int = 0
         steps_per_epoch: int = 1
         save_cache: bool = False
