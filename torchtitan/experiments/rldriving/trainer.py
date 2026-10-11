@@ -40,7 +40,7 @@ from torchtitan.trainer import Trainer
 
 from .dataset import RLDrivingDataLoader
 from .loss import RLDrivingLoss
-from .model import RLDrivingModel
+from .model import _copy_model_state, RLDrivingModel
 from .onnx_checkpoint import RLDrivingOnnxCheckpointManager
 
 
@@ -64,7 +64,7 @@ NStepPreparedBatch = tuple[
 ]
 
 
-_get_path_checkpoint = cache(Checkpoint)
+_get_warm_start_checkpoint = cache(Checkpoint)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -150,10 +150,13 @@ class RLDrivingTrainer(Trainer):
         checkpoint: RLDrivingOnnxCheckpointManager.Config  # pyrefly: ignore [bad-override]
         lr_scheduler: RLDrivingLRSchedulers.Config  # pyrefly: ignore [bad-override]
         warm_start_checkpoint: str
+        """PATH temporal policy or ResFiT EMA actor and critics used to initialize training."""
         steps_per_epoch: int
         train_step_barrier_timeout_seconds: int
         ema_tau: float
         fps: int
+        vision_model: str | None = None
+        """Frozen rollout vision checkpoint; defaults to the PATH warm start."""
         miniray: dict[str, Any] = field(default_factory=dict)
         reports: list[Report] = field(default_factory=list)
 
@@ -192,11 +195,25 @@ class RLDrivingTrainer(Trainer):
         )
         self.loss_fn.to(self.device)
         self.model = cast(RLDrivingModel, self.model_parts[0])
-        dcp.load(
-            {"temporal_policy": self.model.actor.off_policy},
-            storage_reader=FsspecReader(_get_path_checkpoint(config.warm_start_checkpoint).url_or_file()),
-        )
-        self.model.warm_start_critics_from_actor()
+        reader = FsspecReader(_get_warm_start_checkpoint(config.warm_start_checkpoint).url_or_file())
+        metadata = reader.read_metadata().state_dict_metadata
+        if any(key.startswith("target_actor.") for key in metadata):
+            if config.vision_model is None:
+                raise ValueError("ResFiT warm starts require vision_model to name a PATH/FastViT checkpoint")
+            dcp.load(
+                {
+                    "target_actor": self.model.actor,
+                    "critic": self.model.critic,
+                    "target_critic": self.model.target_critic,
+                },
+                storage_reader=reader,
+            )
+            # Keep the checkpoint's target critics while starting both actors from its EMA policy.
+            _copy_model_state(self.model.actor, self.model.target_actor)
+            logger.info("Warm-started ResFiT EMA actor and critics from %s", config.warm_start_checkpoint)
+        else:
+            dcp.load({"temporal_policy": self.model.actor.off_policy}, storage_reader=reader)
+            self.model.warm_start_critics_from_actor()
 
     # pyrefly: ignore [bad-override]
     def batch_generator(self, data_iterable: Iterable[Batch]) -> Iterator[Batch]:
