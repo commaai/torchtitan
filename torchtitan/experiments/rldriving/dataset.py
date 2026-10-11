@@ -44,8 +44,6 @@ class RLDrivingDataLoader(BaseDataLoader):
         train_skip: int = 2
         epochs: int = 0
         steps_per_epoch: int = 1
-        save_cache: bool = False
-        load_caches: list[str] = field(default_factory=list)
 
         zero_desire: bool = False
         photo_noise_model: Literal["NONE", "VISION"] = "VISION"
@@ -95,8 +93,6 @@ class RLDrivingDataLoader(BaseDataLoader):
             train_skip=config.train_skip,
             epochs=config.epochs,
             steps_per_epoch=config.steps_per_epoch,
-            save_cache=config.save_cache,
-            load_caches=list(config.load_caches),
             fps=config.fps,
             zero_desire=config.zero_desire,
             photo_noise_model=config.photo_noise_model,

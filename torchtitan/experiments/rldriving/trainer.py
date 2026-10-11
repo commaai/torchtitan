@@ -182,6 +182,9 @@ class RLDrivingTrainer(Trainer):
                 backend="gloo", timeout=timedelta(seconds=config.train_step_barrier_timeout_seconds)
             )
         training_id = os.getenv("REPORTERV2_TRAINING_ID") or "local"
+        self.dataloader.dataset.config = self.dataloader.dataset.config.replace(
+            checkpoint_id=self.checkpointer.checkpoint_dav_id
+        )
         self.unique_segment_counter = StringUniqueCounter(f"unique_ids:{training_id}:rldriving:train")
         self.report_runner = ReportRunner(
             config.reports,
@@ -385,6 +388,9 @@ class RLDrivingTrainer(Trainer):
         loaded = self.checkpointer.load(step=config.checkpoint.load_step)
         if not loaded:
             self.checkpointer.save(0)
+            self.report_runner.submit(step=0)
+        else:
+            self.checkpointer.checkpoint_dav_save(self.step, force=True)
         self.set_runtime_seed()
         loaded_step = self.step
         logger.info(f"Training starts at step {self.step + 1}")
