@@ -57,9 +57,6 @@ ignore-words-list = ["assertin", "datas" ,"indx", "inpt", "nd", "socio-economic"
 gigashuffle = { git = "https://github.com/commaai/gigashuffle.git" }
 reporterv2 = { git = "https://github.com/commaai/reporterv2.git" }
 
-[tool.black]
-line-length = 120
-
 # ---- Explicit project build information ---- #
 [build-system]
 requires = ["setuptools>=61.0"]
