@@ -153,7 +153,9 @@ class TestCheckpointManager(unittest.TestCase):
         )
 
         # Patch process group creation
-        self.patcher_group = mock.patch("torch.distributed.new_group", return_value="pg")
+        self.patcher_group = mock.patch(
+            "torch.distributed.new_group", return_value="pg"
+        )
         self.patcher_group.start()
 
     def tearDown(self):
@@ -172,7 +174,9 @@ class TestCheckpointManager(unittest.TestCase):
         torch.save(sd_to_save, os.path.join(checkpoint_id, "state_dict.pt"))
         return Metadata(state_dict_metadata={}, storage_data={})
 
-    def fake_load(self, states: dict, checkpoint_id=None, storage_reader=None, planner=None):
+    def fake_load(
+        self, states: dict, checkpoint_id=None, storage_reader=None, planner=None
+    ):
         path = os.path.join(checkpoint_id, "state_dict.pt")
         loaded = torch.load(path, weights_only="False")
         for key, val in loaded.items():
@@ -216,7 +220,9 @@ class TestCheckpointManager(unittest.TestCase):
     @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch("torchtitan.components.checkpoint.dcp.save")
     @mock.patch("torchtitan.components.checkpoint.dcp.load")
-    def test_save_and_purge_keeps_last_k_checkpoints(self, mock_load, mock_save, mock_rank):
+    def test_save_and_purge_keeps_last_k_checkpoints(
+        self, mock_load, mock_save, mock_rank
+    ):
         mock_save.side_effect = self.fake_save
         manager = CheckpointManager(
             dataloader=self.data_loader,
@@ -273,7 +279,9 @@ class TestCheckpointManager(unittest.TestCase):
         manager.save(curr_step=2)
         manager.save(curr_step=3)
         time.sleep(1)
-        self.assertListEqual(sorted(os.listdir(self.test_folder)), ["step-1", "step-2", "step-3"])
+        self.assertListEqual(
+            sorted(os.listdir(self.test_folder)), ["step-1", "step-2", "step-3"]
+        )
         self.assertEqual(len(mock_save.call_args_list), 3)
         manager.close()
 
@@ -354,7 +362,9 @@ class TestCheckpointManager(unittest.TestCase):
             base_folder=self.test_folder,
         )
 
-        self.assertEqual(manager._create_checkpoint_id(7), os.path.join(ckpt_folder, "epoch_7"))
+        self.assertEqual(
+            manager._create_checkpoint_id(7), os.path.join(ckpt_folder, "epoch_7")
+        )
         self.assertEqual(manager._find_load_step(), 5)
         manager.close()
 
@@ -447,7 +457,9 @@ class TestCheckpointManager(unittest.TestCase):
     @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch("torchtitan.components.checkpoint.dcp.save")
     @mock.patch("torchtitan.components.checkpoint.dcp.load")
-    def test_last_save_model_only_and_initial_load_model_only(self, mock_load, mock_save, mock_rank):
+    def test_last_save_model_only_and_initial_load_model_only(
+        self, mock_load, mock_save, mock_rank
+    ):
         mock_save.side_effect = self.fake_save
         mock_load.side_effect = self.fake_load
         # Phase 1: save model weights only
@@ -505,7 +517,9 @@ class TestCheckpointManager(unittest.TestCase):
     @mock.patch("torch.cuda.Stream")
     @mock.patch("torchtitan.components.checkpoint.DefaultStager")
     @mock.patch("torchtitan.components.checkpoint.dist.new_group")
-    @mock.patch("torchtitan.components.checkpoint.dcp.async_save", side_effect=fake_async_save)
+    @mock.patch(
+        "torchtitan.components.checkpoint.dcp.async_save", side_effect=fake_async_save
+    )
     def test_async_save_with_pinned_mem_assigns_staging_future(
         self,
         mock_async_save,
@@ -559,8 +573,12 @@ class TestCheckpointManager(unittest.TestCase):
         manager.close()
 
     @mock.patch("torchtitan.components.checkpoint.dist.new_group")
-    @mock.patch("torchtitan.components.checkpoint.dcp.async_save", side_effect=fake_async_save)
-    def test_async_save_calls_maybe_wait_for_saving(self, mock_async_save, mock_new_group):
+    @mock.patch(
+        "torchtitan.components.checkpoint.dcp.async_save", side_effect=fake_async_save
+    )
+    def test_async_save_calls_maybe_wait_for_saving(
+        self, mock_async_save, mock_new_group
+    ):
         """
         Test that in AsyncMode.ASYNC, save() waits on previous async future.
         """
@@ -775,7 +793,9 @@ class TestCheckpointManager(unittest.TestCase):
                 self.assertNotIn("optimizer", state_dict)
             return Metadata(state_dict_metadata={}, storage_data={})
 
-        def fake_load(state_dict: dict, checkpoint_id=None, storage_reader=None, planner=None):
+        def fake_load(
+            state_dict: dict, checkpoint_id=None, storage_reader=None, planner=None
+        ):
             self.assertIn("bias", state_dict)
             self.assertIn("weight", state_dict)
             # No model prefix
@@ -860,7 +880,9 @@ class TestConfigPostInit(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least 2 checkpoint replicas"):
             CheckpointManager.Config(keep_latest_k=1)
 
-        with self.assertRaisesRegex(ValueError, f"{MODEL} key shouldn't be in exclude_from_loading."):
+        with self.assertRaisesRegex(
+            ValueError, f"{MODEL} key shouldn't be in exclude_from_loading."
+        ):
             CheckpointManager.Config(exclude_from_loading=[MODEL])
 
     def test_path_normalization(self):
@@ -869,8 +891,12 @@ class TestConfigPostInit(unittest.TestCase):
         cfg = CheckpointManager.Config(initial_load_path="  /absolute/path/step-100  ")
         self.assertEqual(cfg.initial_load_path, "/absolute/path/step-100")
 
-        cfg = CheckpointManager.Config(initial_load_path="  memory://torchtitan-checkpoints/step-100  ")
-        self.assertEqual(cfg.initial_load_path, "memory://torchtitan-checkpoints/step-100")
+        cfg = CheckpointManager.Config(
+            initial_load_path="  memory://torchtitan-checkpoints/step-100  "
+        )
+        self.assertEqual(
+            cfg.initial_load_path, "memory://torchtitan-checkpoints/step-100"
+        )
 
         # Test relative path rejection
         with self.assertRaisesRegex(ValueError, "must be absolute"):
@@ -880,7 +906,9 @@ class TestConfigPostInit(unittest.TestCase):
         """Test logic where one field requires another to be set."""
         # HF load needs model_only=True; initial_load_path stays optional.
         with self.assertRaisesRegex(ValueError, "requires initial_load_model_only"):
-            CheckpointManager.Config(initial_load_in_hf=True, initial_load_model_only=False)
+            CheckpointManager.Config(
+                initial_load_in_hf=True, initial_load_model_only=False
+            )
         CheckpointManager.Config(initial_load_in_hf=True, initial_load_path=None)
 
         # HF quantized requires HF enabled
@@ -915,7 +943,9 @@ class TestConfigPostInit(unittest.TestCase):
 
         # model_only=True without a path
         CheckpointManager.Config(initial_load_model_only=True, initial_load_path=None)
-        mock_logger.warning.assert_any_call("initial_load_model_only=True has no effect without an initial_load_path.")
+        mock_logger.warning.assert_any_call(
+            "initial_load_model_only=True has no effect without an initial_load_path."
+        )
 
 
 class TestModelWrapper(unittest.TestCase):

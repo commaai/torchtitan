@@ -93,7 +93,11 @@ def get_peak_flops(device_name: str) -> float:
         # Run the lspci command and capture the output
         result = subprocess.run(["lspci"], stdout=subprocess.PIPE, text=True)
         # Filter the output for lines containing both "NVIDIA" and "H100"
-        filtered_lines = [line for line in result.stdout.splitlines() if "NVIDIA" in line and "H100" in line]
+        filtered_lines = [
+            line
+            for line in result.stdout.splitlines()
+            if "NVIDIA" in line and "H100" in line
+        ]
         # Join all filtered lines into a single string
         device_name = " ".join(filtered_lines) or device_name
     except FileNotFoundError as e:
@@ -174,8 +178,11 @@ def get_peak_flops(device_name: str) -> float:
             # https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/neuron-core-v4.html
             return 79e12 * 2
         else:
-            logger.warning(f"Unknown neuron device: {neuron_device_name}, fallback to trn2/trn3")
+            logger.warning(
+                f"Unknown neuron device: {neuron_device_name}, fallback to trn2/trn3"
+            )
             return 79e12 * 2
+
     elif "5090" in device_name:
         # FP16/FP16 data:
         # https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
