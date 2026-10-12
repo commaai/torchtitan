@@ -87,7 +87,7 @@ def rldriving() -> RLDrivingTrainer.Config:
     reporterv2_host = os.getenv("REPORTERV2_HOST")
     reporterv2_training_id = os.getenv("REPORTERV2_TRAINING_ID")
     checkpoint_base_folder = f"{reporterv2_host.rstrip('/')}/checkpoint" if reporterv2_host else ""
-    actor_optim = {"lr": 4e-5, "betas": (0.9, 0.999), "eps": 1e-8}
+    actor_optim = {"lr": 2e-4, "betas": (0.9, 0.999), "eps": 1e-8}
     critic_optim = {"lr": 2e-4, "betas": (0.9, 0.999), "eps": 1e-8}
     return RLDrivingTrainer.Config(
         model_spec=model_spec,
@@ -168,7 +168,7 @@ def rldriving() -> RLDrivingTrainer.Config:
         ),
         steps_per_epoch=steps_per_epoch,
         train_step_barrier_timeout_seconds=60 * 60,
-        ema_tau=128.0,
+        ema_tau=1024.0,
         fps=fps,
         activation_checkpoint=None,
         compile=CompileConfig(enable=True, components=["model"]),
