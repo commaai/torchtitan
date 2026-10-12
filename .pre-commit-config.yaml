@@ -22,7 +22,6 @@ repos:
     hooks:
     -   id: insert-license
         files: \.py$
-        exclude: torchtitan/experiments/path/validate\.py
         args:
         - --license-filepath
         - assets/license_header.txt
@@ -43,7 +42,6 @@ repos:
     rev: v2.3.0
     hooks:
     -   id: ufmt
-        exclude: torchtitan/experiments/path/validate\.py
         additional_dependencies:
           - black == 22.12.0
           - usort == 1.0.5
@@ -113,7 +111,6 @@ repos:
         - "--exclude=http://localhost:.*"
         - "--exclude=http://127.0.0.1:.*"
         - "--exclude=tcp://localhost:.*"
-        - "--exclude=https?://[^/]*\\.comma\\.life.*"  # internal hosts, unreachable from public runners
         - "--max-retries=5"
         - "--retry-wait-time=10"
         - "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
