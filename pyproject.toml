@@ -23,7 +23,6 @@ dependencies = [
     "tensorboard",
     "wandb",
     "fsspec",
-    "reporterv2; python_version >= '3.11'",
     "einops",
     "pillow",
     "spmd_types==0.2.1",
@@ -51,9 +50,6 @@ version = {file = "assets/version.txt"}
 skip = ["*.json"]
 ignore-words-list = ["assertin", "datas" ,"indx", "inpt", "nd", "socio-economic"]
 
-[tool.uv.sources]
-reporterv2 = { git = "https://github.com/commaai/reporterv2.git" }
-
 # ---- Explicit project build information ---- #
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -69,7 +65,7 @@ testpaths = ["tests"]
 
 [tool.pyrefly]
 project-excludes = ["torchtitan/experiments", "**/tests/**"]
-replace-imports-with-any = ["torchao.*", "torchft", "torchvision.*", "deep_ep.*", "jinja2.*", "fla.*", "reporterv2"]  # optional dependencies
+replace-imports-with-any = ["torchao.*", "torchft", "torchvision.*", "deep_ep.*", "jinja2.*", "fla.*"]  # optional dependencies
 search-path = ["../pytorch"]  # local built pytorch
 
 [[tool.pyrefly.sub-config]]
