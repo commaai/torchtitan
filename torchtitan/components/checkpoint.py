@@ -997,10 +997,6 @@ class CheckpointManager(Configurable):
         self.save_future = None
         self._log_dcp_size(metadata)
 
-    def _async_wait(self) -> None:
-        """Compatibility wrapper for subclasses that predate maybe_wait_for_saving."""
-        self.maybe_wait_for_saving()
-
     def _find_load_step(self, folder: str = "") -> int:
         """Identify the highest available checkpoint step in the specified directory.
 
