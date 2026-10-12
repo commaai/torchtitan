@@ -74,9 +74,9 @@ class RLDrivingLRSchedulersConfig(LRSchedulersContainer.Config):
     actor_delay_epochs: float = 15.0
     actor_warmup_fraction: float = 0.1
     cooldown_fraction: float = 0.4
-    min_lr_factor: float = 0.05
+    min_lr_factor: float = 1.0
     critic_switch_epoch: float = 15.0
-    critic_second_lr: float = 4e-5
+    critic_second_lr: float = 2e-4
 
     # pyrefly: ignore [bad-override]
     def build(self, *, optimizers, training_steps):
