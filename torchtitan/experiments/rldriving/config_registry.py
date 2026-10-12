@@ -19,6 +19,7 @@ from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.components.tokenizer import NoOpTokenizer
 from torchtitan.config import CompileConfig, DebugConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .dataset import RLDrivingDataLoader
@@ -48,10 +49,10 @@ def _make_reports(*, fps: int, num_epochs: int, steps_per_epoch: int) -> list[Re
     steps_by_report = {
         "analyse_lat.no_noise": frequent_steps,
         "analyse_lat.realistic_noise": frequent_steps,
-        "analyse_long": frequent_steps,
-        "analyse_unintended_lead_following": sparse_steps,
+        "analyse_long": [], # frequent_steps,
+        "analyse_unintended_lead_following": [], #  sparse_steps,
         "analyse_speed_convergence": sparse_steps,
-        "analyse_platform_oscillation": sparse_steps,
+        "analyse_platform_oscillation":  [], # sparse_steps,
         "analyse_nurec": sparse_steps,
     }
 
@@ -170,7 +171,7 @@ def rldriving() -> RLDrivingTrainer.Config:
         train_step_barrier_timeout_seconds=60 * 60,
         ema_tau=128.0,
         fps=fps,
-        activation_checkpoint=None,
+        activation_checkpoint=FullAC.Config(),
         compile=CompileConfig(enable=True, components=["model"]),
         metrics=MetricsProcessor.Config(
             log_freq=16,

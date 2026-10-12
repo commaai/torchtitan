@@ -8,7 +8,7 @@ from types import MethodType
 
 from xx.training.path.model import PathSelfAttention, TemporalSummarizer
 from xx.training.path.model_config import model_config
-from xx.training.path.model_constants import ModelInputs, SPATIAL_SIZE
+from xx.training.path.model_constants import ModelInputs, NAVIGATION_PROJECTIONS, SPATIAL_SIZE
 
 import torch
 
@@ -20,7 +20,9 @@ VISION_OUTPUT_ORDER = tuple(
 )
 OFF_POLICY_OUTPUT_ORDER = ("plan", "lead", "lead_prob", "desire_state")
 ON_POLICY_OUTPUT_ORDER = ("action",)
-OUTPUT_ORDER = (*VISION_OUTPUT_ORDER, *OFF_POLICY_OUTPUT_ORDER, *ON_POLICY_OUTPUT_ORDER, "hidden_state")
+OUTPUT_ORDER = (
+    *VISION_OUTPUT_ORDER, *OFF_POLICY_OUTPUT_ORDER, *ON_POLICY_OUTPUT_ORDER, "hidden_state", *NAVIGATION_PROJECTIONS,
+)
 TINYGRAD_ONNX_DOMAIN = "org.tinygrad"
 TINYGRAD_CONTIGUOUS_OP = "Contiguous"
 
@@ -72,6 +74,7 @@ class Supercombo(torch.nn.Module):
             **{head.name: head.output_size for head in config.point_policy.hydra.heads},
             **{head.name: head.output_size for head in config.temporal_policy.temporal_hydra.heads},
             "hidden_state": SPATIAL_SIZE * config.vision.vision_features,
+            **{name: shape[0] for name, shape in NAVIGATION_PROJECTIONS.items()},
         }
         output_size = sum(self.output_sizes[name] for name in OUTPUT_ORDER)
         self.register_buffer("pad", torch.zeros(1, -output_size % 4), persistent=False)
@@ -85,9 +88,18 @@ class Supercombo(torch.nn.Module):
                 attention.register_buffer("_supercombo_mask", mask.tril(), persistent=False)
                 attention.forward = MethodType(_naive_attention, attention)
 
-    def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    def predictions(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         current = self.vision(inputs)
         features = torch.cat((inputs["features_buffer"], current[:, None]), dim=1)
+        # Encode only this frame, then share its projections across both policies.
+        maps, navigation = self.off_policy.temporal_summarizer.encode_navigation(
+            (inputs[ModelInputs.MAP][:, None].float() / 255).to(current.dtype),
+            inputs[ModelInputs.NAVIGATION][:, None].to(current.dtype),
+        )
+        projections = {ModelInputs.MAP_FEATURES: maps, ModelInputs.NAVIGATION_FEATURES: navigation}
+        histories = {
+            name: torch.cat((inputs[f"{name}_buffer"], value), dim=1) for name, value in projections.items()
+        }
         outputs = self.point_policy(current.mean(dim=1))
         for policy, names in ((self.off_policy, OFF_POLICY_OUTPUT_ORDER), (self.on_policy, ON_POLICY_OUTPUT_ORDER)):
             policy_outputs = policy(
@@ -95,7 +107,14 @@ class Supercombo(torch.nn.Module):
                 inputs[ModelInputs.DESIRE],
                 inputs[ModelInputs.TRAFFIC][:, None],
                 inputs[ModelInputs.ACTION_T][:, None],
+                map_features=histories[ModelInputs.MAP_FEATURES],
+                navigation_features=histories[ModelInputs.NAVIGATION_FEATURES],
             )
             outputs.update({name: policy_outputs[name] for name in names})
         outputs["hidden_state"] = current.detach().flatten(1)
+        outputs.update({name: value[:, 0] for name, value in projections.items()})
+        return outputs
+
+    def forward(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        outputs = self.predictions(inputs)
         return torch.cat([outputs[name] for name in OUTPUT_ORDER] + [self.pad], dim=1)

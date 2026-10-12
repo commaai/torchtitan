@@ -16,7 +16,7 @@ from functools import cache
 from typing import Any, cast, Literal
 
 from xx.common.helpers import parse_info
-from xx.ml_tools.constants.model import TEMPORAL_INPUTS
+from xx.ml_tools.constants.model import NAVIGATION_PROJECTIONS, PROJECTED_TEMPORAL_INPUTS
 from xx.training.lib.checkpoint import Checkpoint
 from xx.training.lib.torchtitan.report_runner import Report, ReportRunner
 from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
@@ -221,15 +221,23 @@ class RLDrivingTrainer(Trainer):
         inputs = {name: value.to(self.device) for name, value in inputs.items()}
         targets = {name: value.to(self.device) for name, value in targets.items()}
         metadata = {name: value.to(self.device) for name, value in metadata.items()}
-        current_inputs = {name: inputs[name].float() for name in TEMPORAL_INPUTS}
-        n_step = inputs[f"next_{next(iter(TEMPORAL_INPUTS))}"].shape[1]
+        # The shared buffer carries BF16 projection bits in int16 storage.
+        for name in NAVIGATION_PROJECTIONS:
+            for key in (name, f"next_{name}"):
+                if inputs[key].dtype == torch.int16:
+                    inputs[key] = inputs[key].view(torch.bfloat16)
+        current_inputs = {
+            name: inputs[name] if name in NAVIGATION_PROJECTIONS else inputs[name].float()
+            for name in PROJECTED_TEMPORAL_INPUTS
+        }
+        n_step = inputs[f"next_{next(iter(PROJECTED_TEMPORAL_INPUTS))}"].shape[1]
         next_inputs = {
-            name: torch.cat((inputs[name][:, 1:], inputs[f"next_{name}"][:, :1]), dim=1).float()
-            for name in current_inputs
+            name: torch.cat((value[:, 1:], inputs[f"next_{name}"][:, :1].to(value.dtype)), dim=1)
+            for name, value in current_inputs.items()
         }
         bootstrap_inputs = {
-            name: torch.cat((inputs[name][:, n_step:], inputs[f"next_{name}"]), dim=1).float()
-            for name in current_inputs
+            name: torch.cat((value[:, n_step:], inputs[f"next_{name}"].to(value.dtype)), dim=1)
+            for name, value in current_inputs.items()
         }
         return current_inputs, next_inputs, bootstrap_inputs, targets, metadata
 

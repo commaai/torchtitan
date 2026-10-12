@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import cast
+from xx.training.lib.onnx_helpers import cast_map_encoders_to_bfloat16
 from xx.training.lib.torchtitan.onnx_checkpoint import OnnxCheckpointManager
 
+import onnx
 import torch
 import torch.nn as nn
 
@@ -48,3 +50,7 @@ class RLDrivingOnnxCheckpointManager(OnnxCheckpointManager):
             path,
             output_names=[ACTION_HEAD_NAME],
         )
+
+    def _post_export_hook(self, onnx_data: bytes) -> bytes:
+        model = cast_map_encoders_to_bfloat16(onnx.load_from_string(onnx_data))
+        return model.SerializeToString()

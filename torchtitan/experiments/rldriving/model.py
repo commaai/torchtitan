@@ -11,7 +11,9 @@ from dataclasses import dataclass
 from typing import Any, cast
 from xx.training.path.model import Hydra, LinearEncoder, PathHead, PathMLP, TemporalPolicy, TemporalSummarizer
 from xx.training.path.model_config import _encoder, _hydra, _mlp, TEMPORAL_HEADS, temporal_policy_config
-from xx.training.path.model_constants import ACTION_LEN, ModelInputs
+from xx.training.path.model_constants import (
+    ACTION_LEN, ModelInputs, NAVIGATION_PROJECTIONS, TEMPORAL_INPUTS,
+)
 
 import torch
 import torch.nn as nn
@@ -21,7 +23,7 @@ from torch.utils.flop_counter import FlopCounterMode
 
 from torchtitan.config import CompileConfig, ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig, FullAC, MemoryBudgetAC
 from torchtitan.distributed.fsdp import enable_fsdp_symm_mem, get_fsdp_reshard_after_forward_policy
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module
@@ -43,6 +45,8 @@ def _policy_forward(policy: TemporalPolicy | ResFiTPolicy, inputs: TemporalInput
         inputs[ModelInputs.DESIRE],
         inputs[ModelInputs.TRAFFIC],
         inputs[ModelInputs.ACTION_T],
+        map_features=inputs[ModelInputs.MAP_FEATURES],
+        navigation_features=inputs[ModelInputs.NAVIGATION_FEATURES],
     )
 
 
@@ -71,17 +75,22 @@ class ResFiTPolicy(Module):
         desire_BTA: torch.Tensor,
         traffic_BTA: torch.Tensor,
         action_t_BTA: torch.Tensor,
+        map_features: torch.Tensor,
+        navigation_features: torch.Tensor,
     ) -> ActorOutputs:
         with torch.no_grad():
-            off_policy_action_BA = self.off_policy(features_BTSD, desire_BTA, traffic_BTA, action_t_BTA)[
-                ACTION_HEAD_NAME
-            ]
+            off_policy_action_BA = self.off_policy(
+                features_BTSD, desire_BTA, traffic_BTA, action_t_BTA,
+                map_features=map_features, navigation_features=navigation_features,
+            )[ACTION_HEAD_NAME]
         dtype = features_BTSD.dtype
-        summary_BD = self.temporal_summarizer(
+        summary_BD = self.temporal_summarizer.forward_with_features(
             features_BTSD[:, self.history_idxs],
             desire_BTA.to(dtype),
             traffic_BTA[:, -1].to(dtype),
             action_t_BTA[:, -1].to(dtype),
+            map_features[:, self.history_idxs].to(dtype),
+            navigation_features[:, self.history_idxs].to(dtype),
         )
         summary_BD = summary_BD + self.action_encoder(off_policy_action_BA[..., :ACTION_LEN].to(dtype))
         residual_BA = self.residual_hydra(summary_BD)[RESIDUAL_ACTION_HEAD_NAME].tanh()
@@ -118,11 +127,13 @@ class Critic(Module):
     def forward(self, inputs: TemporalInputs, action: torch.Tensor) -> torch.Tensor:
         features_BTSD = inputs[ModelInputs.FEATURES]
         dtype = features_BTSD.dtype
-        critic_features_BD = self.temporal_summarizer(
+        critic_features_BD = self.temporal_summarizer.forward_with_features(
             features_BTSD[:, self.history_idxs],
             inputs[ModelInputs.DESIRE].to(dtype),
             inputs[ModelInputs.TRAFFIC][:, -1].to(dtype),
             inputs[ModelInputs.ACTION_T][:, -1].to(dtype),
+            inputs[ModelInputs.MAP_FEATURES][:, self.history_idxs].to(dtype),
+            inputs[ModelInputs.NAVIGATION_FEATURES][:, self.history_idxs].to(dtype),
         )
         critic_features_BD = critic_features_BD + self.post_action_mlp1(critic_features_BD)
         critic_features_BD = critic_features_BD + self.action_encoder(action.to(dtype))
@@ -186,8 +197,6 @@ class RLDrivingModel(BaseModel):
             for name, degree in unsupported.items():
                 if degree > 1:
                     raise ValueError(f"rldriving does not support {name}")
-            if config.activation_checkpoint is not None:
-                raise ValueError("rldriving does not support activation checkpointing")
 
         def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
             rldriving_model = cast(RLDrivingModel, model)
@@ -215,6 +224,11 @@ class RLDrivingModel(BaseModel):
 
         self.target_actor.requires_grad_(False).eval()
         self.target_critic.requires_grad_(False).eval()
+        # Rollouts cache the PATH projections; RL always bypasses these frozen modules.
+        for module in self.modules():
+            if isinstance(module, TemporalSummarizer):
+                for name in ("map_encoder", "map_projection", "navigation_encoder"):
+                    getattr(module, name).requires_grad_(False)
         for critic in (self.critic.critic1, self.critic.critic2):
             for name in ("desire_encoder", "traffic_encoder", "action_t_encoder"):
                 getattr(critic.temporal_summarizer, name).requires_grad_(False)
@@ -226,7 +240,7 @@ class RLDrivingModel(BaseModel):
     ) -> dict[str, tuple[int, ...]]:
         summarizer = config.actor.temporal_summarizer
         temporal_len = max(summarizer.desire_window_starts) + summarizer.desire_window_len
-        desire_dim = summarizer.desire_encoder.in_layer.in_features // summarizer.desire_window_len
+        desire_dim = TEMPORAL_INPUTS[ModelInputs.DESIRE][0]
         return {
             ModelInputs.FEATURES: (
                 batch_size,
@@ -245,6 +259,7 @@ class RLDrivingModel(BaseModel):
                 temporal_len,
                 summarizer.action_t_encoder.in_layer.in_features,
             ),
+            **{name: (batch_size, temporal_len, *shape) for name, shape in NAVIGATION_PROJECTIONS.items()},
         }
 
     def verify_module_protocol(self) -> None:
@@ -253,6 +268,14 @@ class RLDrivingModel(BaseModel):
 
     def init_states(self, *, buffer_device: torch.device | None = None) -> None:
         super().init_states(buffer_device=buffer_device)
+        # Module.init_states does not initialize the plain nn.Modules in ConvNeXt.
+        for module in self.modules():
+            if isinstance(module, TemporalSummarizer):
+                for layer in module.map_encoder.modules():
+                    reset = getattr(layer, "reset_parameters", None)
+                    if callable(reset):
+                        reset()
+                module.map_encoder.init_path_weights()
         self.sync_targets()
 
     @torch.no_grad()
@@ -262,6 +285,9 @@ class RLDrivingModel(BaseModel):
 
     @torch.no_grad()
     def warm_start_critics_from_actor(self) -> None:
+        source = self.actor.off_policy.temporal_summarizer
+        for name in ("map_encoder", "map_projection", "navigation_encoder"):
+            _copy_model_state(getattr(source, name), getattr(self.actor.temporal_summarizer, name))
         for destination in (
             self.critic.critic1.temporal_summarizer,
             self.critic.critic2.temporal_summarizer,
@@ -298,6 +324,9 @@ def parallelize_rldriving(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ) -> RLDrivingModel:
+    if ac_config is not None:
+        _apply_activation_checkpointing(model, ac_config, dump_folder=dump_folder)
+
     if compile_config.enable and "model" in compile_config.components:
         torch._dynamo.config.capture_scalar_outputs = True
         model.actor.compile(backend=compile_config.backend)
@@ -354,3 +383,26 @@ def parallelize_rldriving(
     if training.enable_cpu_offload:
         logger.info("Applied CPU Offloading to the rldriving model")
     return model
+
+
+def _apply_activation_checkpointing(
+    model: RLDrivingModel, ac_config: ActivationCheckpointingConfig, *, dump_folder: str
+) -> None:
+    assert ac_config is not None
+    ac_policy = ac_config.build(dump_folder=dump_folder)
+    if isinstance(ac_policy, MemoryBudgetAC):
+        ac_policy.apply(model)
+        return
+
+    def wrap(module: nn.Module, fqn: str) -> nn.Module:
+        return ac_policy._wrap_block(module, base_fqn=fqn)
+
+    mode = "full" if isinstance(ac_policy, FullAC) else "selective"
+    # Frozen off-policy and target networks already run without an autograd graph.
+    for name, summarizer in (
+        ("actor.temporal_summarizer", model.actor.temporal_summarizer),
+        ("critic.critic1.temporal_summarizer", model.critic.critic1.temporal_summarizer),
+        ("critic.critic2.temporal_summarizer", model.critic.critic2.temporal_summarizer),
+    ):
+        summarizer.transformer.apply_activation_checkpointing(wrap, f"{name}.transformer")
+    logger.info(f"Applied {mode} activation checkpointing to the rldriving model")
