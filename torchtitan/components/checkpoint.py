@@ -27,7 +27,6 @@ from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
 )
-from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader, FsspecWriter
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict_saver import (
@@ -53,8 +52,6 @@ OPTIMIZER = "optimizer"
 LR_SCHEDULER = "lr_scheduler"
 DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
-CHECKPOINT_UPLOAD_TIMEOUT_SECONDS = 600.0
-CHECKPOINT_SIZE_LIMIT_BYTES = 100_000_000_000
 
 
 class AsyncMode(str, enum.Enum):
@@ -219,6 +216,9 @@ class CheckpointManager(Configurable):
 
     """
 
+    # Shared by checkpoint creation, discovery, and retention.
+    checkpoint_id_format: str = "step-"
+
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         enable: bool = False
@@ -230,9 +230,6 @@ class CheckpointManager(Configurable):
         When enable is set to true, checkpoints will be in
         {--dump_folder}/{--checkpoint.folder}.
         """
-
-        checkpoint_id_format: str = "step-"
-        """Prefix for per-step checkpoint directory names. Empty string means ``str(step)``."""
 
         interval: int = 500
         """Checkpointing interval in steps."""
@@ -261,13 +258,6 @@ class CheckpointManager(Configurable):
         training checkpoint, including optimizer, lr scheduler, training states, etc.
         The default setting for this option is True. Note that you will have to use
         `--checkpoint.no_initial_load_model_only` to override the default setting.
-        """
-
-        allow_partial_initial_load: bool = False
-        """
-        Allow checkpoint loads to skip keys that are present in the target state dict
-        but missing from the checkpoint. This is useful when loading initial model
-        weights into a model whose state dict has added keys.
         """
 
         initial_load_in_hf: bool = False
@@ -468,7 +458,6 @@ class CheckpointManager(Configurable):
             if split_protocol(config.folder)[0] is not None
             else fs.join_path(base_folder, config.folder)
         )
-        self.checkpoint_id_format = config.checkpoint_id_format
         self.interval = config.interval
 
         self.states = states
@@ -486,7 +475,6 @@ class CheckpointManager(Configurable):
         self.exclude_from_loading = config.exclude_from_loading
         self.initial_load_path = config.initial_load_path
         self.initial_load_model_only = config.initial_load_model_only
-        self.allow_partial_initial_load = config.allow_partial_initial_load
         self.initial_load_in_hf = config.initial_load_in_hf
         self.initial_load_in_hf_quantized = config.initial_load_in_hf_quantized
 
@@ -610,14 +598,11 @@ class CheckpointManager(Configurable):
             # `consolidate_safetensors_files_on_every_rank` is used later to manage
             # the multi-file merging process.
         else:
-            storage_writer = FsspecWriter(
-                checkpoint_id, timeout=CHECKPOINT_UPLOAD_TIMEOUT_SECONDS
-            )
+            storage_writer = self._create_dcp_writer(checkpoint_id)
 
-        # Execution Dispatch
-        checkpoint_save_id = (
-            None if to_hf else checkpoint_id
-        )  # for HF the storage_writer handles the path
+        # A supplied writer owns its path and storage options. Passing the ID
+        # as well resets the writer, discarding filesystem-specific options.
+        checkpoint_save_id = None if storage_writer is not None else checkpoint_id
 
         if async_mode == AsyncMode.ASYNC:
             ret = dcp.async_save(
@@ -642,7 +627,7 @@ class CheckpointManager(Configurable):
                 checkpoint_id=checkpoint_save_id,
             )
             if not to_hf:
-                self._log_dcp_size(ret)
+                self._on_dcp_save_complete(ret)
 
         # Post-Processing
         if to_hf and fqn_to_index_mapping:
@@ -658,24 +643,16 @@ class CheckpointManager(Configurable):
 
         return ret
 
-    @staticmethod
-    def _log_dcp_size(metadata: Metadata) -> None:
-        total_bytes = sum(info.length for info in metadata.storage_data.values())
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            num_shards = len(
-                {info.relative_path for info in metadata.storage_data.values()}
-            )
-            logger.info(
-                "total DCP checkpoint size: %.3f GB (%d shards).",
-                total_bytes / 1e9,
-                num_shards,
-            )
+    def _create_dcp_writer(self, checkpoint_id: str) -> StorageWriter | None:
+        """Override to configure storage for native DCP saves."""
+        return None
 
-        if total_bytes > CHECKPOINT_SIZE_LIMIT_BYTES:
-            raise RuntimeError(
-                f"DCP checkpoint shards exceed the size limit: "
-                f"{total_bytes / 1e9:.3f} > {CHECKPOINT_SIZE_LIMIT_BYTES / 1e9:.3f} GB."
-            )
+    def _create_dcp_load_planner(self) -> dcp.LoadPlanner | None:
+        """Override to configure planning for native DCP loads."""
+        return None
+
+    def _on_dcp_save_complete(self, metadata: Metadata) -> None:
+        """Called after a synchronous save or when waiting for an async save."""
 
     def dcp_load(
         self,
@@ -721,11 +698,8 @@ class CheckpointManager(Configurable):
         else:
             dcp.load(
                 state_dict,
-                storage_reader=FsspecReader(checkpoint_id),
                 checkpoint_id=checkpoint_id,
-                planner=dcp.DefaultLoadPlanner(
-                    allow_partial_load=self.allow_partial_initial_load
-                ),
+                planner=self._create_dcp_load_planner(),
             )
 
             # TODO: Since we flatten the model states in state_dict, we need to
@@ -995,7 +969,7 @@ class CheckpointManager(Configurable):
 
         metadata = self.save_future.result()
         self.save_future = None
-        self._log_dcp_size(metadata)
+        self._on_dcp_save_complete(metadata)
 
     def _find_load_step(self, folder: str = "") -> int:
         """Identify the highest available checkpoint step in the specified directory.

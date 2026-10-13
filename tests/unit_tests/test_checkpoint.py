@@ -330,7 +330,10 @@ class TestCheckpointManager(unittest.TestCase):
         self.assertTrue(res)
         manager.close()
 
-    def test_custom_checkpoint_id_format_finds_latest(self):
+    def test_subclass_checkpoint_id_format_finds_latest(self):
+        class CustomCheckpointManager(CheckpointManager):
+            checkpoint_id_format = "epoch_"
+
         ckpt_folder = os.path.join(self.test_folder, "custom")
         os.makedirs(ckpt_folder, exist_ok=True)
         for step in (2, 5):
@@ -342,7 +345,6 @@ class TestCheckpointManager(unittest.TestCase):
             enable=True,
             async_mode="disabled",
             folder="custom",
-            checkpoint_id_format="epoch_",
             interval=1,
             keep_latest_k=0,
             last_save_model_only=False,
@@ -351,7 +353,7 @@ class TestCheckpointManager(unittest.TestCase):
             initial_load_path=None,
             initial_load_model_only=False,
         )
-        manager = CheckpointManager(
+        manager = CustomCheckpointManager(
             dataloader=self.data_loader,
             model_parts=self.model_parts,
             optimizers=self.optimizers,
