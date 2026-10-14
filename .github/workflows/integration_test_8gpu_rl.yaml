@@ -3,12 +3,8 @@ name: RL Integration Tests
 on:
   push:
     branches: [ main ]
-    paths:
-      - 'torchtitan/experiments/rl/**'
-      - '.github/workflows/integration_test_8gpu_rl.yaml'
-  pull_request:
-    types: [labeled, synchronize]
-    branches: [ main ]
+    tags:
+      - ciflow/rl/*
   schedule:
     # Runs every 12 hours
     - cron: '0 */12 * * *'
@@ -29,9 +25,7 @@ jobs:
   # Step 1: Dynamically compute the matrix based on conditions
   set-matrix:
     # Skip scheduled runs on forks, where they would only fail and email the fork owner
-    if: >-
-      (github.repository_owner == 'pytorch' || github.event_name != 'schedule') &&
-      (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ciflow/rl'))
+    if: github.repository_owner == 'pytorch' || github.event_name != 'schedule'
     uses: ./.github/workflows/set-matrix.yaml
     with:
       is-experimental: true
@@ -39,7 +33,7 @@ jobs:
   # Step 2: Use the dynamic matrix in the build-test job
   build-test:
     needs: set-matrix
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@main
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.set-matrix.outputs.matrix) }}
@@ -47,9 +41,12 @@ jobs:
       runner: ${{ matrix.runner }}
       gpu-arch-type: ${{ matrix.gpu-arch-type }}
       gpu-arch-version: ${{ matrix.gpu-arch-version }}
-      docker-image: ${{ matrix.docker-image }}
+      docker-image: 308535385114.dkr.ecr.us-east-1.amazonaws.com/torchtitan/torchtitan-ubuntu-22.04-clang12:rl-${{ needs.set-matrix.outputs.docker-hash }}
       repository: pytorch/torchtitan
-      upload-artifact: outputs
+      # No upload-artifact: the suites dump a distributed checkpoint per test,
+      # which is 31GB and takes 25 minutes to push. linux_job_v2 never collected
+      # any of it -- the script ran in a container whose RUNNER_TEMP the host
+      # side could not see -- so nothing has ever consumed these.
       timeout: 60
       script: |
         set -eux
@@ -64,41 +61,41 @@ jobs:
 
         pip config --user set global.progress_bar off
 
-        # Install uv for faster dependency resolution
-        pip install uv
+        python -m pip install uv
 
-        # 1. Install Monarch, TorchStore, and Renderers
-        uv pip install torchmonarch
-        uv pip install --no-deps "git+https://github.com/meta-pytorch/torchstore.git@main"
-        uv pip install pygtrie portpicker
-        uv pip install "git+https://github.com/PrimeIntellect-ai/renderers.git@main"
+        # 1. Install the CUDA nightlies and RL extras; Monarch and the shared
+        # RL deps are in the image. The image has the CUDA runtime but not nvcc,
+        # which FlashInfer (vLLM's default sampler) needs to JIT-compile kernels.
+        bash scripts/install_rl_env.sh --skip-base --flash-attn none --nvcc
 
-        # 2. Install batch-invariant ops
-        uv pip install --no-deps "git+https://github.com/thinking-machines-lab/batch_invariant_ops.git@main"
-
-        # 3. Install PyTorch nightly, vllm, and xformers
-        # torchvision must be installed from the nightly channel alongside torch
-        # so its C++ extensions (e.g. torchvision::nms) match the torch ABI.
-        uv pip install torch torchvision vllm xformers --pre \
-          --extra-index-url https://download.pytorch.org/whl/nightly/cu130 \
-          --index-strategy unsafe-best-match
-
-        # 4. Make the checkout importable for subprocesses spawned by the test.
+        # 2. Make the checkout importable for subprocesses spawned by the test.
         export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
-        # 5. Download HF model checkpoint for tests
+        # 3. Download HF model checkpoint for tests
         MODEL_PATH=$(python -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-0.6B'))")
 
         sudo mkdir -p "$RUNNER_TEMP/artifacts-to-be-uploaded"
         sudo chown -R $(id -u):$(id -g) "$RUNNER_TEMP/artifacts-to-be-uploaded"
 
-        # Install nvcc so FlashInfer can JIT compile its CUDA kernels.
-        # vLLM uses FlashInfer sampler by default (vllm-project/vllm#40376)
-        # but the CI docker image only has CUDA runtime, not the toolkit.
-        uv pip install nvidia-cuda-nvcc
+        # RL Loss Guard runs FIRST, in a clean container, so a lingering port from
+        # the E2E suite can't collide with the generator's distributed init
+        # (EADDRINUSE). Deterministic loss regression check on the REAL Qwen3-0.6B
+        # (--hf-assets-path=$MODEL_PATH): real weights -> varied rewards -> non-zero
+        # advantage -> meaningful, full-precision losses (random init gives all
+        # zeros). The golden is arch-specific; regenerate on A10G if it changes.
+        LOSS_FILE="tests/assets/losses/rl_grpo_cuda.txt"
+        # Override to trainer TP=4 + 1 generator TP=4: the config's TP=2 OOMs with
+        # batch-invariant on A10G; the golden is from TP=4.
+        python scripts/rl/loss_compare.py \
+          --hf-assets-path "$MODEL_PATH" \
+          --dump-folder "$RUNNER_TEMP/artifacts-to-be-uploaded/rl_loss_guard" \
+          --module torchtitan_recipes.rl.alphabet_sort \
+          --config rl_grpo_qwen3_0_6b_varlen_batch_invariant \
+          --import-result "$LOSS_FILE" \
+          --assert-equal
 
-        # Run E2E RL integration tests (up to 8 GPUs).
-        # Includes the MoE TP=4 EP=4 random_init test which needs 8 GPUs.
-        python -m torchtitan.experiments.rl.tests.integration_tests \
-          $RUNNER_TEMP/artifacts-to-be-uploaded --ngpu 8 \
-          --hf_assets_path "$MODEL_PATH"
+        # Run E2E RL integration tests (up to 8 GPUs): includes the MoE TP=4 EP=4
+        # random-init test and the batch-invariant debug tests (both need 8 GPUs).
+        python -m tests.integration_tests.run_tests \
+          "$RUNNER_TEMP/artifacts-to-be-uploaded/integration" --ngpu 8 \
+          --test_suite rl --hf_assets_path "$MODEL_PATH"

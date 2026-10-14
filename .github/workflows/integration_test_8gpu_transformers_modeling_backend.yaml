@@ -39,7 +39,7 @@ jobs:
   # Step 2: Use the dynamic matrix in the build-test job
   build-test:
     needs: set-matrix
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@main
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.set-matrix.outputs.matrix) }}
@@ -47,7 +47,7 @@ jobs:
       runner: ${{ matrix.runner }}
       gpu-arch-type: ${{ matrix.gpu-arch-type }}
       gpu-arch-version: ${{ matrix.gpu-arch-version }}
-      docker-image: ${{ matrix.docker-image }}
+      docker-image: 308535385114.dkr.ecr.us-east-1.amazonaws.com/torchtitan/${{ matrix.docker-image }}:${{ needs.set-matrix.outputs.docker-hash }}
       repository: pytorch/torchtitan
       upload-artifact: outputs
       timeout: 45
@@ -68,8 +68,9 @@ jobs:
         if [ -n "${{ matrix.torch-version }}" ]; then
           TORCH_SPEC="torch==${{ matrix.torch-version }}"
         fi
-        # NOTE: reinstall torchvision alongside torch so their ABIs stay in sync;
-        # otherwise transformers' transitive `import torchvision` fails at test time.
+        # torchvision must be installed from the nightly channel alongside torch
+        # so its C++ extensions (e.g. torchvision::nms) match the torch ABI.
+        # transformers pulls in torchvision transitively via image_utils.
         python -m pip install --force-reinstall --pre \
           "${TORCH_SPEC}" torchvision --index-url ${{ matrix.index-url }}
 
@@ -79,6 +80,11 @@ jobs:
         fi
 
         USE_CPP=0 python -m pip install --pre torchao --index-url ${{ matrix.index-url }}
+
+        # MoE parallelism requires transformers >= 5.0.0 (grouped experts format).
+        # Install here rather than in the shared Docker image to avoid affecting
+        # other CI workflows (e.g. unit_test_cpu tokenizer tests).
+        python -m pip install transformers==5.9.0
 
         sudo mkdir -p "$RUNNER_TEMP/artifacts-to-be-uploaded"
         sudo chown -R $(id -u):$(id -g) "$RUNNER_TEMP/artifacts-to-be-uploaded"

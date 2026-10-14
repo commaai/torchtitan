@@ -6,14 +6,22 @@
 #
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+import torch_remat as remat
 from torch import nn
 
-from torchtitan.models.common.attention import AttentionMasksType, VarlenAttention
+from torchtitan.models.common.attention import (
+    FlexAttentionMetadata,
+    VarlenAttentionMetadata,
+)
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
-from torchtitan.models.utils import get_dense_model_nparams_and_flops
+from torchtitan.models.common.flops import (
+    get_nparams_and_active_nparams,
+    quadratic_attention_flops_per_token,
+)
+from .state_dict_adapter import Llama3StateDictAdapter
 
 
 class Llama3TransformerBlock(TransformerBlock):
@@ -42,15 +50,28 @@ class Llama3TransformerBlock(TransformerBlock):
     def forward(
         self,
         x: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+        attention_metadata: FlexAttentionMetadata | VarlenAttentionMetadata | None,
         positions: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
     ):
-        h = x + self.attention(self.attention_norm(x), attention_masks, positions)
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        del aux_loss_denominator, padding_mask
+        attn_out = self.attention(self.attention_norm(x), attention_metadata, positions)
+        # The residual add reads the attention output with bare ops.
+        remat.recompute_needs_tensor(attn_out)
+        h = x + attn_out
+        ffn_out = self.feed_forward(self.ffn_norm(h))
+        # Trailing add, always saved: it saves nothing for backward, so replay skips
+        # it and its inputs need no persisting, matching checkpoint early stop.
+        return remat.region(
+            torch.add, self.remat_region_name("ffn_residual"), recompute=False
+        )(h, ffn_out)
 
 
 class Llama3Model(Decoder):
+    state_dict_adapter_cls = Llama3StateDictAdapter
+
     """
     Llama3Model Module
 
@@ -62,39 +83,29 @@ class Llama3Model(Decoder):
     class Config(Decoder.Config):
         dim: int = 4096
         vocab_size: int = 128256
-
-        def update_from_config(
-            self,
-            *,
-            config,
-            **kwargs,
-        ) -> None:
-            Decoder.Config.update_from_config(self, config=config, **kwargs)
-            parallelism = config.parallelism
-
-            if parallelism.context_parallel_degree > 1 and isinstance(
-                self.layers[0].attention.inner_attention, VarlenAttention.Config
-            ):
-                raise NotImplementedError(
-                    "Context Parallel only supports SDPA and FlexAttention. "
-                    "Varlen attention is not supported with CP."
-                )
-
-            from torchtitan.models.llama3.sharding import set_llama3_sharding_config
-
-            set_llama3_sharding_config(
-                self,
-                enable_sp=parallelism.enable_sequence_parallel,
-            )
+        local_compile_regions: list[str] = field(
+            default_factory=lambda: ["loss", "fused_binary_activation"]
+        )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-            return get_dense_model_nparams_and_flops(
-                model,
-                n_layers=len(self.layers),
-                n_heads=self.layers[0].attention.n_heads,
-                head_dims=2 * (self.dim // self.layers[0].attention.n_heads),
-                seq_len=seq_len,
-                enable_weight_tying=self.enable_weight_tying,
-            )
+            nparams, active_nparams = get_nparams_and_active_nparams(model)
+            attention_op_flops = 0
+            for layer in self.layers:
+                attention = layer.attention
+                head_dim = (
+                    attention.head_dim
+                    if attention.head_dim is not None
+                    else attention.dim // attention.n_heads
+                )
+                attention_op_flops += quadratic_attention_flops_per_token(
+                    num_heads=attention.n_heads,
+                    qk_head_dim=head_dim,
+                    v_head_dim=head_dim,
+                    seq_len=seq_len,
+                )
+            return nparams, 6 * active_nparams + attention_op_flops
+
+    def __init__(self, config: Config):
+        super().__init__(config)

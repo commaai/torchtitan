@@ -1,26 +1,29 @@
 # Huggingface Transformers Modeling backend
 
-This enables HF transformers models to be trained with `4D parallelism + torch.compile`
+This enables HF transformers models to be trained with 4D parallelism.
+
+This backend uses the TorchTitan SPMD type system.
 
 ## Quick start
 
-- Requirements `transformers==4.57.1`
+- Requirements `transformers==5.9.0`
 
-- Config: `torchtitan/experiments/transformers_modeling_backend/config_registry.py`
+- Test recipes: `torchtitan_recipes/tests/transformers_modeling_backend.py`
 ```diff
 ...
-- --module llama3
-+ --module transformers_modeling_backend
---config transformers_modeling_backend_debugmodel
+- --module torchtitan_recipes.tests.models.llama3
++ --module torchtitan_recipes.tests.transformers_modeling_backend
+ --config transformers_modeling_backend_debugmodel
 ...
 ```
-- Train: `LOG_RANK=7 MODEL=transformers_modeling_backend CONFIG=transformers_modeling_backend_debugmodel ./run_train.sh --compile.enable`
+- Train: `LOG_RANK=7 MODULE=torchtitan_recipes.tests.transformers_modeling_backend CONFIG=transformers_modeling_backend_debugmodel_compile ./run_train.sh`
     - Make sure you have created the tokenizers beforehand
 <img width="1334" height="453" alt="image" src="https://github.com/user-attachments/assets/da459448-027b-4af9-8176-6a3e433a272c" />
 
 ## Supported Features
 
-- The following models were tested:
+- The following models were tested. This is backend coverage, not a set of
+  recommended production training recipes:
     - Dense (FSDP/CP/TP/PP/`torch.compile`)
         - `meta-llama/Llama-3.2-1B`
         - `microsoft/phi-2`
@@ -34,7 +37,39 @@ This enables HF transformers models to be trained with `4D parallelism + torch.c
         - `kyutai/helium-1-preview-2b`
         - `allenai/OLMo-7B-hf`
         - `mistralai/Ministral-8B-Instruct-2410`
-    - MoE (upcoming)
+    - MoE (see the table below for parallelism support)
+        - `Qwen/Qwen3-30B-A3B` (qwen3_moe, GQA)
+        - `mistralai/Mixtral-8x7B-Instruct-v0.1` (mixtral, GQA)
+        - `allenai/OLMoE-1B-7B-0924` (olmoe, GQA)
+        - `deepseek-ai/DeepSeek-V2-Lite` (deepseek_v2, MLA)
+        - `deepseek-ai/DeepSeek-V3` (deepseek_v3, MLA)
+        - `zai-org/GLM-4.7` (glm4_moe, MLA)
+        - `zai-org/GLM-5` (glm_moe_dsa, MLA + DSA sparse attention)
+        - `google/gemma-4-26B-A4B-it` (gemma4_text)
+
+### Attention
+
+Attention runs on **FlexInnerAttention**. `attn_mask_type` selects the flex mask:
+`causal` (plain causal) or `block_causal` (causal + same-document, for packed /
+SFT sequences).
+
+### MoE
+
+The MoE block is swapped to TorchTitan's grouped-experts MoE to enable expert
+parallelism and the `grouped_mm` fast path.
+
+Parallelism support, validated at debug scale (2-step loss decreasing) across the
+combinations below. FSDP composes with every listed axis.
+
+| Model(s) | attn | TP | EP | CP | notes |
+|---|---|---|---|---|---|
+| Qwen3-30B-A3B | GQA | yes | yes | yes | full matrix up to TP+EP+CP |
+| Mixtral-8x7B, OLMoE-1B-7B | GQA | yes | yes | yes | TP+EP, EP+CP |
+| DeepSeek-V2-Lite, V3, GLM-4.7 | MLA | yes | yes | yes* | TP+EP; *flex+CP verified on DeepSeek-V2-Lite (EP+CP) |
+| GLM-5 | MLA + DSA | no | yes | no | DSA indexer fails loud under TP; CP not wired -- FSDP/EP only |
+| Gemma-4-26B-A4B | GQA | no | yes | no | attention TP not viable (num_global_key_value_heads=2) -- FSDP/EP only |
+
+PP is not yet wired for the MoE path (see Further work).
 
 ## Known issues to address later
 
@@ -43,7 +78,7 @@ This enables HF transformers models to be trained with `4D parallelism + torch.c
 
 ## Further work
 
-- Missing `build_optimizers_with_moe_load_balancing` support for MoE
-- Missing TP/PP/EP supports for MoE
+- Missing PP support for MoE
 - Load HF weights
 - Add LORA support
+- Support for Titan RL

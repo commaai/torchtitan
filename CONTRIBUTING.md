@@ -49,10 +49,9 @@ Note: To accelerate contributions to and innovations around `torchtitan`, we are
   - The main branch of `torchtitan` should have minimal dependencies on non-PyTorch libraries. Interesting models/techniques that depend on external libraries can be demonstrated in the `experiments` folder, or in forks of `torchtitan`.
 - Aim for minimal (if not zero) code change to the model. For the Llama model in `torchtitan`, if one has to make justifiable model change(s):
   - After the model change, it should still load the original checkpoint correctly.
-  - Document the reasons for the code change, similar to [composability.md](docs/composability.md).
-- Keep code modularized, especially for [train.py](torchtitan/train.py), so that it remains easy to copy-paste into a minimal code example. If necessary:
-  - Introduce new config options/category in [configs.py](torchtitan/config/configs.py).
-  - Create separate functions/files.
+  - Document the reasons for the code change, similar to the model notes in [PIPELINE_PARALLEL.md](torchtitan/distributed/PIPELINE_PARALLEL.md).
+- Keep code modularized, especially for [train.py](torchtitan/train.py), so that it remains easy to copy-paste into a minimal code example. If necessary create separate functions/files.
+- Training behavior is configured by Python recipes, not by `--section.option` flags. A knob that changes the model goes in the model config dataclass. One that belongs to a component goes in that component's config, and one with no other owner goes in [configs.py](torchtitan/config/configs.py) after checking with the maintainers. See [the configuration doc](torchtitan/config/README.md).
 
 ### Proof of Value
 
@@ -61,7 +60,7 @@ It is the contributor’s responsibility to justify the change. The requirements
 #### Loss
 
 - If a change does not impact computation results, one should see identical loss before vs. after, with fixed random seeds (`training.seed`) and deterministic algorithms (`training.deterministic`). An example is activation checkpointing.
-- If a change is expected to impact computation results, loss converging should be verified via end-to-end training on representable datasets (e.g. Llama 3 models on the C4 dataset). Please refer to the recommended practices in [converging.md](docs/converging.md).
+- If a change is expected to impact computation results, loss converging should be verified via end-to-end training on representable datasets (e.g. Llama 3 models on the C4 dataset). Please refer to the recommended practices in [debugging.md](docs/debugging.md#validating-a-distributed-training-technique).
 
 #### Performance
 - Memory and TPS / MFU, which are available from logging, should meet expectations.
@@ -75,9 +74,9 @@ When appropriate, one should consider
 
 - Adding CPU/GPU unit/integration tests.
   - To add a unit test, put it in the [tests](tests/) folder and follow the existing test files.
-  - To add a GPU integration test, create a new `OverrideDefinitions` in [integration_tests](tests/integration_tests/). It will override the default config to run on the Llama 3 debug model (see [config_registry.py](torchtitan/models/llama3/config_registry.py)).
-- Updating [README](README.md) and writing a new note in the [docs](docs/) folder on installation and usage, similar to [float8.md](torchtitan/components/quantization/float8.md).
-- Following the tensor shape-suffix naming convention for new model code (e.g. `x_BLD`, `q_BLNH`, `out_TNH`), with a per-module legend comment as in [attention.py](torchtitan/models/common/attention.py). Capital suffixes name logical tensor dimensions (not sharding layout) and are scoped per file.
-- Adding a new file with benchmark results in [benchmarks](benchmarks) folder.
+  - To add a GPU integration test, add a configuration function and an `IntegrationTestDefinition` naming it to the matching suite module in [tests/integration_tests](tests/integration_tests/). Reusable model debug configurations live in [torchtitan_recipes/tests/models](torchtitan_recipes/tests/models/).
+- Updating [README](README.md) and documenting the feature next to its code: usage in the package's `README.md` and design notes in an UPPERCASE `.md` file, similar to [MXFP8](torchtitan/quantization/mxfp8/README.md).
+- Following the tensor shape-suffix naming convention for new model code (e.g. `x_BLD`, `q_BLHK`, `out_THV`), with a per-module legend comment as in [attention.py](torchtitan/models/common/attention/attention.py). Capital suffixes name logical tensor dimensions (not sharding layout) and are scoped per file.
+- Adding a new file with benchmark results in [benchmarks](docs/benchmarks) folder.
 - Creating GitHub issues for things that cannot be addressed at the moment.
 - Writing a post on [PyTorch Forums](https://discuss.pytorch.org/c/distributed/torchtitan/44) and linking to it.

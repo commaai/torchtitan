@@ -11,11 +11,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from torchtitan.config import ParallelismConfig, TrainingConfig
-from torchtitan.experiments.graph_trainer.configs import (
-    GraphTrainerCompileConfig,
-    validate_autoparallel_config,
-)
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 
 
 class _FakeMesh:
@@ -28,7 +26,7 @@ class _FakeMesh:
         return self._size
 
 
-class _FakeParallelDims:
+class _FakeParallelismContext:
     dp_replicate_enabled = False
     cp_enabled = False
     pp_enabled = False
@@ -41,7 +39,7 @@ class _FakeParallelDims:
         self.tp_enabled = not sparse
 
     def get_optional_mesh(self, name):
-        enabled = {"fsdp", "tp"} if not self.sparse else {"efsdp", "ep"}
+        enabled = {"dp_shard", "tp"} if not self.sparse else {"edp_shard", "ep"}
         return _FakeMesh((name,)) if name in enabled else None
 
     def get_mesh(self, names):
@@ -85,8 +83,8 @@ class _FakeAutoParallelGraph:
 
 def _training_config():
     return TrainingConfig(
-        local_batch_size=2,
-        seq_len=8,
+        num_tokens_per_microbatch_per_dp_rank=2 * 8,
+        max_context_length=8,
         mixed_precision_param="bfloat16",
         mixed_precision_reduce="float32",
     )
@@ -107,25 +105,9 @@ def test_autoparallel_integration_matrix():
         "autoparallel_llama3_fsdp_tp"
     ]
     assert [test.test_name for test in suites["h100"]] == [
-        "autoparallel_deepseek_v3_efsdp_ep"
+        "autoparallel_deepseek_v3_edp_shard_ep"
     ]
     assert all(test.ngpu == 4 for tests in suites.values() for test in tests)
-
-
-def test_autoparallel_config_validation():
-    with pytest.raises(ValueError, match="only supports --compile.mode aot_fx_trace"):
-        validate_autoparallel_config(
-            GraphTrainerCompileConfig(
-                mode="jit",
-                enable_autoparallel=True,
-            )
-        )
-
-    compile_config = GraphTrainerCompileConfig(
-        inductor_compilation="regional",
-        enable_autoparallel=True,
-    )
-    validate_autoparallel_config(compile_config)
 
 
 def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
@@ -138,14 +120,14 @@ def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
     config = SimpleNamespace(
         compile=GraphTrainerCompileConfig(
             enable_autoparallel=True,
-            disable_passes=["cudagraph_pass"],
-        ),
-        model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
-        parallelism=SimpleNamespace(
             enable_async_tensor_parallel=False,
+        ),
+        model=SimpleNamespace(layers=[object()]),
+        parallelism=SimpleNamespace(
             fsdp_reshard_after_forward="always",
             pipeline_parallel_degree=1,
         ),
+        training=TrainingConfig(disable_cuda_graphs=True),
     )
 
     graph_passes = passes.construct_default_graph_passes(traced_result, config)
@@ -193,7 +175,7 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
         from torchtitan.experiments.graph_trainer.llama3 import parallelize_autoparallel
 
         model = SimpleNamespace(config=SimpleNamespace(vocab_size=16))
-        parallel_dims = _FakeParallelDims()
+        parallelism_context = _FakeParallelismContext()
         call_parallelize = parallelize_autoparallel.parallelize_autoparallel_llama
         extra_patches = ()
     else:
@@ -202,7 +184,7 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
         )
 
         model = SimpleNamespace(config=SimpleNamespace())
-        parallel_dims = _FakeParallelDims(sparse=True)
+        parallelism_context = _FakeParallelismContext(sparse=True)
         call_parallelize = parallelize_autoparallel.parallelize_autoparallel_deepseekv3
         extra_patches = (
             patch.object(
@@ -228,11 +210,11 @@ def test_model_autoparallel_uses_fx_module_path_and_resolved_policy(
 
         call_parallelize(
             model,
-            parallel_dims=parallel_dims,
+            parallelism_context=parallelism_context,
             training=_training_config(),
             parallelism=parallelism,
             compile_config=compile_config,
-            ac_config=object(),
+            activation_remat=object(),
             dump_folder="",
         )
 
