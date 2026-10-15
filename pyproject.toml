@@ -11,7 +11,7 @@ authors = [
 keywords = ["pytorch", "training", "llm"]
 # Dependencies are read from the requirement files so pip, uv, CI and the
 # Docker image (whose build context is .ci/docker) share one source of truth.
-dynamic = ["version", "dependencies", "optional-dependencies"]
+dynamic = ["version", "dependencies"]
 
 [project.urls]
 GitHub = "https://github.com/pytorch/torchtitan"
@@ -21,10 +21,6 @@ Issues = "https://github.com/pytorch/torchtitan/issues"
 [tool.setuptools.dynamic]
 version = {file = "assets/version.txt"}
 dependencies = {file = ["requirements.txt"]}
-optional-dependencies.dev = {file = ["requirements-dev.txt"]}
-optional-dependencies.rl = {file = [".ci/docker/requirements-rl.txt"]}
-optional-dependencies.vlm = {file = [".ci/docker/requirements-vlm.txt"]}
-optional-dependencies.flux = {file = [".ci/docker/requirements-flux.txt"]}
 
 [tool.codespell]
 skip = ["*.json"]
