@@ -64,14 +64,16 @@ repos:
       additional_dependencies:
         - tomli
 
-- repo: https://github.com/facebook/pyrefly-pre-commit
-  rev: 0.45.1
-  hooks:
-    - id: pyrefly-check
-      name: Pyrefly (type checking)
-      pass_filenames: false
-      language: system
-      args: ["--remove-unused-ignores", "--summarize-errors"]
+# Disabled in the fork: optional dependencies and pinned PyTorch APIs differ
+# from upstream's type-checking environment.
+# - repo: https://github.com/facebook/pyrefly-pre-commit
+#   rev: 0.45.1
+#   hooks:
+#     - id: pyrefly-check
+#       name: Pyrefly (type checking)
+#       pass_filenames: false
+#       language: system
+#       args: ["--remove-unused-ignores", "--summarize-errors"]
 
 
 - repo: local
