@@ -16,6 +16,8 @@ from .freeze_moe_routing import FreezeMoERoutingTransform
 from .lm_head_fp32 import LMHeadFP32OutputConverter
 from .lora import LoRATransform
 from .quantization import (
+    # Fork export; adapted converter provenance:
+    # https://github.com/commaai/torchtitan/commit/122d0220d9576054f25bcbd05389d4c1298647d2
     Float8LinearConverter,
     MXFP8GroupedLinearConverter,
     MXFP8LinearConverter,

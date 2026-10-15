@@ -70,7 +70,13 @@ class QuantizationConverter(ModelConfigConverter):
 
 
 class Float8LinearConverter(QuantizationConverter):
-    """Retain TorchAO FP8 compute, including the tensorwise training recipe."""
+    """Retain TorchAO FP8 compute, including the tensorwise training recipe.
+
+    Adapted to current config traversal and parallel Linear owners from:
+    https://github.com/commaai/torchtitan/blob/cd0875e51e2cb62bd3f8de2a0450f80cc1bb3860/torchtitan/components/quantization/float8.py
+    Upstream removed Float8 training in:
+    https://github.com/pytorch/torchtitan/commit/6bbfbdd5e8c0e6e8231b1b7efcebccb6a2b18c20
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(QuantizationConverter.Config):

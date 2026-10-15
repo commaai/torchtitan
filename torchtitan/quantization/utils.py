@@ -83,6 +83,8 @@ def swap_token_dispatcher(routed_experts_config, pad_multiple: int) -> None:
 
 def has_quantization(model_config) -> bool:
     """Check if any module in the model config has quantization applied."""
+    # Fork integration for the retained Float8 wrapper (not upstream code):
+    # https://github.com/commaai/torchtitan/commit/122d0220d9576054f25bcbd05389d4c1298647d2
     from .float8_legacy import Float8Linear
     from .mxfp8 import MXFP8Linear
     from .mxfp8.experts import _mxfp8_grouped_linear_cache

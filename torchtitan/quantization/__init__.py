@@ -6,6 +6,8 @@
 
 """Quantized module and tensor building blocks."""
 
+# Fork export restored after upstream removed Float8; implementation provenance:
+# https://github.com/commaai/torchtitan/commit/122d0220d9576054f25bcbd05389d4c1298647d2
 from .float8_legacy import Float8Linear
 from .mxfp8 import MXFP8Linear
 from .nvfp4 import NVFP4Linear

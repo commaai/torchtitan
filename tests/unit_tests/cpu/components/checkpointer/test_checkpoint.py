@@ -332,6 +332,39 @@ class TestCheckpointManager(unittest.TestCase):
         shutil.rmtree(self.base_temp_dir)
         time.sleep(0.1)
 
+    def test_custom_checkpoint_id_format_finds_latest(self):
+        # Retained from the pre-rebase fork, with the new constructor API:
+        # https://github.com/commaai/torchtitan/blob/cd0875e51e2cb62bd3f8de2a0450f80cc1bb3860/tests/unit_tests/test_checkpoint.py
+        ckpt_folder = os.path.join(self.test_folder, "custom")
+        for step in (2, 5):
+            directory = os.path.join(ckpt_folder, f"epoch_{step}")
+            os.makedirs(directory)
+            with open(os.path.join(directory, ".metadata"), "w"):
+                pass
+        config = CheckpointManager.Config(
+            folder="custom",
+            checkpoint_id_format="epoch_",
+            keep_latest_k=0,
+            last_save_model_only=False,
+        )
+        manager = CheckpointManager(
+            config=config,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            ema=self.ema,
+            extra_states=self.states,
+            sd_adapter=None,
+            base_folder=self.test_folder,
+        )
+        try:
+            self.assertEqual(
+                manager._create_checkpoint_id(7), os.path.join(ckpt_folder, "epoch_7")
+            )
+            self.assertEqual(manager._find_load_step(), 5)
+        finally:
+            manager.close()
+
     def fake_save(self, state_dict: dict, checkpoint_id: str, storage_writer=None):
         os.makedirs(checkpoint_id, exist_ok=True)
         sd_to_save = {}

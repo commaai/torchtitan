@@ -4,7 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""TorchAO-backed FP8 compute retained for tensorwise training references."""
+"""TorchAO-backed FP8 compute retained for tensorwise training references.
+
+Adapted wrapper and scale hook (not an unchanged copy):
+https://github.com/commaai/torchtitan/blob/cd0875e51e2cb62bd3f8de2a0450f80cc1bb3860/torchtitan/components/quantization/float8.py
+https://github.com/commaai/torchtitan/blob/cd0875e51e2cb62bd3f8de2a0450f80cc1bb3860/torchtitan/components/optimizer.py
+Compute below follows TorchAO 0.17.0 Float8Linear.forward:
+https://github.com/pytorch/ao/blob/02105d46c61dc80a8c9d39d5836e827ba3af8439/torchao/float8/float8_linear.py
+"""
 
 from dataclasses import dataclass
 from typing import Any

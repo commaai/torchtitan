@@ -337,6 +337,8 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
         self._validate_params(all_params)
         self._post_init(all_params)
 
+        # Replaces ModelSpec.post_optimizer_build_fn; hook provenance is in:
+        # https://github.com/commaai/torchtitan/blob/cd0875e51e2cb62bd3f8de2a0450f80cc1bb3860/torchtitan/components/optimizer.py
         from torchtitan.quantization.float8_legacy import (
             register_float8_precompute_scale_hook,
         )
