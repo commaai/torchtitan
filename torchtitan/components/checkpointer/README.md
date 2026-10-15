@@ -73,20 +73,6 @@ checkpointer=CheckpointManager.Config(
 
 A more exhaustive and up-to-date list of checkpoint config options can be found in `torchtitan/components/checkpointer/base.py` (`BaseCheckpointManager.Config`). DCP-specific `async_mode` is on `CheckpointManager.Config` in `torchtitan/components/checkpointer/dcp.py`.
 
-## Fork checkpoint policies
-
-- `checkpoint_id_format` is a directory prefix: `"step-"` (default) produces
-  `step-100/`; `""` produces `100/`. Discovery and retention use the same prefix.
-- DCP's `allow_partial_initial_load=False` keeps strict missing-key checks by
-  default. When enabled, missing keys retain their initialized values. Despite
-  the historical name, this applies to every native DCP load, including resumes;
-  Hugging Face loads are unchanged.
-- Native DCP saves log their total shard payload size and fail above 100 GB
-  (decimal). The check runs after writing, including when an async save is joined;
-  it does not prevent an oversized upload. HF exports are not subject to this limit.
-- Remote DCP writers receive a 600-second fsspec storage timeout. Local DCP I/O
-  and all path operations use upstream's implementations.
-
 ## Creating a seed checkpoint
 Sometimes one needs to create a seed checkpoint to initialize a model from step 0.
 E.g. it is hard, if not impossible, for meta initialization on multiple devices to reproduce the initialization on a single device.

@@ -2,7 +2,6 @@
 
 TorchTitan provides the following low-precision training formats:
 
-- [Legacy TorchAO FP8](float8_legacy.md) for tensorwise reference training on SM89+ GPUs.
 - [MXFP8](mxfp8/README.md) for dense and MoE models on Blackwell GPUs.
 - [NVFP4](nvfp4/README.md) for experimental dense training on Blackwell GPUs.
 
