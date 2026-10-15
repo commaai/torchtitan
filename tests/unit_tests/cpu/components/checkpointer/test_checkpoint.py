@@ -333,8 +333,6 @@ class TestCheckpointManager(unittest.TestCase):
         time.sleep(0.1)
 
     def test_custom_checkpoint_id_format_finds_latest(self):
-        # Retained from the pre-rebase fork, with the new constructor API:
-        # https://github.com/commaai/torchtitan/blob/cd0875e51e2cb62bd3f8de2a0450f80cc1bb3860/tests/unit_tests/test_checkpoint.py
         ckpt_folder = os.path.join(self.test_folder, "custom")
         for step in (2, 5):
             directory = os.path.join(ckpt_folder, f"epoch_{step}")
