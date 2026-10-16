@@ -291,8 +291,8 @@ class Trainer(Configurable):
 
         logger.info(
             "Trainer is initialized with "
-            f"{num_tokens_per_dp_rank} tokens per DP rank, "
-            f"{num_tokens_per_train_step} tokens per train step, "
+            f"{num_tokens_per_dp_rank} samples per DP rank, "
+            f"{num_tokens_per_train_step} samples per train step, "
             f"gradient accumulation steps {self.gradient_accumulation_steps}, "
             f"maximum context length {config.training.max_context_length}, "
             f"total steps {config.training.steps} "

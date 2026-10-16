@@ -582,7 +582,7 @@ class MetricsProcessor(Configurable):
             f"{color.orange}grad_norm: {grad_norm:7.4f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
-            f"{color.blue}tps: {round(tps):,}  "
+            f"{color.blue}samples/s: {tps:,.2f}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
             f"{color.magenta}mfu: {mfu_str}{color.reset}"
         )
@@ -608,7 +608,7 @@ class MetricsProcessor(Configurable):
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
-        # tokens per second per device, abbreviated as tps
+        # Throughput per device, in the unit counted by the trainer.
         tps = self.ntokens_since_last_log / (
             time_delta * self.parallelism_context.non_data_parallel_size
         )
@@ -633,7 +633,7 @@ class MetricsProcessor(Configurable):
             f"{color.green}loss: {loss:7.4f}  "
             f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
-            f"{color.blue}tps: {round(tps):,}{color.reset}"
+            f"{color.blue}samples/s: {tps:,.2f}{color.reset}"
         )
 
         self.step_last_log = step
