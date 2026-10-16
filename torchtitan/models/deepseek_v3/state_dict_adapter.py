@@ -4,23 +4,29 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import torch
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 from torch.distributed.tensor import DTensor
 
+from torchtitan.models.common.moe_state_dict_adapter import MoEStateDictAdapter
+
 from torchtitan.models.common.rope import ComplexRoPE
-from torchtitan.models.utils import MoEStateDictAdapter
-from .model import DeepSeekV3Model
+
+if TYPE_CHECKING:
+    from .model import DeepSeekV3Model
 
 
 class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
     """
     StateDictAdapter for DeepSeekV3 model.
     """
+
+    hf_experts_key_fragment = "mlp.experts"
 
     def __init__(
         self,
@@ -43,14 +49,19 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
             "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
             "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
             # MoE Module
-            "model.layers.{}.mlp.experts.{}.gate_proj.weight": "layers.{}.moe.experts.w1_EFD",
-            "model.layers.{}.mlp.experts.{}.up_proj.weight": "layers.{}.moe.experts.w3_EFD",
-            "model.layers.{}.mlp.experts.{}.down_proj.weight": "layers.{}.moe.experts.w2_EDF",
+            "model.layers.{}.mlp.experts.{}.gate_proj.weight": "layers.{}.moe.routed_experts.w1_EFD",
+            "model.layers.{}.mlp.experts.{}.up_proj.weight": "layers.{}.moe.routed_experts.w3_EFD",
+            "model.layers.{}.mlp.experts.{}.down_proj.weight": "layers.{}.moe.routed_experts.w2.weight",
             "model.layers.{}.mlp.gate.weight": "layers.{}.moe.router.gate.weight",
             "model.layers.{}.mlp.shared_experts.gate_proj.weight": "layers.{}.moe.shared_experts.w1.weight",
             "model.layers.{}.mlp.shared_experts.up_proj.weight": "layers.{}.moe.shared_experts.w3.weight",
             "model.layers.{}.mlp.shared_experts.down_proj.weight": "layers.{}.moe.shared_experts.w2.weight",
             "model.layers.{}.mlp.gate.e_score_correction_bias": "layers.{}.moe.expert_bias_E",
+            # MTP Module
+            "model.layers.{}.enorm.weight": "layers.{}.enorm.weight",
+            "model.layers.{}.hnorm.weight": "layers.{}.hnorm.weight",
+            "model.layers.{}.eh_proj.weight": "layers.{}.eh_proj.weight",
+            "model.layers.{}.shared_head.norm.weight": "layers.{}.mtp_norm.weight",
             "model.norm.weight": "norm.weight",
             "lm_head.weight": "lm_head.weight",
         }
@@ -71,8 +82,60 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
                 }
             )
 
+    def _map_from_hf_layer_key(
+        self,
+        abstract_key: str,
+        layer_num: str,
+    ) -> tuple[str, str]:
+        new_key = self.from_hf_map[abstract_key]
+        if getattr(self.model_config, "mtp_layers", None):
+            # pyrefly: ignore [missing-attribute]
+            num_main_layers = len(self.model_config.layers)
+            layer_idx = int(layer_num)
+            if layer_idx >= num_main_layers:
+                if not any(
+                    new_key.startswith(f"layers.{{}}.{name}.")
+                    for name in ("enorm", "hnorm", "eh_proj", "mtp_norm")
+                ):
+                    new_key = new_key.replace(
+                        "layers.{}.",
+                        "mtp_layers.{}.",
+                        1,
+                    )
+                else:
+                    new_key = new_key.replace("layers.{}.", "mtp_layers.{}.", 1)
+                layer_num = str(layer_idx - num_main_layers)
+        return new_key, layer_num
+
+    def _map_to_hf_layer_key(
+        self,
+        key: str,
+        to_hf_map: dict[str, str],
+    ) -> tuple[str, str]:
+        if key.startswith("mtp_layers."):
+            abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
+            # pyrefly: ignore [missing-attribute]
+            layer_num = re.search(r"\d+", key).group(0)
+            main_abstract_key = abstract_key.replace(
+                "mtp_layers.{}.",
+                "layers.{}.",
+                1,
+            ).replace("mtp_layers.{}.", "layers.{}.", 1)
+            # pyrefly: ignore [missing-attribute]
+            hf_layer_num = str(len(self.model_config.layers) + int(layer_num))
+            return to_hf_map[main_abstract_key], hf_layer_num
+
+        abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
+        # pyrefly: ignore [missing-attribute]
+        layer_num = re.search(r"\d+", key).group(0)
+        return to_hf_map[abstract_key], layer_num
+
     def get_hf_storage_reader(
-        self, path: str, from_quantized: bool = False
+        self,
+        path: str,
+        from_quantized: bool = False,
+        *,
+        thread_count: int | None = None,
     ) -> HuggingFaceStorageReader:
         """
         Override default get_hf_storage_reader function to return QuantizedHFStorageReader.
@@ -89,29 +152,32 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
                 path=path,
                 target_dtype=torch.float32,
                 block_size=BLOCK_SIZE,
-                thread_count=4,
+                thread_count=4 if thread_count is None else thread_count,
             )
-        else:
-            return HuggingFaceStorageReader(path)
+        return super().get_hf_storage_reader(path, thread_count=thread_count)
 
-    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def to_hf(
+        self, state_dict: dict[str, Any], *, to_quantized_layout: bool = False
+    ) -> dict[str, Any]:
         """
         1. Convert between the HF shape and the torchtitan shape.
-        2. Split the GroupedExperts' weight into separate expert's weight.
+        2. Split grouped-linear weights into individual expert weights.
         """
+        state_dict = self._native_fused_linears_to_hf(
+            state_dict,
+            split_routed_experts=True,
+        )
 
         to_hf_map = {v: k for k, v in self.from_hf_map.items()}
 
         hf_state_dict = {}
 
         for key, value in state_dict.items():
-            if "moe.experts" in key:
+            if self._is_expert_weight_key(key):
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
-                # pyrefly: ignore [missing-attribute]
-                layer_num = re.search(r"\d+", key).group(0)
-                new_abstract_key = to_hf_map[abstract_key]
+                new_abstract_key, layer_num = self._map_to_hf_layer_key(key, to_hf_map)
 
-                # Store the GroupedExperts Weight metadata for from_hf()
+                # Store grouped-weight metadata for from_hf().
                 if isinstance(value, DTensor):
                     self.grouped_expert_weight_placements[
                         abstract_key
@@ -119,7 +185,7 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
                     self.grouped_expert_weight_shape[abstract_key] = value.shape
                     self.grouped_expert_weight_mesh[abstract_key] = value.device_mesh
 
-                    # Split GroupedExperts weight to local individual expert weights
+                    # Split the grouped weight into local individual experts.
                     local_expert_fqn = self._get_local_experts_weights(
                         new_abstract_key,
                         abstract_key,
@@ -145,10 +211,7 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
                         hf_state_dict[new_key] = split_values[expert_num].squeeze()
 
             elif "layers" in key:
-                abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
-                # pyrefly: ignore [missing-attribute]
-                layer_num = re.search(r"\d+", key).group(0)
-                new_key = to_hf_map[abstract_key]
+                new_key, layer_num = self._map_to_hf_layer_key(key, to_hf_map)
                 new_key = new_key.format(layer_num)
                 hf_state_dict[new_key] = value
 
@@ -158,11 +221,13 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
 
         return hf_state_dict
 
-    def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+    def from_hf(
+        self, hf_state_dict: dict[str, Any], *, is_quantized_layout: bool = False
+    ) -> dict[str, Any]:
         """
         1. When loading from HF checkpoint, dequantize the weights from float8 to float32.
         2. Convert between the HF shape and the torchtitan shape.
-        3. Concat separate expert's weight into GroupedExperts' weight.
+        3. Concatenate individual expert weights into grouped-linear weights.
         """
         self._validate_hf_rope_config(ComplexRoPE.Config)
 
@@ -170,10 +235,15 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
         expert_weights_by_layer = {}  # {layer: {abstract_key: {expert_id: tensor}}}
 
         for key, value in hf_state_dict.items():
-            if "mlp.experts" in key:
+            if self.hf_experts_key_fragment in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=2)
-                layer_num, expert_num = re.findall(r"\d+", key)
-                titan_abstract_key = self.from_hf_map[abstract_key]
+                layer_num, expert_num = re.findall(r"\d+", key)[:2]
+                titan_abstract_key, mapped_layer_num = self._map_from_hf_layer_key(
+                    abstract_key,
+                    layer_num,
+                )
+                if mapped_layer_num != layer_num:
+                    layer_num = mapped_layer_num
                 new_key = titan_abstract_key.format(layer_num)
 
                 # Store the expert's weight in expert_weights_by_layer for concatenating later.
@@ -212,7 +282,10 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 # pyrefly: ignore [missing-attribute]
                 layer_num = re.search(r"\d+", key).group(0)
-                new_key = self.from_hf_map[abstract_key]
+                new_key, layer_num = self._map_from_hf_layer_key(
+                    abstract_key,
+                    layer_num,
+                )
                 new_key = new_key.format(layer_num)
                 state_dict[new_key] = value
 
@@ -220,4 +293,7 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
                 new_key = self.from_hf_map[key]
                 state_dict[new_key] = value
 
-        return state_dict
+        return self._native_fused_linears_from_hf(
+            state_dict,
+            fuse_routed_experts=True,
+        )

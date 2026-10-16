@@ -1,0 +1,497 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""GPT-OSS model flavors."""
+
+import dataclasses
+from collections.abc import Callable
+from functools import partial
+
+import torch.nn as nn
+
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.transform import (
+    ModelConfigConverter,
+    validate_converter_compatibility,
+)
+from torchtitan.models.common import (
+    BatchWiseLoadBalanceLoss,
+    ColumnParallelLinear,
+    CosSinRoPE,
+    Embedding,
+    HiMidLoLinear,
+    Linear,
+    RMSNorm,
+    RoPE,
+    RowParallelLinear,
+    Softmax,
+    TransformerBlock,
+)
+from torchtitan.models.common.activation import ClampedSwiGLU
+from torchtitan.models.common.attention import (
+    FlexInnerAttention,
+    QKVLinear,
+    SlidingWindowFlexInnerAttention,
+    VarlenInnerAttention,
+)
+from torchtitan.models.common.config_utils import get_attention_config
+from torchtitan.models.common.decoder_sharding import (
+    colwise_sharding_config,
+    inner_attention_local_spmd_sharding_config,
+    lm_head_sharding_config,
+    norm_sharding_config,
+    pre_lm_head_norm_sharding_config,
+    residual_activation_placement,
+    rope_cache_sharding_config,
+    rowwise_sharding_config,
+    token_embedding_sharding_config,
+)
+from torchtitan.models.common.moe import MoE, RoutedExperts, TokenChoiceTopKRouter
+from torchtitan.models.common.moe_sharding import (
+    moe_sharding_config,
+    routed_experts_sharding_config,
+    router_gate_sharding_config,
+    router_sharding_config,
+)
+from torchtitan.models.common.param_init import depth_scaled_std
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+from .model import Attention, GptOssModel, GptOssTransformerBlock
+from .moe import GptOssGroupedLinear
+from .sharding import attention_sharding_config, routed_expert_linear_sharding_config
+
+__all__ = [
+    "GptOssModel",
+    "MODEL_FLAVORS",
+    "build_model_config",
+]
+
+_NORM_INIT = {"weight": nn.init.ones_}
+# GPT-OSS uses std=0.02 for embeddings (model-specific)
+_EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=0.02)}
+
+
+def _output_linear_init(dim: int) -> dict[str, Callable]:
+    s = dim**-0.5
+    return {
+        "weight": partial(nn.init.trunc_normal_, std=s, a=-3 * s, b=3 * s),
+        "bias": nn.init.zeros_,
+    }
+
+
+def _depth_init(layer_id: int) -> dict[str, Callable]:
+    return {
+        "weight": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+        "bias": nn.init.zeros_,
+    }
+
+
+def _make_gptoss_attn_config(
+    *,
+    dim: int,
+    layer_id: int,
+    attn_backend: str = "varlen",
+    n_heads: int = 64,
+    n_kv_heads: int = 8,
+    head_dim: int = 64,
+    sliding_window_size: int | None = None,
+    rope: RoPE.Config,
+    enable_sp: bool,
+) -> Attention.Config:
+    """Build a fully-specified, sharded GPT-OSS Attention.Config for a layer.
+
+    All linear sub-configs have their in_features/out_features set.
+    All linear params use depth-scaled init (including wq/wkv/wo).
+    Sinks also use depth-scaled init.
+    """
+
+    inner_attention = get_attention_config(attn_backend)
+
+    if sliding_window_size is not None and isinstance(
+        inner_attention, VarlenInnerAttention.Config
+    ):
+        inner_attention = dataclasses.replace(
+            inner_attention, window_size=(sliding_window_size - 1, 0)
+        )
+    elif sliding_window_size is not None and isinstance(
+        inner_attention, FlexInnerAttention.Config
+    ):
+        inner_attention = SlidingWindowFlexInnerAttention.Config(
+            block_size=inner_attention.block_size,
+            kernel_options=inner_attention.kernel_options,
+            window_size=sliding_window_size,
+        )
+    inner_attention = dataclasses.replace(
+        inner_attention, sharding_config=inner_attention_local_spmd_sharding_config()
+    )
+    x_layout = residual_activation_placement(enable_sp=enable_sp)
+
+    sinks_init = {
+        "sinks": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id))
+    }
+
+    qkv = QKVLinear.Config(
+        head_dim=head_dim,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        wqkv=ColumnParallelLinear.Config(
+            in_features=dim,
+            out_features=(n_heads + 2 * n_kv_heads) * head_dim,
+            bias=True,
+            param_init=_depth_init(layer_id),
+            sharding_config=colwise_sharding_config(input_layout=x_layout),
+        ),
+    )
+
+    return Attention.Config(
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        dim=dim,
+        qkv_linear=qkv,
+        wo=RowParallelLinear.Config(
+            in_features=n_heads * head_dim,
+            out_features=dim,
+            bias=True,
+            param_init=_depth_init(layer_id),
+            sharding_config=rowwise_sharding_config(output_layout=x_layout),
+        ),
+        sliding_window_size=sliding_window_size,
+        inner_attention=inner_attention,
+        param_init=sinks_init,
+        rope=dataclasses.replace(rope, sharding_config=rope_cache_sharding_config()),
+        sharding_config=attention_sharding_config(enable_sp=enable_sp),
+    )
+
+
+def _make_gptoss_experts_config(
+    *,
+    dim: int,
+    hidden_dim: int,
+    num_experts: int,
+    layer_id: int,
+    top_k: int,
+    enable_ep: bool,
+) -> RoutedExperts.Config:
+    """Build a fully-specified, sharded RoutedExperts.Config for one layer."""
+    # TODO: Audit GPT-OSS gate/up depth scaling separately, including its biases.
+    std = depth_scaled_std(0.02, layer_id)
+    experts_init = {
+        "weight": partial(nn.init.trunc_normal_, std=std),
+        "bias": partial(nn.init.trunc_normal_, std=std),
+    }
+    return RoutedExperts.Config(
+        w13=GptOssGroupedLinear.Config(
+            group_size=num_experts,
+            in_features=dim,
+            out_features=hidden_dim,
+            num_linears=2,
+            param_init=experts_init,
+            sharding_config=routed_expert_linear_sharding_config(enable_ep=enable_ep),
+        ),
+        w2=GptOssGroupedLinear.Config(
+            group_size=num_experts,
+            in_features=hidden_dim,
+            out_features=dim,
+            param_init=experts_init,
+            sharding_config=routed_expert_linear_sharding_config(enable_ep=enable_ep),
+        ),
+        activation_fn=ClampedSwiGLU.Config(),
+        token_dispatcher=AllToAllTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+        ),
+        sharding_config=routed_experts_sharding_config(),
+    )
+
+
+def _build_gptoss_layers(
+    *,
+    dim: int,
+    n_layers: int,
+    hidden_dim: int,
+    num_experts: int,
+    top_k: int,
+    load_balance_coeff: float | None,
+    attn_backend: str = "varlen",
+    rope: RoPE.Config,
+    enable_sp: bool,
+    enable_ep: bool,
+) -> list[TransformerBlock.Config]:
+    """Build sharded per-layer configs for GPT-OSS.
+
+    Even-indexed layers (0, 2, 4, ...) use sliding window attention.
+    All dimensional fields are set directly.
+    """
+    norm_sharding = norm_sharding_config(enable_sp=enable_sp)
+    layers = []
+    for layer_id in range(n_layers):
+        attn_cfg = _make_gptoss_attn_config(
+            dim=dim,
+            layer_id=layer_id,
+            attn_backend=attn_backend,
+            sliding_window_size=128 if layer_id % 2 == 0 else None,
+            rope=rope,
+            enable_sp=enable_sp,
+        )
+        routed_experts_cfg = _make_gptoss_experts_config(
+            dim=dim,
+            hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            layer_id=layer_id,
+            top_k=top_k,
+            enable_ep=enable_ep,
+        )
+        moe_cfg = MoE.Config(
+            num_experts=num_experts,
+            load_balance_coeff=load_balance_coeff,
+            routed_experts=routed_experts_cfg,
+            router=TokenChoiceTopKRouter.Config(
+                num_experts=num_experts,
+                score_func=Softmax.Config(),
+                route_norm=True,
+                gate=HiMidLoLinear.Config(
+                    in_features=dim,
+                    out_features=num_experts,
+                    backward_mode="hi_mid_lo",
+                    bias=True,
+                    param_init=_depth_init(layer_id),
+                    sharding_config=router_gate_sharding_config(),
+                ),
+                top_k=top_k,
+                aux_loss=BatchWiseLoadBalanceLoss.Config(
+                    coeff=1e-3, num_experts=num_experts
+                ),
+                sharding_config=router_sharding_config(),
+            ),
+            sharding_config=moe_sharding_config(enable_sp=enable_sp),
+        )
+        layer_cfg = GptOssTransformerBlock.Config(
+            attention=attn_cfg,
+            attention_norm=RMSNorm.Config(
+                normalized_shape=dim,
+                param_init=_NORM_INIT,
+                sharding_config=norm_sharding,
+            ),
+            ffn_norm=RMSNorm.Config(
+                normalized_shape=dim,
+                param_init=_NORM_INIT,
+                sharding_config=norm_sharding,
+            ),
+            moe=moe_cfg,
+        )
+        layers.append(layer_cfg)
+    return layers
+
+
+def _debugmodel(
+    attn_backend: str = "varlen",
+    *,
+    seq_len: int,
+    parallelism: ParallelismConfig,
+) -> GptOssModel.Config:
+    dim = 256
+    hidden_dim = 2880
+    n_layers = 4
+    return GptOssModel.Config(
+        max_context_length=seq_len,
+        vocab_size=2048,
+        dim=dim,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=2048,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+            sharding_config=token_embedding_sharding_config(
+                enable_sp=parallelism.enable_sequence_parallel
+            ),
+        ),
+        norm=RMSNorm.Config(
+            normalized_shape=dim,
+            param_init=_NORM_INIT,
+            sharding_config=pre_lm_head_norm_sharding_config(
+                enable_sp=parallelism.enable_sequence_parallel
+            ),
+        ),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=2048,
+            param_init=_output_linear_init(dim),
+            sharding_config=lm_head_sharding_config(),
+        ),
+        layers=_build_gptoss_layers(
+            dim=dim,
+            n_layers=n_layers,
+            hidden_dim=hidden_dim,
+            num_experts=8,
+            top_k=4,
+            load_balance_coeff=None,
+            attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=64,
+                max_context_length=seq_len,
+                theta=150000.0,
+                scaling="yarn",
+                rope_factor=32,
+                beta_fast=32.0,
+                beta_slow=1.0,
+                truncate=False,
+                original_seq_len=4096,
+            ),
+            enable_sp=parallelism.enable_sequence_parallel,
+            enable_ep=parallelism.expert_parallel_degree > 1,
+        ),
+    )
+
+
+def _20b(
+    attn_backend: str = "varlen",
+    *,
+    seq_len: int,
+    parallelism: ParallelismConfig,
+) -> GptOssModel.Config:
+    dim = 2880
+    hidden_dim = 2880
+    n_layers = 24
+    return GptOssModel.Config(
+        max_context_length=seq_len,
+        dim=dim,
+        vocab_size=201088,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=201088,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+            sharding_config=token_embedding_sharding_config(
+                enable_sp=parallelism.enable_sequence_parallel
+            ),
+        ),
+        norm=RMSNorm.Config(
+            normalized_shape=dim,
+            param_init=_NORM_INIT,
+            sharding_config=pre_lm_head_norm_sharding_config(
+                enable_sp=parallelism.enable_sequence_parallel
+            ),
+        ),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=201088,
+            param_init=_output_linear_init(dim),
+            sharding_config=lm_head_sharding_config(),
+        ),
+        layers=_build_gptoss_layers(
+            dim=dim,
+            n_layers=n_layers,
+            hidden_dim=hidden_dim,
+            num_experts=32,
+            top_k=4,
+            load_balance_coeff=None,
+            attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=64,
+                max_context_length=seq_len,
+                theta=150000.0,
+                scaling="yarn",
+                rope_factor=32,
+                beta_fast=32.0,
+                beta_slow=1.0,
+                truncate=False,
+                original_seq_len=4096,
+            ),
+            enable_sp=parallelism.enable_sequence_parallel,
+            enable_ep=parallelism.expert_parallel_degree > 1,
+        ),
+    )
+
+
+def _120b(
+    attn_backend: str = "varlen",
+    *,
+    seq_len: int,
+    parallelism: ParallelismConfig,
+) -> GptOssModel.Config:
+    dim = 2880
+    hidden_dim = 2880
+    n_layers = 36
+    return GptOssModel.Config(
+        max_context_length=seq_len,
+        dim=dim,
+        vocab_size=201088,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=201088,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+            sharding_config=token_embedding_sharding_config(
+                enable_sp=parallelism.enable_sequence_parallel
+            ),
+        ),
+        norm=RMSNorm.Config(
+            normalized_shape=dim,
+            param_init=_NORM_INIT,
+            sharding_config=pre_lm_head_norm_sharding_config(
+                enable_sp=parallelism.enable_sequence_parallel
+            ),
+        ),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=201088,
+            param_init=_output_linear_init(dim),
+            sharding_config=lm_head_sharding_config(),
+        ),
+        layers=_build_gptoss_layers(
+            dim=dim,
+            n_layers=n_layers,
+            hidden_dim=hidden_dim,
+            num_experts=128,
+            top_k=4,
+            load_balance_coeff=None,
+            attn_backend=attn_backend,
+            rope=CosSinRoPE.Config(
+                dim=64,
+                max_context_length=seq_len,
+                theta=150000.0,
+                scaling="yarn",
+                rope_factor=32,
+                beta_fast=32.0,
+                beta_slow=1.0,
+                truncate=False,
+                original_seq_len=4096,
+            ),
+            enable_sp=parallelism.enable_sequence_parallel,
+            enable_ep=parallelism.expert_parallel_degree > 1,
+        ),
+    )
+
+
+MODEL_FLAVORS = {
+    "debugmodel": (_debugmodel, 131072),
+    "20b": (_20b, 131072),
+    "120b": (_120b, 131072),
+}
+
+
+def build_model_config(
+    flavor: str,
+    *,
+    parallelism: ParallelismConfig,
+    seq_len: int | None = None,
+    attn_backend: str = "varlen",
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> GptOssModel.Config:
+    get_config, max_context_len = MODEL_FLAVORS[flavor]
+    context_len = seq_len or max_context_len
+    if context_len > max_context_len:
+        raise ValueError(
+            f"Requested seq_len {context_len} exceeds max context length "
+            f"{max_context_len} for flavor {flavor}"
+        )
+    config = get_config(
+        attn_backend=attn_backend,
+        seq_len=context_len,
+        parallelism=parallelism,
+    )
+    if converters is not None:
+        validate_converter_compatibility(converters)
+        for c in converters:
+            config = c.build().convert(config)
+    return config

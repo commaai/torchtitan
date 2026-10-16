@@ -1,0 +1,508 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""ShardingConfig-based TP setup for HF model modules.
+
+Sets ``_sharding_config`` on every HF sub-module so that a single
+``model._parallelize(parallelism_context)`` call handles all TP distribution
+and forward wrapping via the Module protocol.
+
+The flex-attention kernel uses a local SPMD region (via ``_attach_flex_kernel``)
+to declare the q/k/v layouts around the flex HOP, mirroring Titan's attention.
+Other HF internals operate on plain tensors carrying local SPMD annotations.
+
+MoE layers are already Titan Module instances with ShardingConfig and
+are handled by ``model._parallelize()`` directly.
+"""
+
+import inspect
+import logging
+
+import spmd_types as spmd
+import torch.nn as nn
+from spmd_types import SpmdType
+
+from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.models.base.sharding import ShardingConfig
+from torchtitan.models.common.decoder_sharding import (
+    dense_activation_placement,
+    dense_param_placement,
+    dense_sequence_parallel_placement,
+)
+
+logger = logging.getLogger(__name__)
+
+DP = MeshAxisName.DP
+CP = MeshAxisName.CP
+TP = MeshAxisName.TP
+
+
+def _hf_activation_placement(
+    *,
+    tp: spmd.PerMeshAxisSpmdType,
+    cp: spmd.PerMeshAxisSpmdType = spmd.S(1),
+) -> SpmdType:
+    """Placement for Transformers activations with batch and sequence dims."""
+    return SpmdType({DP: spmd.S(0), CP: cp, TP: tp})
+
+
+def _hf_sequence_parallel_placement() -> SpmdType:
+    """Sequence-parallel placement for ``(batch, sequence, hidden)`` tensors."""
+    return SpmdType(
+        {DP: spmd.V, CP: spmd.V, TP: spmd.V},
+        partition_spec=spmd.PartitionSpec(DP, (CP, TP), None),
+    )
+
+
+def _hf_colwise_sharding_config() -> ShardingConfig:
+    """Column-shard a linear whose output retains HF's batch dimension."""
+    return ShardingConfig(
+        state_shardings={
+            "weight": dense_param_placement(tp=spmd.S(0)),
+            "bias": dense_param_placement(tp=spmd.S(0)),
+        },
+        out_src_shardings=_hf_activation_placement(tp=spmd.S(-1)),
+    )
+
+
+def _hf_rowwise_sharding_config(*, output_sp: bool = False) -> ShardingConfig:
+    """Row-shard a linear whose output retains HF's batch dimension."""
+    out_dst = (
+        _hf_sequence_parallel_placement()
+        if output_sp
+        else _hf_activation_placement(tp=spmd.I)
+    )
+    return ShardingConfig(
+        state_shardings={
+            "weight": dense_param_placement(tp=spmd.S(1)),
+            "bias": dense_param_placement(tp=spmd.R),
+        },
+        out_src_shardings=_hf_activation_placement(tp=spmd.P),
+        out_dst_shardings=out_dst,
+    )
+
+
+def _sp_activation(*, enable_sp: bool) -> SpmdType:
+    """Activation layout for the sequence-parallel region.
+
+    When SP is enabled, the sequence dim is sharded across both CP and TP
+    (``partition_spec=(DP, (CP, TP), None)``) -- use the HF-specific sequence
+    placement so the CP/TP shard ordering on tensor
+    dim 1 is explicit. When SP is disabled, TP replicates (CP still seq-shards).
+    """
+    return (
+        _hf_sequence_parallel_placement()
+        if enable_sp
+        else _hf_activation_placement(tp=spmd.R)
+    )
+
+
+def set_hf_sharding_configs(
+    model: nn.Module,
+    *,
+    enable_sp: bool,
+) -> None:
+    """Set ``_sharding_config`` on all HF modules for TP/EP parallelization.
+
+    Root-level and per-layer modules all use ``_sharding_config``.
+    MoE layers are skipped (already have ShardingConfig from Titan MoE).
+    Actual state distribution happens later in ``model.parallelize()``.
+
+    Args:
+        model: The HFTransformerModel with Module-converted children.
+        enable_sp: Whether sequence parallelism is enabled (TP > 1).
+    """
+    # Root-level modules — nn.Identity modules are skipped (no params).
+    if model.tok_embeddings is not None and not isinstance(
+        model.tok_embeddings, nn.Identity
+    ):
+        emb_state: dict = {"weight": dense_param_placement(tp=spmd.S(0))}
+        for buf_name, _ in model.tok_embeddings.named_buffers(recurse=False):
+            emb_state[buf_name] = dense_param_placement(tp=spmd.R)
+        model.tok_embeddings._sharding_config = ShardingConfig(
+            state_shardings=emb_state,
+            in_src_shardings={"input": _hf_activation_placement(tp=spmd.R)},
+            in_dst_shardings={"input": _hf_activation_placement(tp=spmd.R)},
+            out_src_shardings=_hf_activation_placement(tp=spmd.P),
+            out_dst_shardings=_sp_activation(enable_sp=enable_sp),
+            local_spmd=True,
+        )
+
+    if model.norm is not None and not isinstance(model.norm, nn.Identity):
+        model.norm._sharding_config = _hf_norm_sharding_config(enable_sp=enable_sp)
+
+    if model.lm_head is not None and not isinstance(model.lm_head, nn.Identity):
+        lm_head_input = (
+            dense_sequence_parallel_placement()
+            if enable_sp
+            else dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+        )
+        model.lm_head._sharding_config = ShardingConfig(
+            state_shardings={
+                "weight": dense_param_placement(tp=spmd.S(0)),
+                "bias": dense_param_placement(tp=spmd.S(0)),
+            },
+            in_src_shardings={
+                "input": lm_head_input,
+            },
+            in_dst_shardings={
+                "input": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+            },
+            # Vocab-shard the lm_head output S(-1) unconditionally, mirroring
+            # core's set_decoder_sharding_config. The S(-1) TP placement is a
+            # no-op when TP is absent from the runtime mesh, so no flag is
+            # needed: core cross_entropy_loss detects the vocab-sharded pred
+            # (spmd_types: tp mesh size > 1) and runs vocab-parallel CE.
+            out_src_shardings=dense_activation_placement(tp=spmd.S(-1), cp=spmd.S(0)),
+            out_dst_shardings=dense_activation_placement(tp=spmd.S(-1), cp=spmd.S(0)),
+        )
+
+    # Rotary embedding: annotate buffers and inputs so their local SPMD layouts
+    # compose through apply_rotary_pos_emb.
+    if hasattr(model, "rotary_emb") and not isinstance(model.rotary_emb, nn.Identity):
+        rope = model.rotary_emb
+        rope._sharding_config = _rope_sharding_config(rope, enable_sp=enable_sp)
+
+    # Per-layer modules
+    for transformer_block in model.layers:
+        _set_layer_sharding_configs(transformer_block, enable_sp=enable_sp)
+
+    # Completeness backstop: every parameter/buffer-bearing module this function
+    # is responsible for must have a sharding config. Covers
+    # root modules and every decoder layer; the Titan MoE subtree is configured
+    # separately by set_moe_sharding_config, so it is excluded per layer.
+    for name in ("tok_embeddings", "norm", "lm_head", "rotary_emb"):
+        mod = getattr(model, name, None)
+        if mod is not None and not isinstance(mod, nn.Identity):
+            _assert_all_states_sharded(mod, path=name)
+    for transformer_block in model.layers:
+        moe = _moe_subtree(transformer_block)
+        _assert_all_states_sharded(
+            transformer_block,
+            path=type(transformer_block).__name__,
+            skip=(moe,) if moe is not None else (),
+        )
+
+    logger.info("Set sharding configs on all HF modules")
+
+
+def _attach_flex_kernel(attn: nn.Module) -> None:
+    """Attach the flex-attention kernel Module carrying its local SPMD region.
+
+    q/k/v reach the HF attention function as ``(b, heads, seq, dim)`` with heads
+    on tensor dim 1 and seq on tensor dim 2; the flex output is
+    ``(b, seq, heads, dim)`` with seq on dim 1 and heads on dim 2. Declare those
+    as the local-region input/output placements around the flex HOP (see
+    ``HFFlexKernel``).
+
+    Under CP, q/k/v arrive seq-sharded on the CP axis. The local region treats
+    them as seq-sharded (``S(2)`` on the input); the actual k/v all-gather across
+    the CP axis is done explicitly with a funcol collective inside the kernel
+    forward (see ``_wrap_flex_kernel_cp`` in parallelize.py), because the kernel
+    runs nested inside the attention module's local SPMD region where the CP mesh
+    dim is no longer visible to a declarative redistribute. The output is
+    seq-sharded on the CP axis (``S(1)`` -- seq is dim 1 after flex transposes).
+    When CP is not enabled the (tp,)-only mesh ignores the CP placement, so this
+    is a no-op for the TP/FSDP-only paths. DP stays ``R`` -- FSDP is applied
+    classically (``apply_fsdp``), not as an spmd DP axis.
+    """
+    from torchtitan.experiments.transformers_modeling_backend.model import HFFlexKernel
+
+    # Input layout (b, heads, seq, dim): heads on dim 1 (TP), seq on dim 2 (CP).
+    # k/v stay S(2) here; the funcol all-gather in the forward wrap handles CP.
+    heads_in = SpmdType({DP: spmd.R, CP: spmd.S(2), TP: spmd.S(1)})
+    # Output layout (b, seq, heads, dim): seq on dim 1 (CP), heads on dim 2 (TP).
+    heads_out = SpmdType({DP: spmd.R, CP: spmd.S(1), TP: spmd.S(2)})
+    attn._titan_flex_kernel = HFFlexKernel.Config(
+        sharding_config=ShardingConfig(
+            in_src_shardings={
+                "query": heads_in,
+                "key": heads_in,
+                "value": heads_in,
+            },
+            in_dst_shardings={
+                "query": heads_in,
+                "key": heads_in,
+                "value": heads_in,
+            },
+            out_src_shardings=heads_out,
+            local_spmd=True,
+        )
+    ).build()
+
+
+def _set_layer_sharding_configs(layer: nn.Module, *, enable_sp: bool) -> None:
+    """Set ``_sharding_config`` on each sub-module of a decoder layer.
+
+    Covers norms, attention projections, and (for non-MoE layers) dense MLP.
+    MoE layers have their own ShardingConfig from the Titan MoE swap. Also
+    attaches the flex-attention kernel Module that carries the attention
+    local SPMD region (see ``_attach_flex_kernel``).
+    """
+    # --- Norms ---
+    if hasattr(layer, "input_layernorm"):
+        layer.input_layernorm._sharding_config = _hf_norm_sharding_config(
+            enable_sp=enable_sp
+        )
+    if hasattr(layer, "post_attention_layernorm"):
+        layer.post_attention_layernorm._sharding_config = _hf_norm_sharding_config(
+            enable_sp=enable_sp
+        )
+    if hasattr(layer, "pre_feedforward_layernorm"):
+        layer.pre_feedforward_layernorm._sharding_config = _hf_norm_sharding_config(
+            enable_sp=enable_sp
+        )
+    if hasattr(layer, "post_feedforward_layernorm"):
+        layer.post_feedforward_layernorm._sharding_config = _hf_norm_sharding_config(
+            enable_sp=enable_sp
+        )
+
+    # --- Attention ---
+    attn = layer.self_attn
+
+    # Gather input from SP layout to Replicate at the attention boundary.
+    attn._sharding_config = ShardingConfig(
+        in_src_shardings={
+            "hidden_states": _sp_activation(enable_sp=enable_sp),
+        },
+        in_dst_shardings={
+            "hidden_states": _hf_activation_placement(tp=spmd.R),
+        },
+    )
+
+    # Flex attention: attach the kernel Module that carries the attention
+    # local SPMD region so q/k/v are computed on local head-sharded tensors.
+    _attach_flex_kernel(attn)
+
+    # Query projection. Detected independently of the KV path: a model may
+    # use low-rank Q (q_a_proj/q_b_proj, e.g. DeepSeek-V3, GLM-4.7) or
+    # full-rank Q (q_proj, e.g. GQA models and DeepSeek-V2-Lite).
+    if hasattr(attn, "q_a_proj"):
+        for name in ("q_a_proj", "q_a_layernorm"):
+            mod = getattr(attn, name, None)
+            if mod is not None:
+                mod._sharding_config = _replicate_sharding_config(mod)
+        if hasattr(attn, "q_b_proj"):
+            attn.q_b_proj._sharding_config = _hf_colwise_sharding_config()
+    elif hasattr(attn, "q_proj"):
+        attn.q_proj._sharding_config = _hf_colwise_sharding_config()
+    else:
+        raise ValueError(
+            f"{type(attn).__name__}: no recognized query projection "
+            "(expected 'q_a_proj'/'q_b_proj' or 'q_proj'). "
+            "Add a case in _set_layer_sharding_configs (hf_sharding.py)."
+        )
+
+    # Key/Value projection. Detected independently of Q: DeepSeek-V2-Lite has
+    # full-rank Q but low-rank KV (kv_a_proj_with_mqa/kv_b_proj), so keying KV
+    # off q_lora_rank misses it. MLA models replicate the low-rank down-proj
+    # and column-shard the up-proj; GQA models column-shard k_proj/v_proj.
+    if hasattr(attn, "kv_a_proj_with_mqa"):
+        for name in ("kv_a_proj_with_mqa", "kv_a_layernorm"):
+            mod = getattr(attn, name, None)
+            if mod is not None:
+                mod._sharding_config = _replicate_sharding_config(mod)
+        if hasattr(attn, "kv_b_proj"):
+            attn.kv_b_proj._sharding_config = _hf_colwise_sharding_config()
+    elif hasattr(attn, "k_proj") and hasattr(attn, "v_proj"):
+        attn.k_proj._sharding_config = _hf_colwise_sharding_config()
+        attn.v_proj._sharding_config = _hf_colwise_sharding_config()
+    else:
+        raise ValueError(
+            f"{type(attn).__name__}: no recognized key/value projection "
+            "(expected 'kv_a_proj_with_mqa'/'kv_b_proj' or 'k_proj'/'v_proj'). "
+            "Add a case in _set_layer_sharding_configs (hf_sharding.py)."
+        )
+
+    # O projection
+    o_proj_name = "o_proj" if hasattr(attn, "o_proj") else "dense"
+    getattr(attn, o_proj_name)._sharding_config = _hf_rowwise_sharding_config(
+        output_sp=enable_sp
+    )
+
+    # Q/K norms (Qwen3) — weight replicated, activations stay heads-sharded.
+    for norm_name in ("q_norm", "k_norm"):
+        norm = getattr(attn, norm_name, None)
+        if norm is not None:
+            norm._sharding_config = _replicate_sharding_config(norm)
+
+    _set_dsa_indexer_sharding(attn, enable_sp=enable_sp)
+
+    # V-norm (Gemma4) — parameter-free RMSNorm applied per-head
+    if hasattr(attn, "v_norm"):
+        attn.v_norm._sharding_config = _replicate_sharding_config(attn.v_norm)
+
+    # --- Dense MLP (non-MoE layers only) ---
+    if not getattr(layer, "moe_enabled", False):
+        mlp = layer.mlp
+
+        mlp_arg = _first_forward_arg(mlp)
+        mlp._sharding_config = ShardingConfig(
+            in_src_shardings={mlp_arg: _sp_activation(enable_sp=enable_sp)},
+            in_dst_shardings={mlp_arg: _hf_activation_placement(tp=spmd.R)},
+        )
+
+        gate_name = "gate_proj" if hasattr(mlp, "gate_proj") else "fc1"
+        getattr(mlp, gate_name)._sharding_config = _hf_colwise_sharding_config()
+
+        if hasattr(mlp, "up_proj"):
+            mlp.up_proj._sharding_config = _hf_colwise_sharding_config()
+
+        down_name = "down_proj" if hasattr(mlp, "down_proj") else "fc2"
+        getattr(mlp, down_name)._sharding_config = _hf_rowwise_sharding_config(
+            output_sp=enable_sp
+        )
+
+    # --- Direct-on-layer state ---
+    # Some models keep parameters/buffers directly on the decoder layer rather
+    # than in a submodule (e.g. Gemma4's ``layer_scalar``, a per-layer scalar
+    # buffer initialized to 1). Replicate any such state so the layer itself has
+    # a config; otherwise the completeness backstop fails loud.
+    if (
+        next(layer.named_parameters(recurse=False), None) is not None
+        or next(layer.named_buffers(recurse=False), None) is not None
+    ):
+        layer._sharding_config = _replicate_sharding_config(layer)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _set_dsa_indexer_sharding(attn: nn.Module, *, enable_sp: bool) -> None:
+    """Replicate a DSA indexer, rejecting its unsupported TP execution."""
+    if not hasattr(attn, "indexer"):
+        return
+    if enable_sp:
+        raise NotImplementedError(
+            f"{type(attn).__name__}: the DSA indexer is not supported under "
+            "tensor parallelism. Use FSDP/EP without TP."
+        )
+    for sub in attn.indexer.modules():
+        sub._sharding_config = _replicate_sharding_config(sub)
+
+
+def _hf_norm_sharding_config(*, enable_sp: bool) -> ShardingConfig:
+    """Norm sharding using HF's ``hidden_states`` arg name."""
+    state = {
+        "weight": dense_param_placement(tp=spmd.R),
+        "bias": dense_param_placement(tp=spmd.R),
+    }
+    if not enable_sp:
+        return ShardingConfig(state_shardings=state)
+    sp_layout = _hf_sequence_parallel_placement()
+    return ShardingConfig(
+        state_shardings=state,
+        in_src_shardings={"hidden_states": sp_layout},
+        in_dst_shardings={"hidden_states": sp_layout},
+        out_src_shardings=sp_layout,
+        out_dst_shardings=sp_layout,
+    )
+
+
+def _replicate_sharding_config(module: nn.Module) -> ShardingConfig:
+    """Replicate all params and buffers on the dense SPMD mesh.
+
+    Dynamically enumerates the module's own parameters and buffers to avoid
+    ``_distribute_states`` raising on undeclared entries.
+    """
+    state_shardings: dict = {}
+    for name, _ in module.named_parameters(recurse=False):
+        state_shardings[name] = dense_param_placement(tp=spmd.R)
+    for name, _ in module.named_buffers(recurse=False):
+        state_shardings[name] = dense_param_placement(tp=spmd.R)
+    return ShardingConfig(state_shardings=state_shardings)
+
+
+def _rope_sharding_config(module: nn.Module, *, enable_sp: bool) -> ShardingConfig:
+    """Sharding config for a rotary embedding module.
+
+    The rotary embedding's forward receives the hidden-states activation (first
+    positional arg) plus plain tensors (e.g. ``position_ids``). Its inv_freq
+    buffer is replicated so the computed cos/sin have matching SPMD types in
+    ``apply_rotary_pos_emb``.
+
+    Core's input redistribution requires ``in_src_shardings`` to match the
+    incoming placement exactly. Under SP the hidden-states arg arrives sharded
+    on the sequence dim (the embedding output layout), so declare the first arg
+    with the SP activation placement; the remaining (plain) args are wrapped as
+    Replicate. ``in_dst`` mirrors ``in_src`` -- the rotary embedding only reads
+    hidden_states for dtype/device, so there is no need to redistribute it.
+    """
+    state_shardings: dict = {}
+    for name, _ in module.named_parameters(recurse=False):
+        state_shardings[name] = dense_param_placement(tp=spmd.R)
+    for name, _ in module.named_buffers(recurse=False):
+        state_shardings[name] = dense_param_placement(tp=spmd.R)
+
+    sig = inspect.signature(type(module).forward)
+    arg_names = [p.name for p in sig.parameters.values() if p.name != "self"]
+    in_shardings = {}
+    for i, name in enumerate(arg_names):
+        in_shardings[name] = (
+            _sp_activation(enable_sp=enable_sp)
+            if i == 0
+            else _hf_activation_placement(tp=spmd.R)
+        )
+    return ShardingConfig(
+        state_shardings=state_shardings,
+        in_src_shardings=in_shardings,
+        in_dst_shardings=in_shardings,
+    )
+
+
+def _first_forward_arg(module: nn.Module) -> str:
+    """Return the first positional arg name of ``module.forward``."""
+    sig = inspect.signature(type(module).forward)
+    for p in sig.parameters.values():
+        if p.name != "self":
+            return p.name
+    raise ValueError(f"No positional args in {type(module).__name__}.forward")
+
+
+def _moe_subtree(layer: nn.Module) -> nn.Module | None:
+    """Return the Titan MoE module on a layer, or None for dense layers.
+
+    The MoE subtree is configured by ``set_moe_sharding_config`` (not this
+    file), so it is excluded from the completeness backstop below.
+    """
+    if not getattr(layer, "moe_enabled", False):
+        return None
+    return getattr(layer, "mlp", None)
+
+
+def _assert_all_states_sharded(
+    root: nn.Module, *, path: str, skip: tuple[nn.Module, ...] = ()
+) -> None:
+    """Raise if any param/buffer-bearing submodule of ``root`` lacks a config.
+
+    A module that owns parameters or buffers but has no ``_sharding_config``
+    leaves their SPMD layouts undeclared. This backstop turns that into a
+    precise setup-time error naming the module.
+
+    ``skip`` lists module subtrees configured elsewhere (e.g. the Titan MoE,
+    handled by ``set_moe_sharding_config``); they and their descendants are not
+    checked here.
+    """
+    skip_ids = {id(sub) for m in skip for sub in m.modules()}
+    missing = []
+    for name, sub in root.named_modules():
+        if id(sub) in skip_ids:
+            continue
+        has_own_state = (
+            next(sub.named_parameters(recurse=False), None) is not None
+            or next(sub.named_buffers(recurse=False), None) is not None
+        )
+        if has_own_state and getattr(sub, "_sharding_config", None) is None:
+            missing.append(f"{path}.{name}" if name else path)
+    if missing:
+        raise ValueError(
+            f"Unsharded modules with no _sharding_config: {missing}. "
+            "Every parameter/buffer-bearing module on the dense path needs a "
+            "sharding config (shard it, or use _replicate_sharding_config). Add a case in "
+            "set_hf_sharding_configs / _set_layer_sharding_configs (hf_sharding.py)."
+        )

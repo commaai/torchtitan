@@ -24,13 +24,16 @@ from typing import cast
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor
 
-from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
-from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import SelectiveAC
-from torchtitan.models.qwen3_5 import Qwen35Model, qwen3_5_configs
-from torchtitan.models.qwen3_5.parallelize import parallelize_qwen3_5
+# Registers the "loss" local compile region that the Qwen3.5 config lists.
+import torchtitan.components.loss  # noqa: F401
+
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed import ParallelismContext
+from torchtitan.distributed.activation_remat import DefaultActivationRematConfig
+from torchtitan.models.qwen3_5 import build_model_config, Qwen35Model
+from torchtitan.tools import utils
 
 CONFIGS = [
     {"ngpu": 1, "tp": 1, "ep": 1, "label": "no_parallel"},
@@ -45,7 +48,7 @@ def run_worker(args):
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(utils.get_local_device())
 
     dp_shard = world_size // args.tp
 
@@ -53,12 +56,20 @@ def run_worker(args):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-    config = qwen3_5_configs["debugmodel_moe"](
+    seq_len = 128
+    parallelism = ParallelismConfig(
+        tensor_parallel_degree=args.tp,
+        data_parallel_shard_degree=dp_shard,
+        expert_parallel_degree=args.ep,
+    )
+    config = build_model_config(
+        "debugmodel_moe",
         attn_backend="flex",
-        moe_comm_backend="standard",
+        seq_len=seq_len,
+        parallelism=parallelism,
     )
 
-    parallel_dims = ParallelDims(
+    parallelism_context = ParallelismContext(
         dp_shard=dp_shard,
         dp_replicate=1,
         cp=1,
@@ -66,69 +77,51 @@ def run_worker(args):
         pp=1,
         ep=args.ep,
         world_size=world_size,
+        enable_sequence_parallel=True,
     )
-    parallel_dims.build_mesh()
+    parallelism_context.build_mesh()
 
-    parallelism = ParallelismConfig(
-        tensor_parallel_degree=args.tp,
-        data_parallel_shard_degree=dp_shard,
-        expert_parallel_degree=args.ep,
-    )
     training = TrainingConfig(
-        local_batch_size=1,
-        seq_len=128,
+        num_tokens_per_microbatch_per_dp_rank=1 * 128,
+        max_context_length=seq_len,
         steps=1,
         mixed_precision_param="bfloat16",
         mixed_precision_reduce="float32",
     )
 
-    config.update_from_config(
-        config=type(
-            "C",
-            (),
-            {
-                "training": training,
-                "parallelism": parallelism,
-                "debug": type("D", (), {"moe_force_load_balance": False})(),
-            },
-        )(),
-    )
-
-    model = config.build()
+    with parallelism_context.activate_spmd():
+        model = config.build()
     model.to_empty(device="cuda")
     model.init_weights(buffer_device=torch.device("cuda"))
 
-    model = parallelize_qwen3_5(
-        model,
-        parallel_dims=parallel_dims,
+    model = model.parallelize(
+        parallelism_context=parallelism_context,
         training=training,
         parallelism=parallelism,
-        compile_config=CompileConfig(),
-        ac_config=SelectiveAC.Config(),
+        local_compile_regions=config.local_compile_regions,
+        activation_remat=DefaultActivationRematConfig(),
         dump_folder="/tmp",
     )
 
     torch.manual_seed(seed)
-    seq_len = 128
     tokens = torch.randint(0, 248320, (1, seq_len), device="cuda")
     dist.broadcast(tokens, src=0)
 
     # Text-only inputs: plain sequential positions. The flex backend requires a
-    # BlockMask, which the trainer normally builds in post_dataloading_process;
-    # build it here directly since we call the model outside the trainer.
+    # BlockMask, which the model normally builds in its preprocess_inputs; build
+    # it here directly since we call the model outside the trainer.
     positions = torch.arange(seq_len, device="cuda").unsqueeze(0)
-    attention_masks = cast(Qwen35Model, model).get_attention_masks(positions=positions)
+    attention_metadata = cast(Qwen35Model, model)._get_attention_metadata(
+        positions=positions
+    )
 
     with torch.no_grad():
         output = model(
             tokens,
             positions=positions,
-            attention_masks=attention_masks,
+            attention_metadata=attention_metadata,
             special_tokens={"image_id": 248056, "video_id": 248057},
         )
-
-    if isinstance(output, DTensor):
-        output = output.full_tensor()
 
     logits = output[0, 0, :10].float().tolist()
 

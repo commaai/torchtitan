@@ -4,6 +4,9 @@
 
 This experiment demonstrates graph-based distributed training in torchtitan through toolkit-style usage of PyTorch's compiler technologies. The goal is to give users explicit control over the compiler stack in terms of performance, numerics, and debuggability during large-scale distributed training. See the [Manifesto](MANIFESTO.md) for the motivation and design philosophy behind GraphTrainer.
 
+> [!NOTE]
+> GraphTrainer users and developers are welcome to join the [public PyTorch Slack channel](https://pytorch.slack.com/archives/C0C4ZRE5BL7) for questions, discussion, and updates.
+
 **Key features:**
 - **Full train step graph capture** — `make_fx`-based `minimal_fx_tracer` traces forward + loss + backward (and optionally `optimizer.step`) into a single FX graph, without AOTAutograd partitioning, giving full visibility and control over the entire computation.
 - **[SimpleFSDP](https://arxiv.org/abs/2411.00284)** — A compiler-based FSDP that represents sharding as parameterized collectives within the computation graph, making it fully tracer-friendly while achieving memory and throughput improvements over eager FSDP2.
@@ -12,14 +15,6 @@ This experiment demonstrates graph-based distributed training in torchtitan thro
 - **Pre-compile (Compile-on-One-Rank)** — Compile on a single GPU, serialize the artifact, and load on all ranks at training time — skipping compilation entirely. Config fingerprinting detects stale artifacts.
 - **Composable parallelism** — FSDP + TP + EP in the graph, with async tensor parallel (micro-pipeline TP via symmetric memory) as an opt-in graph pass.
 - **Debug tooling** — tlparse integration for browser-based graph inspection, and CUDA graph kernel annotations in profiler traces.
-
-<details>
-<summary>Legacy compilation modes (deprecated)</summary>
-
-In addition to the default `aot_fx_trace` mode, two legacy modes exist but are deprecated and will be removed:
-- **AOT mode** (`--compile.mode aot`): Explicit joint graph export with a custom graph pass pipeline.
-- **JIT mode** (`--compile.mode jit`): Standard `torch.compile()` with graph passes registered to custom backends.
-</details>
 
 ### Prerequisites
 
@@ -34,86 +29,164 @@ You can replace `cu130` with another version of CUDA.
 #### Training Llama3-8B
 
 ```bash
-MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh
+MODULE=torchtitan_recipes.graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh
 ```
-#### Training DeepSeek-v3-16B
+#### Training DeepSeek-V3 671B Dist-MoE
 
 ```bash
-MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b ./run_train.sh
+MODULE=torchtitan_recipes.graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_671b_dist_moe_bf16 ./run_train.sh
 ```
 
 #### Training Qwen3-14B
 
 ```bash
-MODULE=graph_trainer.qwen3 CONFIG=graph_trainer_qwen3_14b ./run_train.sh
+MODULE=torchtitan_recipes.graph_trainer.qwen3 CONFIG=graph_trainer_qwen3_14b ./run_train.sh
 ```
 
 ### Configuring Parallelism
 
-#### Training Llama3-8B with 2D parallelism (FSDP and TP)
-```bash
-NGPU=8 MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --parallelism.data_parallel_shard_degree=4 --parallelism.tensor_parallel_degree=2
-```
-#### Training DeepSeek-v3-16B with 3D parallelism (FSDP, TP, and EP)
+Put parallelism choices in a recipe. For example:
 
-```bash
-NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b ./run_train.sh --parallelism.data_parallel_shard_degree=4 --parallelism.tensor_parallel_degree=2 --parallelism.expert_parallel_degree=2
+```python
+from torchtitan_recipes.graph_trainer.llama3 import (
+    graph_trainer_llama3_8b,
+)
+
+def llama3_8b_fsdp4_tp2():
+    config = graph_trainer_llama3_8b()
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.tensor_parallel_degree = 2
+    return config
 ```
+
+Launch it with `NGPU=8 MODULE=my_graph_configs
+CONFIG=llama3_8b_fsdp4_tp2 ./run_train.sh`. Use the same pattern for EP and
+other parallel axes.
+
+### GraphPP Pipeline Parallelism
+
+GraphPP is the pipeline-parallel path for GraphTrainer models.
+It reuses TorchTitan's eager PP module splitting and PyTorch PP schedules, then
+traces one representative microbatch per local stage with GraphTrainer's
+`minimal_fx_tracer`. The resulting per-stage graph bundles are reused for later
+microbatches; `GraphPipelineRuntime` only executes the prebuilt callable for each PP
+schedule action.
+
+Design references:
+- GraphPP RFC: https://github.com/pytorch/torchtitan/issues/3780
+- CUDA-graph-compatible GraphPP RFC: https://github.com/pytorch/torchtitan/issues/3820
+
+```python
+config.training.disable_cuda_graphs = True
+config.parallelism.pipeline_parallel_degree = 2
+config.parallelism.num_pp_microbatches = 8
+config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
+config.parallelism.data_parallel_shard_degree = 4
+config.parallelism.expert_parallel_degree = 2
+```
+
+Supported runtime schedules include `Interleaved1F1B`, `ZBVZeroBubble`, and
+`DualPipeV`. GraphPP builds stage-local forward/backward graphs, optional FSDP
+`UNSHARD` / `REDUCE_GRAD` graphs, optional dI/dW graphs for split backward
+schedules, and multiplexed graphs for `OVERLAP_F_B` actions. Regional and full
+Inductor compilation reuse the existing GraphTrainer compilation passes on the
+extracted GraphPP callables; GraphPP-specific handling stays in the GraphPP
+stack before those passes are invoked. Multiplexed graphs keep the forward graph
+as the destination module and ShapeEnv, insert backward placeholders/compute
+before it, and transfer backward metadata into that ShapeEnv. This preserves
+forward collective-size provenance for full Inductor without changing the shared
+compiler passes.
+
+GraphPP follows the same subclass boundary as the non-PP GraphTrainer tracer.
+Extracted graphs run on flat plain tensor leaves. Values exposed to the PP
+runtime are rewrapped from tracer metadata: stage forward outputs, input
+gradients sent to previous stages, and parameter gradients before assignment to
+live `param.grad`. Internal values remain flat because they never leave GraphPP
+graph execution: saved-for-backward tensors, unsharded FSDP params, raw grad
+leaves, reduce-grad inputs, and multiplexed intermediate outputs.
+
+Current limitations: GraphPP does not load precompile artifacts yet, and
+EP-overlap annotations will be composed with GraphPP in a later PR.
 
 ### Compiler Optimizations
 
-The `aot_fx_trace` mode has a built-in pass pipeline controlled by dedicated flags.
+GraphTrainer has a built-in pass pipeline controlled by its compile config.
 
-```bash
-# Full Inductor compilation (default is regional — compiles only tagged regions)
-MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.inductor_compilation full
-
-# Numerics-changing optimizations (e.g. RMSNorm Inductor fusion)
-MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.numerics_changing_optim
-
-# CPU activation offloading
-MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.memory_policy cpu_offload_all
-
-# Disable CUDA graphs (for debugging)
-MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.disable_passes cudagraph_pass
-
-# Disable specific passes by name
-MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.disable_passes custom_codegen_pass,cudagraph_pass
-
-# Disable all graph passes (for debugging)
-MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh --compile.no-enable_passes
+```python
+config.compile.inductor_compilation = "full"
+config.compile.numerics_changing_optim = True
+config.compile.memory_policy = "full"
+config.compile.full_recompute_save_ops = (
+    "layers.*.moe.router.gate::aten.mm.dtype | "
+    "layers.*.attention.wkv_a::aten.mm.default"
+)
+config.compile.disable_passes = ["custom_codegen_pass"]
+# To disable every optional pass:
+config.compile.enable_passes = False
 ```
+
+The graph-level CUDA graph and kernel annotation passes remain available in
+`cuda_graph.py`, but are not part of the built-in pass pipeline. Custom callers
+can apply them explicitly with `construct_cuda_graph_passes`. By default, CUDA
+graph capture is owned by the client around the complete forward/backward
+execution. Users can disable CUDA graphs with
+`config.training.disable_cuda_graphs = True`.
+
+### Expert Parallel Overlap
+
+EP overlap is an experimental graph-trainer optimization for MoE models with
+real expert-parallel collectives. Enable it only with
+`expert_parallel_degree > 1`:
+
+```python
+config.compile.ep_overlap.enabled = True
+config.compile.ep_overlap.chunk_dim = "batch"
+config.compile.ep_overlap.module_fqn = "layers.*"
+config.parallelism.data_parallel_shard_degree = 4
+config.parallelism.expert_parallel_degree = 2
+```
+
+Supported chunking selections are:
+
+- `chunk_dim="batch", module_fqn="layers.*"`
+  for transformer-block chunking.
+- `chunk_dim="batch", module_fqn="layers.*.moe"`
+  for MoE-only batch chunking.
+- `chunk_dim="seq", module_fqn="layers.*.moe"`
+  for MoE-only sequence chunking.
+
+Selected module forwards are wrapped with eager chunking before tracing; the
+chunk annotations recorded during tracing are the contract consumed by the
+EP-overlap scheduler.
+
+Current limitations:
+
+- EP overlap is only meaningful when `expert_parallel_degree > 1`.
+- Sequence chunking is restricted to `layers.*.moe`; chunking attention over
+  sequence is not supported.
+- EP overlap is validated against the tested DP/EP configurations in the
+  graph-trainer numerics and integration suites. Composability with additional
+  overlap or sharding modes should be validated with loss comparison before use.
 
 ### Experimental AutoParallel Sharding
 
 GraphTrainer can use AutoParallel to solve SPMD placement for supported models,
-then trace and compile the placed model through the regular `aot_fx_trace`
-flow. Enable it with `--compile.enable_autoparallel`; `--compile.mode
-aot_fx_trace` is required.
+then trace and compile the placed model through the regular GraphRuntime flow.
+Enable it with `config.compile.enable_autoparallel = True` in the recipe.
 
 Llama 3 debug model:
 
-```bash
-MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_debugmodel ./run_train.sh \
-  --compile.mode aot_fx_trace \
-  --compile.enable_autoparallel \
-  --parallelism.data_parallel_shard_degree 2 \
-  --parallelism.tensor_parallel_degree 2
-```
+The tested Llama 3 layout also sets data-parallel sharding and tensor
+parallelism to 2 in that recipe.
 
 DeepSeek V3 debug model:
 
-```bash
-MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel_ep ./run_train.sh \
-  --compile.mode aot_fx_trace \
-  --compile.enable_autoparallel \
-  --parallelism.data_parallel_shard_degree 4 \
-  --parallelism.expert_parallel_degree 2
-```
+The tested DeepSeek V3 layout uses data-parallel sharding 4 and expert
+parallelism 2.
 
 AutoParallel is only responsible for producing the placed model. After that,
 GraphTrainer captures the full train step with `minimal_fx_tracer` and applies
-the normal `aot_fx_trace` pipeline: the configured memory policy, selective
+the normal graph pass pipeline: the configured memory policy, selective
 activation remat, CPU offload, bucketing and overlap passes, regional or full
 Inductor compilation, CUDA graph compatibility checks, and any other enabled
 GraphTrainer passes. This keeps AutoParallel placement composable with the same
@@ -129,7 +202,8 @@ than requiring bitwise-identical losses.
 Pre-compile lets you compile AOT graphs on a single GPU and save them to disk,
 then load them on all ranks during training — skipping compilation entirely.
 This uses compile-on-one-rank (CooR) to produce a rank-agnostic artifact.
-Setting `--compile.precompile_artifact_dir` enables precompile in both steps.
+Setting `compile.precompile_artifact_dir` in the selected recipe enables
+precompile in both steps.
 
 **Artifact ephemerality:** Precompiled artifacts are tied to the exact PyTorch
 version, CUDA version, model architecture, and parallelism configuration used
@@ -138,45 +212,13 @@ Stale artifacts are detected automatically via config fingerprinting and
 will raise an error at load time. Delete old artifacts and re-run
 precompile when upgrading PyTorch or changing the model/parallelism setup.
 
-#### Llama3 (dense model)
+The integration runner contains complete Llama 3 and DeepSeek V3 precompile
+recipes and runs both the single-process compile and distributed training
+phases:
 
 ```bash
-# Step 1: precompile on a single process (needs only 1 GPU)
-python -m torchtitan.experiments.graph_trainer.precompile_main \
-    --module graph_trainer.llama3 \
-    --config graph_trainer_llama3_debugmodel \
-    --compile.precompile_artifact_dir /tmp/precompile_artifacts \
-    --parallelism.data_parallel_shard_degree 4 \
-    --parallelism.tensor_parallel_degree 2
-
-# Step 2: load and train with torchrun (uses all GPUs)
-# Uses run_train_precompile.sh which passes --virtual-local-rank to torchrun.
-NGPU=8 MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_debugmodel \
-    ./torchtitan/experiments/graph_trainer/run_train_precompile.sh \
-    --compile.precompile_artifact_dir /tmp/precompile_artifacts \
-    --parallelism.data_parallel_shard_degree 4 \
-    --parallelism.tensor_parallel_degree 2
-```
-
-#### DeepSeek-v3 (MoE model with expert parallelism)
-
-```bash
-# Step 1: precompile on a single process (needs only 1 GPU)
-python -m torchtitan.experiments.graph_trainer.precompile_main \
-    --module graph_trainer.deepseek_v3 \
-    --config graph_trainer_deepseek_v3_debugmodel \
-    --compile.precompile_artifact_dir /tmp/dsv3_precompile_artifacts \
-    --parallelism.data_parallel_shard_degree 4 \
-    --parallelism.tensor_parallel_degree 2 \
-    --parallelism.expert_parallel_degree 4
-
-# Step 2: load and train with torchrun (uses all GPUs)
-NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_debugmodel \
-    ./torchtitan/experiments/graph_trainer/run_train_precompile.sh \
-    --compile.precompile_artifact_dir /tmp/dsv3_precompile_artifacts \
-    --parallelism.data_parallel_shard_degree 4 \
-    --parallelism.tensor_parallel_degree 2 \
-    --parallelism.expert_parallel_degree 4
+python -m torchtitan.experiments.graph_trainer.tests.run_precompile_tests \
+    /tmp/precompile_test --ngpu 8
 ```
 
 <details>
@@ -196,7 +238,7 @@ filesystem path for the artifact directory in multi-node setups.
 
 ### Composability Support
 
-Composability status for `aot_fx_trace` mode:
+GraphRuntime composability status:
 
 | Feature | Support |
 | :--------: | :--------: |
@@ -208,7 +250,7 @@ Composability status for `aot_fx_trace` mode:
 |Context Parallelism| ✅ |
 |Distributed Checkpointing| ✅ |
 |CUDA Graphs| ✅ |
-|Float8/MXFP8 Training| 🚧 |
+|MXFP8 Training| 🚧 |
 |Expert Parallelism| ✅ |
 |Expert Parallelism + Activation Checkpointing| 🚧 |
 |Expert Parallelism + Pipeline Parallelism| 🚧 |

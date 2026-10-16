@@ -86,7 +86,7 @@ git log --since="<last_report_date>" --oneline -- \
     torchtitan/models/common/ \
     torchtitan/models/llama3/ \
     torchtitan/models/deepseek_v3/ \
-    torchtitan/protocols/ \
+    torchtitan/models/base/ \
     torchtitan/components/ \
     torchtitan/experiments/__init__.py
 ```
@@ -98,10 +98,11 @@ For each commit found, answer:
 - Does this change a signature or field that graph_trainer depends on?
   Key fragile surfaces:
   - `Trainer.Config` fields (dict-spread copy in `configs.py:to_graph_trainer_config`)
-  - `Trainer.post_dataloading_process()` return tuple
+  - `BaseModel.preprocess_inputs()` return tuple (inlined into
+    `Trainer.forward_backward_step`/`pp_forward_backward_step`)
   - `CompileConfig` fields (extended by `GraphTrainerCompileConfig`)
-  - `FlexAttention.forward`, `MoE.forward` signatures (monkey-patched)
-  - `ParallelDims` properties and `build_mesh()`
+  - `FlexInnerAttention.forward`, `MoE.forward` signatures (monkey-patched)
+  - `ParallelismContext` properties and `build_mesh()`
 - Does this add a new model variant that graph_trainer should consider supporting?
 - Does this unify code across models in a way that makes graph_trainer's
   per-model wrappers redundant?
@@ -217,16 +218,13 @@ Report a table:
 From the failed test's `Command:` line in the logs, produce a minimal local
 repro command. Strip the following from the original command:
 - `TORCH_TRACE=...` environment variable
-- `--dump_folder ...` flag and its value
+- `--output-dir ...` flag and its value
 - `LOG_RANK=...` environment variable
 
 The result should look like:
 
 ```bash
-NGPU=<n> ./run_train.sh \
-  --module <module> \
-  --config <config> \
-  [remaining flags...]
+NGPU=<n> MODULE=<module> CONFIG=<config> ./run_train.sh
 ```
 
 Include this repro command in the report under a "CI Failures" section.
@@ -265,7 +263,7 @@ in prior reports, only re-check if the relevant upstream files have changed
 since the last report date. For debt items already reported, verify whether
 they've been addressed; if not, carry forward.
 
-- **Stale monkey-patches**: Graph_trainer patches `FlexAttention.forward`,
+- **Stale monkey-patches**: Graph_trainer patches `FlexInnerAttention.forward`,
   `MoE.forward`, `ExpertParallel._token_dispatch/_token_combine`. Check if
   the upstream signatures have changed, making our patches do unnecessary
   work or miss new parameters.
@@ -274,7 +272,7 @@ they've been addressed; if not, carry forward.
   have appeared in recent PyTorch releases.
 - **Duplicated logic**: Check if graph_trainer reimplements anything that
   core torchtitan now provides as a shared utility. Common areas:
-  - Activation checkpointing policy (`passes.py` vs `torchtitan/distributed/activation_checkpoint.py`)
+  - Activation checkpointing policy (`passes.py` vs `torchtitan/distributed/activation_remat.py`)
   - FSDP wrapping logic (`simple_fsdp.py` vs `torchtitan/distributed/fsdp.py`)
   - Model parallelization patterns (graph_trainer's `parallelize.py` vs core's)
 - **Config drift**: Run `to_graph_trainer_config()` mentally — are there new
