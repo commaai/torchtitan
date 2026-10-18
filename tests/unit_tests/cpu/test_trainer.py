@@ -156,11 +156,14 @@ def test_microbatch_generator_preserves_labels() -> None:
             config=SimpleNamespace(
                 training=SimpleNamespace(
                     num_tokens_per_microbatch_per_dp_rank=1,
-                )
+                ),
+                profiler=SimpleNamespace(enable_profiling=False),
             ),
+            unique_ids=lambda _: (),
             metrics_processor=SimpleNamespace(
                 ntokens_since_last_log=0,
                 data_loading_times=[],
+                update_unique_ids=MagicMock(),
             ),
         ),
     )
@@ -902,6 +905,7 @@ def test_trainer_accumulates_reused_cuda_graph_losses(
         step_last_log=0,
         reset=MagicMock(),
         log=MagicMock(),
+        reduce_loss_metrics=MagicMock(return_value={}),
     )
     trainer = cast(
         TrainingEngine,
@@ -952,7 +956,7 @@ def test_trainer_accumulates_reused_cuda_graph_losses(
         6.0,
         6.0,
         4.0,
-        extra_metrics={"n_tokens_seen": 3},
+        extra_metrics={"n_samples_seen": 3},
     )
     # The first step after loading starts a new metrics window.
     metrics_processor.reset.assert_called_once()

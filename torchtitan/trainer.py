@@ -5,15 +5,23 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
-import dataclasses
 import json
 import logging
 import os
 import time
 from collections.abc import Iterable, Iterator
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import timedelta
+from itertools import repeat
 from typing import Any
+from xx.training.lib.torchtitan.metrics import MetricsProcessor
+from xx.training.lib.torchtitan.report_runner import (
+    Report,
+    ReportRunner,
+    validate_reports,
+)
+from xx.training.lib.torchtitan.runtime import set_runtime_seed
+from xx.training.lib.torchtitan.validate import Validator
 
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -22,7 +30,6 @@ from torchtitan.components.checkpointer import DATALOADER
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
-from torchtitan.components.validator import BaseValidator, Validator
 from torchtitan.config import apply_overrides, Configurable, OverrideConfig
 from torchtitan.config.validation import validate_model_training_config
 from torchtitan.distributed import utils as dist_utils
@@ -30,7 +37,7 @@ from torchtitan.distributed.cuda_graph import cuda_graphs_supported
 from torchtitan.models.base.model import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
 from torchtitan.observability import structured_logger as sl
-from torchtitan.observability.metrics import ensure_pp_loss_visible, MetricsProcessor
+from torchtitan.observability.metrics import ensure_pp_loss_visible
 from torchtitan.training_engine import TrainingEngine
 
 
@@ -43,6 +50,8 @@ class Trainer(Configurable):
     The trainer owns input, validation, and reporting policy. Its training engine
     owns model execution, optimization, checkpointing, profiling, and replay.
     """
+
+    MAX_TRAIN_HRS = 24
 
     @dataclass(kw_only=True, slots=True)
     class Config(TrainingEngine.Config):
@@ -68,6 +77,8 @@ class Trainer(Configurable):
         dataloader: BaseDataLoader.Config = field(default_factory=BaseDataLoader.Config)
         validator: Validator.Config | None = None
         dump_folder: str = "./outputs"
+        miniray: dict[str, Any] = field(default_factory=dict)
+        reports: list[Report] = field(default_factory=list)
 
         create_seed_checkpoint: bool = False
         """Initialize and save an unsharded model-only checkpoint, then exit."""
@@ -77,6 +88,17 @@ class Trainer(Configurable):
         constructed."""
 
         def __post_init__(self):
+            if self.profiler.enable_profiling:
+                self.training.steps = self.profiler.profile_freq
+                self.metrics.log_freq = 1
+                self.reports = []
+                self.checkpointer = None
+                self.validator = None
+            validate_reports(
+                self.reports,
+                checkpointer=self.checkpointer,
+                training_steps=self.training.steps,
+            )
             TrainingEngine.Config.__post_init__(self)
             if self.debug.batch_invariant:
                 raise ValueError(
@@ -105,18 +127,6 @@ class Trainer(Configurable):
                     max_num_documents=self.dataloader.max_num_documents,
                 )
 
-        def to_dict(self) -> dict[str, Any]:
-            d = {}
-            for f in dataclasses.fields(self):
-                val = getattr(self, f.name)
-                if hasattr(val, "to_dict"):
-                    d[f.name] = val.to_dict()
-                elif dataclasses.is_dataclass(val):
-                    d[f.name] = asdict(val)
-                else:
-                    d[f.name] = val
-            return d
-
         def maybe_log(self) -> None:
             if self.debug.print_config:
                 logger.info(
@@ -144,7 +154,7 @@ class Trainer(Configurable):
 
     tokenizer: BaseTokenizer
     dataloader: BaseDataLoader
-    validator: BaseValidator
+    validator: Validator
     metrics_processor: MetricsProcessor
     gradient_accumulation_steps: int
     num_pp_microbatches: int
@@ -152,6 +162,7 @@ class Trainer(Configurable):
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
     def __init__(self, config: Config):
+        self.start_time = time.monotonic()
         self.config = config
         config.model = copy.deepcopy(config.model)
         if config.override.imports:
@@ -287,7 +298,17 @@ class Trainer(Configurable):
                 pp_schedule=pp_schedule,
                 pp_has_first_stage=pp_has_first_stage,
                 pp_has_last_stage=pp_has_last_stage,
+                unique_ids=self.unique_ids,
             )
+
+        self.report_runner = ReportRunner(
+            config.reports,
+            metrics_processor=self.metrics_processor,
+            miniray=config.miniray,
+            training_id=os.getenv("REPORTERV2_TRAINING_ID") or "local",
+            enabled=config.metrics.enable_reporterv2
+            and torch.distributed.get_rank() == 0,
+        )
 
         logger.info(
             "Trainer is initialized with "
@@ -299,6 +320,9 @@ class Trainer(Configurable):
             f"(warmup {config.optim.lr_scheduler.warmup_steps})"
         )
 
+    def unique_ids(self, microbatch: TrainingMicrobatch) -> Iterable[str]:
+        return ()
+
     def microbatch_generator(
         self, data_iterable: Iterable[TrainingMicrobatch]
     ) -> Iterator[TrainingMicrobatch]:
@@ -308,6 +332,8 @@ class Trainer(Configurable):
         them to GPU when needed. This allows for more efficient memory usage
         when doing gradient accumulation.
         """
+        if self.config.profiler.enable_profiling:
+            data_iterable = repeat(data_iterable.get_dummy_batch())
         data_iterator = iter(data_iterable)
 
         while True:
@@ -325,6 +351,8 @@ class Trainer(Configurable):
             self.metrics_processor.data_loading_times.append(
                 time.perf_counter() - data_load_start
             )
+
+            self.metrics_processor.update_unique_ids(self.unique_ids(microbatch))
 
             # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield microbatch
@@ -451,9 +479,12 @@ class Trainer(Configurable):
                 global_ntokens_seen = engine.ntokens_seen
 
         extra_metrics = {
-            "n_tokens_seen": global_ntokens_seen,
+            "n_samples_seen": global_ntokens_seen,
             **lr_metrics,
             **collect_aux_loss_metrics(parallelism_context),
+            **self.metrics_processor.reduce_loss_metrics(
+                forward_backward_result.loss_metrics, global_main_loss_token_count
+            ),
         }
         self.metrics_processor.log(
             engine.num_completed_steps,
@@ -461,6 +492,11 @@ class Trainer(Configurable):
             global_max_loss,
             float(grad_norm.item()),
             extra_metrics=extra_metrics,
+        )
+
+    def set_runtime_seed(self) -> None:
+        set_runtime_seed(
+            self.engine.parallelism_context, self.engine.device, self.config.debug.seed
         )
 
     @record
@@ -471,6 +507,8 @@ class Trainer(Configurable):
         sl.log_trace_instant("training_start")
 
         engine.load_checkpoint()
+        self.metrics_processor.reset_unique_ids()
+        self.set_runtime_seed()
 
         # Capture loaded step for relative_step calculation.
         # After checkpoint load, this is the restored number of completed updates.
@@ -495,6 +533,8 @@ class Trainer(Configurable):
                     engine.save_checkpoint(
                         last_step=(engine.num_completed_steps == config.training.steps)
                     )
+
+                    self.report_runner.submit(step=engine.num_completed_steps)
 
                     # Run validation if validator is available
                     if (
@@ -530,12 +570,24 @@ class Trainer(Configurable):
         logger.info("Training completed")
 
     def should_continue_training(self) -> bool:
-        return self.engine.num_completed_steps < self.config.training.steps
+        if self.engine.num_completed_steps >= self.config.training.steps:
+            return False
+        expired = torch.tensor(
+            time.monotonic() - self.start_time >= self.MAX_TRAIN_HRS * 3600,
+            device=self.engine.device,
+        )
+        # All ranks must stop together, even if initialization took different times.
+        torch.distributed.broadcast(expired, src=0)
+        if expired.item():
+            logger.info("Training stopped after %s hours", self.MAX_TRAIN_HRS)
+            return False
+        return True
 
     def close(self) -> None:
-        if hasattr(self, "dataloader") and self.dataloader:
-            self.dataloader.close()
-        if hasattr(self, "engine"):
-            self.engine.close()
-        if hasattr(self, "metrics_processor") and self.metrics_processor:
-            self.metrics_processor.close()
+        # Flush checkpoints before waiting for reports, and reports before their logger.
+        self.dataloader.close()
+        if self.config.validator is not None:
+            self.validator.close()
+        self.engine.close()
+        self.report_runner.close()
+        self.metrics_processor.close()
