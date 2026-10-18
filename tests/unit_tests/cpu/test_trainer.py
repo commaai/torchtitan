@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 from xx.common.helpers import dump_info
-from xx.training.lib.torchtitan.helpers import SampleMicrobatch
+from xx.training.lib.torchtitan.helpers import SampleMicrobatch, unique_ids
 
 import pytest
 import torch
@@ -160,10 +160,11 @@ def test_microbatch_generator_preserves_labels() -> None:
                 ),
                 profiler=SimpleNamespace(enable_profiling=False),
             ),
+            unique_ids=unique_ids,
             metrics_processor=SimpleNamespace(
                 ntokens_since_last_log=0,
                 data_loading_times=[],
-                update_unique_ids=MagicMock(),
+                unique_id_counters={"train": MagicMock()},
             ),
         ),
     )

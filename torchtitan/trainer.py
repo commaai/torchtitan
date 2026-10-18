@@ -14,7 +14,8 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from itertools import repeat
 from typing import Any
-from xx.training.lib.torchtitan.helpers import unique_ids
+from xx.common.basedir import XX_BASEDIR
+from xx.training.lib.torchtitan.helpers import GigashuffleDataLoader, unique_ids
 from xx.training.lib.torchtitan.metrics import MetricsProcessor
 from xx.training.lib.torchtitan.report_runner import (
     Report,
@@ -22,6 +23,7 @@ from xx.training.lib.torchtitan.report_runner import (
     validate_reports,
 )
 from xx.training.lib.torchtitan.runtime import set_runtime_seed
+from xx.training.lib.torchtitan.tokenizer import NoOpTokenizer
 from xx.training.lib.torchtitan.validate import Validator
 
 import torch
@@ -30,7 +32,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.components.checkpointer import DATALOADER
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
-from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
+from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import apply_overrides, Configurable, OverrideConfig
 from torchtitan.config.validation import validate_model_training_config
 from torchtitan.distributed import utils as dist_utils
@@ -39,6 +41,7 @@ from torchtitan.models.base.model import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.metrics import ensure_pp_loss_visible
+from torchtitan.observability.profiler import Profiler
 from torchtitan.training_engine import TrainingEngine
 
 
@@ -61,6 +64,7 @@ class Trainer(Configurable):
         """
 
         model: BaseModel.Config
+        trainer: str = ""
 
         hf_assets_path: str = "./tests/assets/tokenizer"
         """
@@ -70,14 +74,27 @@ class Trainer(Configurable):
         """
 
         metrics: MetricsProcessor.Config = field(
-            default_factory=MetricsProcessor.Config
+            default_factory=lambda: MetricsProcessor.Config(
+                log_freq=16, save_freq=1024, enable_reporterv2=True
+            )
         )
-        tokenizer: BaseTokenizer.Config = field(
-            default_factory=HuggingFaceTokenizer.Config
+        profiler: Profiler.Config = field(
+            default_factory=lambda: Profiler.Config(profiler_repeat=1, profile_freq=10)
         )
-        dataloader: BaseDataLoader.Config = field(default_factory=BaseDataLoader.Config)
+        tokenizer: NoOpTokenizer.Config = field(default_factory=NoOpTokenizer.Config)
+        dataloader: GigashuffleDataLoader.Config
         validator: Validator.Config | None = None
-        dump_folder: str = "./outputs"
+        dump_folder: str = (
+            "/var/log/slurm/"
+            + os.environ["SLURM_JOB_NAME"]
+            + (
+                f"_{os.environ['SLURM_ARRAY_TASK_ID']}"
+                if "SLURM_ARRAY_TASK_ID" in os.environ
+                else ""
+            )
+            if "SLURM_JOB_ID" in os.environ
+            else XX_BASEDIR
+        )
         miniray: dict[str, Any] = field(default_factory=dict)
         reports: list[Report] = field(default_factory=list)
 
@@ -321,6 +338,9 @@ class Trainer(Configurable):
             f"(warmup {config.optim.lr_scheduler.warmup_steps})"
         )
 
+    def unique_ids(self, microbatch: TrainingMicrobatch) -> Iterable[str]:
+        return unique_ids(microbatch)
+
     def microbatch_generator(
         self, data_iterable: Iterable[TrainingMicrobatch]
     ) -> Iterator[TrainingMicrobatch]:
@@ -350,7 +370,9 @@ class Trainer(Configurable):
                 time.perf_counter() - data_load_start
             )
 
-            self.metrics_processor.update_unique_ids(unique_ids(microbatch))
+            self.metrics_processor.unique_id_counters["train"].update(
+                self.unique_ids(microbatch)
+            )
 
             # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield microbatch
@@ -500,7 +522,8 @@ class Trainer(Configurable):
         sl.log_trace_instant("training_start")
 
         engine.load_checkpoint()
-        self.metrics_processor.reset_unique_ids()
+        for counter in self.metrics_processor.unique_id_counters.values():
+            counter.reset()
         set_runtime_seed(engine.parallelism_context, engine.device, config.debug.seed)
 
         # Capture loaded step for relative_step calculation.

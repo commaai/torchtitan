@@ -38,6 +38,7 @@ class ConfigLoader:
 
     def load(self, args: list[str] | None = None) -> Configurable.Config:
         namespace = self._parser().parse_args(args)
+        self.module = namespace.module
         config = self._load_config(namespace.module, namespace.config)
 
         if namespace.override:
