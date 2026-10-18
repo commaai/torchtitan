@@ -522,8 +522,6 @@ class Trainer(Configurable):
         sl.log_trace_instant("training_start")
 
         engine.load_checkpoint()
-        for counter in self.metrics_processor.unique_id_counters.values():
-            counter.reset()
         set_runtime_seed(engine.parallelism_context, engine.device, config.debug.seed)
 
         # Capture loaded step for relative_step calculation.
