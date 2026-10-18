@@ -162,6 +162,7 @@ class Trainer(Configurable):
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
     def __init__(self, config: Config):
+        training_id = os.environ["REPORTERV2_TRAINING_ID"]
         self.start_time = time.monotonic()
         self.config = config
         config.model = copy.deepcopy(config.model)
@@ -305,7 +306,7 @@ class Trainer(Configurable):
             config.reports,
             metrics_processor=self.metrics_processor,
             miniray=config.miniray,
-            training_id=os.getenv("REPORTERV2_TRAINING_ID") or "local",
+            training_id=training_id,
             enabled=config.metrics.enable_reporterv2
             and torch.distributed.get_rank() == 0,
         )
@@ -494,11 +495,6 @@ class Trainer(Configurable):
             extra_metrics=extra_metrics,
         )
 
-    def set_runtime_seed(self) -> None:
-        set_runtime_seed(
-            self.engine.parallelism_context, self.engine.device, self.config.debug.seed
-        )
-
     @record
     def train(self):
         config = self.config
@@ -508,7 +504,7 @@ class Trainer(Configurable):
 
         engine.load_checkpoint()
         self.metrics_processor.reset_unique_ids()
-        self.set_runtime_seed()
+        set_runtime_seed(engine.parallelism_context, engine.device, config.debug.seed)
 
         # Capture loaded step for relative_step calculation.
         # After checkpoint load, this is the restored number of completed updates.
@@ -570,18 +566,12 @@ class Trainer(Configurable):
         logger.info("Training completed")
 
     def should_continue_training(self) -> bool:
-        if self.engine.num_completed_steps >= self.config.training.steps:
+        if time.monotonic() - self.start_time > self.MAX_TRAIN_HRS * 60 * 60:
+            logger.info(
+                f"Your training run took over {self.MAX_TRAIN_HRS}hrs and was killed"
+            )
             return False
-        expired = torch.tensor(
-            time.monotonic() - self.start_time >= self.MAX_TRAIN_HRS * 3600,
-            device=self.engine.device,
-        )
-        # All ranks must stop together, even if initialization took different times.
-        torch.distributed.broadcast(expired, src=0)
-        if expired.item():
-            logger.info("Training stopped after %s hours", self.MAX_TRAIN_HRS)
-            return False
-        return True
+        return self.engine.num_completed_steps < self.config.training.steps
 
     def close(self) -> None:
         # Flush checkpoints before waiting for reports, and reports before their logger.
