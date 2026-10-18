@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from itertools import repeat
 from typing import Any
+from xx.training.lib.torchtitan.helpers import unique_ids
 from xx.training.lib.torchtitan.metrics import MetricsProcessor
 from xx.training.lib.torchtitan.report_runner import (
     Report,
@@ -299,7 +300,6 @@ class Trainer(Configurable):
                 pp_schedule=pp_schedule,
                 pp_has_first_stage=pp_has_first_stage,
                 pp_has_last_stage=pp_has_last_stage,
-                unique_ids=self.unique_ids,
             )
 
         self.report_runner = ReportRunner(
@@ -320,9 +320,6 @@ class Trainer(Configurable):
             f"total steps {config.training.steps} "
             f"(warmup {config.optim.lr_scheduler.warmup_steps})"
         )
-
-    def unique_ids(self, microbatch: TrainingMicrobatch) -> Iterable[str]:
-        return ()
 
     def microbatch_generator(
         self, data_iterable: Iterable[TrainingMicrobatch]
@@ -353,7 +350,7 @@ class Trainer(Configurable):
                 time.perf_counter() - data_load_start
             )
 
-            self.metrics_processor.update_unique_ids(self.unique_ids(microbatch))
+            self.metrics_processor.update_unique_ids(unique_ids(microbatch))
 
             # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield microbatch

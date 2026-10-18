@@ -12,6 +12,8 @@ from functools import partial
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
+from xx.common.helpers import dump_info
+from xx.training.lib.torchtitan.helpers import SampleMicrobatch
 
 import pytest
 import torch
@@ -141,14 +143,13 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
 
 
 def test_microbatch_generator_preserves_labels() -> None:
-    labels = torch.ones(1, dtype=torch.long)
-    microbatch = TokenizedTrainingMicrobatch(
-        input=torch.ones(1),
+    labels = {"out": torch.ones(1, dtype=torch.long)}
+    microbatch = SampleMicrobatch(
+        inputs={
+            "input": torch.ones(1),
+            "info": torch.from_numpy(dump_info({"name": "sample"})).unsqueeze(0),
+        },
         labels=labels,
-        positions=torch.zeros(1, dtype=torch.long),
-        padding_mask=torch.zeros(1, dtype=torch.bool),
-        loss_token_counts=torch.tensor(1),
-        routing_token_counts=torch.tensor([1]),
     )
     trainer = cast(
         Trainer,
@@ -159,7 +160,6 @@ def test_microbatch_generator_preserves_labels() -> None:
                 ),
                 profiler=SimpleNamespace(enable_profiling=False),
             ),
-            unique_ids=lambda _: (),
             metrics_processor=SimpleNamespace(
                 ntokens_since_last_log=0,
                 data_loading_times=[],
