@@ -592,7 +592,6 @@ class Trainer(Configurable):
         return self.engine.num_completed_steps < self.config.training.steps
 
     def close(self) -> None:
-        # Flush checkpoints before waiting for reports, and reports before their logger.
         self.dataloader.close()
         if self.config.validator is not None:
             self.validator.close()
