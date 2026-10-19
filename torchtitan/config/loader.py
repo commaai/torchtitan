@@ -38,15 +38,8 @@ class ConfigLoader:
 
     def load(self, args: list[str] | None = None) -> Configurable.Config:
         namespace = self._parser().parse_args(args)
+        self.module = namespace.module
         config = self._load_config(namespace.module, namespace.config)
-
-        # Trainer imports config, so this import must stay local.
-        from torchtitan.trainer import Trainer
-
-        if isinstance(config, Trainer.Config):
-            config.trainer = namespace.module.removesuffix(".config_registry").rsplit(
-                ".", 1
-            )[-1]
 
         if namespace.override:
             override_config = getattr(config, "override", None)

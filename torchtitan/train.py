@@ -30,7 +30,11 @@ def main() -> None:
         torchtitan.__version__,
     )
 
-    config = cast(Trainer.Config, ConfigLoader().load())
+    config_loader = ConfigLoader()
+    config = cast(Trainer.Config, config_loader.load())
+    config.trainer = config_loader.module.removesuffix(".config_registry").rsplit(
+        ".", 1
+    )[-1]
 
     # NOTE: internal meta tooling relies on source="training".
     sl.init_structured_logger(
