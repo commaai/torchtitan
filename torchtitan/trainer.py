@@ -24,6 +24,7 @@ from xx.training.lib.torchtitan.report_runner import (
 )
 from xx.training.lib.torchtitan.runtime import set_runtime_seed
 from xx.training.lib.torchtitan.tokenizer import NoOpTokenizer
+from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
 from xx.training.lib.torchtitan.validate import Validator
 
 import torch
@@ -259,6 +260,7 @@ class Trainer(Configurable):
             max_context_length=config.training.max_context_length,
             num_tokens_per_microbatch=num_tokens_per_microbatch,
         )
+        self.unique_id_counter = StringUniqueCounter("train")
 
         try:
             engine.initialize(
@@ -370,9 +372,7 @@ class Trainer(Configurable):
                 time.perf_counter() - data_load_start
             )
 
-            self.metrics_processor.unique_id_counters["train"].update(
-                self.unique_ids(microbatch)
-            )
+            self.unique_id_counter.update(self.unique_ids(microbatch))
 
             # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield microbatch
@@ -498,8 +498,14 @@ class Trainer(Configurable):
                 global_avg_loss = global_max_loss = float(accumulated_loss.item())
                 global_ntokens_seen = engine.ntokens_seen
 
+            dp_mesh = parallelism_context.get_optional_mesh("dp")
+            unique_count = self.unique_id_counter.global_count(
+                dp_mesh.get_group() if dp_mesh is not None else None
+            )
+
         extra_metrics = {
             "n_samples_seen": global_ntokens_seen,
+            "dataset/unique_segments_seen": unique_count,
             **lr_metrics,
             **collect_aux_loss_metrics(parallelism_context),
             **self.metrics_processor.reduce_loss_metrics(

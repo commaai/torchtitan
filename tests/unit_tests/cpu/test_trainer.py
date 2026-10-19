@@ -139,6 +139,7 @@ def _training_loop(trainer: TrainingEngine) -> SimpleNamespace:
         gradient_accumulation_steps=trainer.gradient_accumulation_steps,
         num_pp_microbatches=trainer.num_pp_microbatches,
         metrics_processor=trainer.metrics_processor,
+        unique_id_counter=MagicMock(global_count=MagicMock(return_value=0)),
     )
 
 
@@ -161,10 +162,10 @@ def test_microbatch_generator_preserves_labels() -> None:
                 profiler=SimpleNamespace(enable_profiling=False),
             ),
             unique_ids=unique_ids,
+            unique_id_counter=MagicMock(),
             metrics_processor=SimpleNamespace(
                 ntokens_since_last_log=0,
                 data_loading_times=[],
-                unique_id_counters={"train": MagicMock()},
             ),
         ),
     )
@@ -174,6 +175,7 @@ def test_microbatch_generator_preserves_labels() -> None:
     assert output is microbatch
     assert output.labels is labels
     assert trainer.metrics_processor.ntokens_since_last_log == 1
+    trainer.unique_id_counter.update.assert_called_once_with(["sample"])
 
 
 def test_pp_forward_backward_microbatch_group_returns_sentinel_without_last_stage(
@@ -957,7 +959,7 @@ def test_trainer_accumulates_reused_cuda_graph_losses(
         6.0,
         6.0,
         4.0,
-        extra_metrics={"n_samples_seen": 3},
+        extra_metrics={"n_samples_seen": 3, "dataset/unique_segments_seen": 0},
     )
     # The first step after loading starts a new metrics window.
     metrics_processor.reset.assert_called_once()
