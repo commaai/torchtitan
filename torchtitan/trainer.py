@@ -322,11 +322,13 @@ class Trainer(Configurable):
                 pp_has_last_stage=pp_has_last_stage,
             )
 
+        miniray = dict(config.miniray)
+        if "SLURM_JOB_ID" in os.environ:
+            miniray.setdefault("codedir", self.codedir)
         self.report_runner = ReportRunner(
             config.reports,
             metrics_processor=self.metrics_processor,
-            miniray=config.miniray,
-            codedir=self.codedir,
+            miniray=miniray,
             training_id=training_id,
             enabled=config.metrics.enable_reporterv2
             and torch.distributed.get_rank() == 0,
