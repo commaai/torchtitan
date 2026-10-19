@@ -184,6 +184,7 @@ class Trainer(Configurable):
         training_id = os.environ["REPORTERV2_TRAINING_ID"]
         self.start_time = time.monotonic()
         self.config = config
+        self.codedir = XX_BASEDIR
         config.model = copy.deepcopy(config.model)
         if config.override.imports:
             apply_overrides(config.override, config)
@@ -325,6 +326,7 @@ class Trainer(Configurable):
             config.reports,
             metrics_processor=self.metrics_processor,
             miniray=config.miniray,
+            codedir=self.codedir,
             training_id=training_id,
             enabled=config.metrics.enable_reporterv2
             and torch.distributed.get_rank() == 0,
