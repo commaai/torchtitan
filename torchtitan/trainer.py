@@ -22,7 +22,6 @@ from xx.training.lib.torchtitan.report_runner import (
     ReportRunner,
     validate_reports,
 )
-from xx.training.lib.torchtitan.runtime import set_runtime_seed
 from xx.training.lib.torchtitan.tokenizer import NoOpTokenizer
 from xx.training.lib.torchtitan.unique_counter import StringUniqueCounter
 from xx.training.lib.torchtitan.validate import Validator
@@ -532,7 +531,12 @@ class Trainer(Configurable):
         sl.log_trace_instant("training_start")
 
         engine.load_checkpoint()
-        set_runtime_seed(engine.parallelism_context, engine.device, config.debug.seed)
+        dist_utils.set_determinism(
+            engine.parallelism_context,
+            engine.device,
+            config.debug,
+            distinct_seed_mesh_axes=["dp", "pp"],
+        )
 
         # Capture loaded step for relative_step calculation.
         # After checkpoint load, this is the restored number of completed updates.
