@@ -254,6 +254,7 @@ class Trainer(Configurable):
             config.training.num_tokens_per_microbatch_per_dp_rank
         )
         self.dataloader = config.dataloader.build(
+            codedir=self.codedir,
             dp_world_size=dp_degree,
             dp_rank=dp_rank,
             tokenizer=self.tokenizer,
