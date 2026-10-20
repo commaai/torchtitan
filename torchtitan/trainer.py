@@ -260,6 +260,7 @@ class Trainer(Configurable):
             tokenizer=self.tokenizer,
             max_context_length=config.training.max_context_length,
             num_tokens_per_microbatch=num_tokens_per_microbatch,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
         )
         self.unique_id_counter = StringUniqueCounter("train")
 
