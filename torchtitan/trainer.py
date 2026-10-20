@@ -524,6 +524,10 @@ class Trainer(Configurable):
             extra_metrics=extra_metrics,
         )
 
+    def on_checkpoint_loaded(self, loaded: bool) -> None:
+        """Run trainer-specific startup work before runtime reseeding and data iteration."""
+        pass
+
     @record
     def train(self):
         config = self.config
@@ -531,7 +535,7 @@ class Trainer(Configurable):
 
         sl.log_trace_instant("training_start")
 
-        engine.load_checkpoint()
+        self.on_checkpoint_loaded(engine.load_checkpoint())
         dist_utils.set_determinism(
             engine.parallelism_context,
             engine.device,
