@@ -529,6 +529,14 @@ class Trainer(Configurable):
         """Run trainer-specific startup work before runtime reseeding and data iteration."""
         pass
 
+    def set_runtime_seed(self) -> None:
+        dist_utils.set_determinism(
+            self.engine.parallelism_context,
+            self.engine.device,
+            self.config.debug,
+            distinct_seed_mesh_axes=["dp", "pp"],
+        )
+
     @record
     def train(self):
         config = self.config
@@ -537,12 +545,7 @@ class Trainer(Configurable):
         sl.log_trace_instant("training_start")
 
         self.on_checkpoint_loaded(engine.load_checkpoint())
-        dist_utils.set_determinism(
-            engine.parallelism_context,
-            engine.device,
-            config.debug,
-            distinct_seed_mesh_axes=["dp", "pp"],
-        )
+        self.set_runtime_seed()
 
         # Capture loaded step for relative_step calculation.
         # After checkpoint load, this is the restored number of completed updates.
