@@ -44,6 +44,9 @@ install_pip_dependencies() {
   pip_install -r /opt/conda/requirements-flux.txt
   pip_install -r /opt/conda/requirements-vlm.txt
   pip_install -r /opt/conda/requirements-transformers-modeling-backend.txt
+  if [[ "${INSTALL_RL_DEPS:-0}" == "1" ]]; then
+    pip_install -r /opt/conda/requirements-rl.txt
+  fi
   popd
 }
 

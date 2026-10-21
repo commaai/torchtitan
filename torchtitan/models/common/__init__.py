@@ -4,54 +4,68 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from .activation import (
+    BinaryActivationFn,
+    ClampedSwiGLU,
+    Sigmoid,
+    SiLU,
+    SiTUGLU,
+    Softmax,
+    SqrtSoftplus,
+    SwiGLU,
+    UnaryActivationFn,
+)
 from .attention import (
-    BaseQKVLinear,
+    AttentionMetadata,
+    AttentionMetadataMap,
     create_attention_mask,
     create_varlen_metadata_for_document,
-    FlexAttention,
-    FusedQKVLinear,
+    FlexAttentionMetadata,
+    FlexInnerAttention,
     get_causal_mask_mod,
     get_document_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
     get_fixed_block_mask_mod,
     get_sliding_window_mask_mod,
     GQAttention,
+    InnerAttention,
+    LinearAttentionMetadata,
     QKVLinear,
-    ScaledDotProductAttention,
-    VarlenAttention,
-    VarlenMetadata,
+    SlidingWindowFlexInnerAttention,
+    VarlenAttentionMetadata,
+    VarlenInnerAttention,
 )
 from .decoder import Decoder, TransformerBlock
 from .embedding import Embedding
 from .feed_forward import compute_ffn_hidden_dim, FeedForward
-from .moe import MoE
-from .nn_modules import (
-    Conv1d,
-    Conv2d,
-    GELU,
-    GroupNorm,
-    Identity,
-    LayerNorm,
-    Linear,
-    RMSNorm,
-    SiLU,
-)
+from .hi_mid_lo_linear import HiMidLoLinear
+from .linear import ColumnParallelLinear, GroupedLinear, Linear, RowParallelLinear
+from .moe import BatchWiseLoadBalanceLoss, MicrobatchWiseLoadBalanceLoss, MoE
+from .multimodal import MultimodalModel
+from .nn_modules import Conv1d, Conv2d, GELU, GroupNorm, Identity, LayerNorm, RMSNorm
+from .norm import GatedRMSNorm
 from .rope import ComplexRoPE, CosSinRoPE, RoPE
 
 __all__ = [
+    "AttentionMetadata",
+    "AttentionMetadataMap",
     "Conv1d",
     "Conv2d",
     "ComplexRoPE",
+    "ClampedSwiGLU",
+    "ColumnParallelLinear",
     "CosSinRoPE",
     "create_attention_mask",
     "create_varlen_metadata_for_document",
     "Decoder",
     "Embedding",
     "FeedForward",
-    "FlexAttention",
-    "BaseQKVLinear",
-    "FusedQKVLinear",
+    "FlexAttentionMetadata",
+    "FlexInnerAttention",
+    "HiMidLoLinear",
+    "QKVLinear",
     "GELU",
+    "GatedRMSNorm",
     "get_causal_mask_mod",
     "get_document_mask_mod",
     "get_efficient_causal_mask_mod_for_packed_document",
@@ -59,17 +73,30 @@ __all__ = [
     "get_sliding_window_mask_mod",
     "GQAttention",
     "GroupNorm",
+    "GroupedLinear",
     "Identity",
+    "InnerAttention",
     "LayerNorm",
     "Linear",
+    "LinearAttentionMetadata",
+    "BatchWiseLoadBalanceLoss",
     "MoE",
-    "QKVLinear",
+    "MicrobatchWiseLoadBalanceLoss",
+    "MultimodalModel",
     "RMSNorm",
     "RoPE",
-    "ScaledDotProductAttention",
+    "RowParallelLinear",
+    "SlidingWindowFlexInnerAttention",
+    "Sigmoid",
     "SiLU",
+    "BinaryActivationFn",
+    "SiTUGLU",
+    "Softmax",
+    "SqrtSoftplus",
+    "SwiGLU",
     "TransformerBlock",
-    "VarlenAttention",
-    "VarlenMetadata",
+    "UnaryActivationFn",
+    "VarlenInnerAttention",
+    "VarlenAttentionMetadata",
     "compute_ffn_hidden_dim",
 ]

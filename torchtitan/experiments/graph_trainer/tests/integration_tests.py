@@ -5,326 +5,462 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+import dataclasses
 import os
 
-from tests.integration_tests import OverrideDefinitions
+from tests.integration_tests import IntegrationTestDefinition
 from tests.integration_tests.run_tests import run_tests
+from torchtitan_recipes.graph_trainer.llama3 import graph_trainer_llama3_8b
 
-# TODO: JIT mode tests are disabled due to an upstream PyTorch
-# partitioner regression ("Node tangents_2 was invalid, but is output")
-# triggered by the full DTensor change (#2149). Re-enable once the
-# partitioner issue is resolved.
-_JIT_DISABLED = True
+from torchtitan_recipes.tests.graph_trainer import (
+    b200 as b200_recipes,
+    deepseek_v3 as deepseek_v3_recipes,
+    llama3 as llama3_recipes,
+    muse_glimmer as muse_glimmer_recipes,
+    qwen3 as qwen3_recipes,
+)
+
+from torchtitan.models.common.moe import (
+    RoundRobinTokenChoiceTopKRouter,
+    TokenChoiceTopKRouter,
+)
+
+# TODO: Re-enable after regional_inductor can trace the CP load balancer's
+# index-rearrange constants; it currently raises a FunctionalTensor error.
+_FLEX_CP_INDUCTOR_DISABLED = True
 
 
-def _build_llama3_tests() -> list[OverrideDefinitions]:
+def llama3_fsdp_tp_cp():
+    config = llama3_recipes.graph_trainer_llama3_debugmodel()
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.context_parallel_degree = 2
+    return config
+
+
+def llama3_fsdp_tp():
+    config = llama3_recipes.graph_trainer_llama3_debugmodel()
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.tensor_parallel_degree = 2
+    return config
+
+
+def llama3_spmd_gradient_accumulation():
+    config = llama3_recipes.graph_trainer_llama3_debugmodel()
+    config.training.num_tokens_per_microbatch_per_dp_rank = 2048
+    config.training.num_tokens_per_train_step = 4096
+    return config
+
+
+def _llama3_fsdp_collectives(*, param_unshard_mode: str, grad_reduce_mode: str):
+    config = llama3_recipes.graph_trainer_llama3_debugmodel()
+    config.compile.spmd_gradient_accumulation.fsdp_param_unshard_mode = (
+        param_unshard_mode
+    )
+    config.compile.spmd_gradient_accumulation.fsdp_grad_reduce_mode = grad_reduce_mode
+    config.parallelism.data_parallel_shard_degree = 4
+    config.training.num_tokens_per_microbatch_per_dp_rank = 2048
+    config.training.num_tokens_per_train_step = 16384
+    return config
+
+
+def llama3_ga_per_microbatch_fsdp_collectives():
+    return _llama3_fsdp_collectives(
+        param_unshard_mode="every_microbatch",
+        grad_reduce_mode="every_microbatch",
+    )
+
+
+def llama3_ga_first_unshard_last_reduce_fsdp_collectives():
+    return _llama3_fsdp_collectives(
+        param_unshard_mode="first_microbatch",
+        grad_reduce_mode="last_microbatch",
+    )
+
+
+def llama3_fsdp_tp_sac_and_offload():
+    config = llama3_fsdp_tp()
+    config.compile.memory_policy = "sac_and_offload"
+    return config
+
+
+def llama3_fsdp_tp_regional_inductor():
+    config = llama3_fsdp_tp()
+    config.compile.inductor_compilation = "regional"
+    return config
+
+
+def deepseek_v3_fused_mla_swiglu_fsdp_tp_ep():
+    config = deepseek_v3_recipes.graph_trainer_deepseek_v3_debugmodel()
+    config.training.disable_cuda_graphs = True
+    config.compile.disable_passes = [
+        "joint_transformer_block_bucketing_reordering_pass",
+    ]
+    config.override.imports = [
+        "torchtitan_recipes.overrides.fused_mla.fused_mla",
+        "torchtitan_recipes.overrides.fused_swiglu.fused_swiglu",
+    ]
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.expert_parallel_degree = 2
+    return config
+
+
+def deepseek_v3_hsdp_edp_shard_ep():
+    config = deepseek_v3_recipes.graph_trainer_deepseek_v3_debugmodel()
+    config.training.disable_cuda_graphs = True
+    config.parallelism.data_parallel_replicate_degree = 2
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.expert_parallel_degree = 2
+    return config
+
+
+def deepseek_v3_fsdp_tp_cp_ep():
+    config = deepseek_v3_recipes.graph_trainer_deepseek_v3_debugmodel()
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.context_parallel_degree = 2
+    config.parallelism.expert_parallel_degree = 4
+    return config
+
+
+def deepseek_v3_fsdp_tp_ep():
+    config = deepseek_v3_recipes.graph_trainer_deepseek_v3_debugmodel()
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.expert_parallel_degree = 4
+    return config
+
+
+def deepseek_v3_fsdp_tp_ep_regional_inductor():
+    config = deepseek_v3_fsdp_tp_ep()
+    config.compile.inductor_compilation = "regional"
+    return config
+
+
+def _deepseek_v3_ep_overlap(
+    *, inductor_compilation: str, chunk_dim: str, module_fqn: str
+):
+    config = deepseek_v3_recipes.graph_trainer_deepseek_v3_debugmodel()
+    config.training.disable_cuda_graphs = True
+    config.compile.inductor_compilation = inductor_compilation
+    config.compile.ep_overlap.enabled = True
+    config.compile.ep_overlap.chunk_dim = chunk_dim
+    config.compile.ep_overlap.module_fqn = module_fqn
+    config.parallelism.data_parallel_shard_degree = 8
+    config.parallelism.tensor_parallel_degree = 1
+    config.parallelism.expert_parallel_degree = 4
+    return config
+
+
+def deepseek_v3_regional_ep_overlap_transformer_batch():
+    return _deepseek_v3_ep_overlap(
+        inductor_compilation="regional", chunk_dim="batch", module_fqn="layers.*"
+    )
+
+
+def deepseek_v3_regional_ep_overlap_moe_batch():
+    return _deepseek_v3_ep_overlap(
+        inductor_compilation="regional",
+        chunk_dim="batch",
+        module_fqn="layers.*.moe",
+    )
+
+
+def deepseek_v3_regional_ep_overlap_moe_seq():
+    return _deepseek_v3_ep_overlap(
+        inductor_compilation="regional",
+        chunk_dim="seq",
+        module_fqn="layers.*.moe",
+    )
+
+
+def deepseek_v3_full_ep_overlap_transformer_batch():
+    return _deepseek_v3_ep_overlap(
+        inductor_compilation="full", chunk_dim="batch", module_fqn="layers.*"
+    )
+
+
+def deepseek_v3_full_ep_overlap_moe_batch():
+    return _deepseek_v3_ep_overlap(
+        inductor_compilation="full",
+        chunk_dim="batch",
+        module_fqn="layers.*.moe",
+    )
+
+
+def deepseek_v3_full_ep_overlap_moe_seq():
+    return _deepseek_v3_ep_overlap(
+        inductor_compilation="full", chunk_dim="seq", module_fqn="layers.*.moe"
+    )
+
+
+def deepseek_v3_graph_pp_interleaved_1f1b():
+    return _deepseek_v3_graph_pp("Interleaved1F1B")
+
+
+def deepseek_v3_graph_pp_zbv_zero_bubble():
+    return _deepseek_v3_graph_pp("ZBVZeroBubble")
+
+
+def deepseek_v3_graph_pp_dual_pipe_v():
+    return _deepseek_v3_graph_pp("DualPipeV")
+
+
+def _deepseek_v3_graph_pp(schedule: str):
+    config = deepseek_v3_recipes.graph_trainer_deepseek_v3_debugmodel()
+    config.training.disable_cuda_graphs = True
+    config.training.num_tokens_per_microbatch_per_dp_rank = 2048
+    config.compile.inductor_compilation = "full"
+    config.parallelism.pipeline_parallel_degree = 2
+    config.parallelism.num_pp_microbatches = 8
+    config.parallelism.pipeline_parallel_schedule = schedule
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.expert_parallel_degree = 2
+    return config
+
+
+def _round_robin_routing(config):
+    """Route token-expert assignments round-robin, with exact balance."""
+    router_fields = dataclasses.fields(TokenChoiceTopKRouter.Config)
+    for layer in config.model.layers:
+        if getattr(layer, "moe", None) is not None:
+            router = layer.moe.router
+            layer.moe.router = RoundRobinTokenChoiceTopKRouter.Config(
+                **{f.name: getattr(router, f.name) for f in router_fields}
+            )
+    return config
+
+
+def deepseek_v3_hybrid_ep_paged_stash():
+    config = deepseek_v3_recipes.graph_trainer_deepseek_v3_debugmodel_hybridep()
+    # Paged stash may release and reallocate buffers after an overflow.
+    config.training.disable_cuda_graphs = True
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.expert_parallel_degree = 2
+    config.compile.memory_policy = "sac_and_paged_stash"
+    return _round_robin_routing(config)
+
+
+def deepseek_v3_graph_pp_hybrid_ep_paged_stash():
+    config = deepseek_v3_recipes.graph_trainer_deepseek_v3_debugmodel_hybridep()
+    config.training.disable_cuda_graphs = True
+    config.parallelism.pipeline_parallel_degree = 2
+    config.parallelism.num_pp_microbatches = 4
+    config.parallelism.pipeline_parallel_schedule = "Interleaved1F1B"
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.expert_parallel_degree = 2
+    config.compile.memory_policy = "sac_and_paged_stash"
+    return _round_robin_routing(config)
+
+
+def qwen3_fsdp_tp_cp():
+    config = qwen3_recipes.graph_trainer_qwen3_debugmodel()
+    config.training.disable_cuda_graphs = True
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.context_parallel_degree = 2
+    return config
+
+
+def qwen3_moe_fsdp_tp_ep():
+    config = qwen3_recipes.graph_trainer_qwen3_debugmodel_moe()
+    config.training.disable_cuda_graphs = True
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.tensor_parallel_degree = 2
+    config.parallelism.expert_parallel_degree = 4
+    return config
+
+
+def muse_glimmer_fsdp():
+    config = muse_glimmer_recipes.graph_trainer_muse_glimmer_debugmodel()
+    config.parallelism.data_parallel_shard_degree = 8
+    return config
+
+
+def muse_glimmer_fsdp_tp():
+    config = muse_glimmer_recipes.graph_trainer_muse_glimmer_debugmodel()
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.tensor_parallel_degree = 2
+    return config
+
+
+def llama3_fsdp_tp_async_tp():
+    config = graph_trainer_llama3_8b(seq_len=512)
+    config.compile.enable_async_tensor_parallel = True
+    config.training.num_tokens_per_microbatch_per_dp_rank = 1024
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.tensor_parallel_degree = 2
+    config.hf_assets_path = "./tests/assets/tokenizer"
+    return config
+
+
+def llama3_autoparallel_fsdp_tp():
+    config = llama3_recipes.graph_trainer_llama3_debugmodel_varlen_cross_entropy_loss()
+    config.compile.enable_autoparallel = True
+    config.parallelism.data_parallel_shard_degree = 2
+    config.parallelism.tensor_parallel_degree = 2
+    return config
+
+
+def deepseek_v3_autoparallel_edp_shard_ep():
+    config = deepseek_v3_recipes.graph_trainer_deepseek_v3_debugmodel()
+    config.compile.enable_autoparallel = True
+    config.parallelism.data_parallel_shard_degree = 4
+    config.parallelism.expert_parallel_degree = 2
+    return config
+
+
+def _build_llama3_tests() -> list[IntegrationTestDefinition]:
     """Llama3-based integration tests (run on default A10 machines)."""
     return [
-        # === JIT mode tests ===
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--compile.backend aot_eager",
-                    "--compile.passes=auto_bucketing",
-                ],
-            ],
-            "JIT 1D+auto_bucketing",
-            "jit_1d_auto_bucketing",
-            disabled=_JIT_DISABLED,
+        IntegrationTestDefinition(
+            configs=[llama3_recipes.graph_trainer_llama3_debugmodel_sdc_replay],
+            test_descr="GraphTrainer SDC replay",
+            test_name="sdc_replay",
+            ngpu=1,
+            skip_rocm_test=True,
         ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--compile.backend aot_eager",
-                    "--compile.passes=transformer_block_bucketing",
-                ],
-            ],
-            "JIT 1D+transformer_block_bucketing",
-            "jit_1d_transformer_block_bucketing",
-            disabled=_JIT_DISABLED,
-        ),
-        # TODO: re-enable this test once the async TP issue is fixed
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.enable_async_tensor_parallel",
-                ],
-            ],
-            "JIT 2D async TP",
-            "jit_2d_asynctp",
-            disabled=True,
-        ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--checkpoint.enable",
-                    "--parallelism.pipeline_parallel_degree 2",
-                    "--parallelism.data_parallel_shard_degree 2",
-                    "--parallelism.tensor_parallel_degree 2",
-                ],
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--training.steps 20",
-                    "--checkpoint.enable",
-                    "--parallelism.pipeline_parallel_degree 2",
-                    "--parallelism.data_parallel_shard_degree 2",
-                    "--parallelism.tensor_parallel_degree 2",
-                ],
-            ],
-            "JIT PP+DP+TP 3D test with save/load resume ckpt",
-            "jit_pp_dp_tp",
-            ngpu=8,
-            disabled=_JIT_DISABLED,
-        ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--parallelism.data_parallel_shard_degree 2",
-                    "--parallelism.data_parallel_replicate_degree 2",
-                    "--parallelism.tensor_parallel_degree 2",
-                ]
-            ],
-            "JIT HSDP+TP",
-            "jit_hsdp+tp",
-            ngpu=8,
-            disabled=_JIT_DISABLED,
-        ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--parallelism.data_parallel_shard_degree 2",
-                    "--parallelism.data_parallel_replicate_degree 2",
-                    "--parallelism.context_parallel_degree 2",
-                ]
-            ],
-            "JIT HSDP+CP (with dp_shard)",
-            "jit_hsdp+cp_with_dp_shard",
-            ngpu=8,
-            disabled=_JIT_DISABLED,
-        ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--parallelism.data_parallel_shard_degree 2",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.context_parallel_degree 2",
-                ]
-            ],
-            "JIT FSDP+TP+CP",
-            "jit_fsdp+tp+cp",
-            ngpu=8,
-            disabled=_JIT_DISABLED,
-        ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--checkpoint.enable",
-                    "--training.steps 10",
-                ],
-                # Save at [dp:4] and load at [dp:2, tp:2]. Note that the dataloader should be
-                # excluded during loading to avoid errors caused by mismatched dp_degree.
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--checkpoint.enable",
-                    "--checkpoint.exclude_from_loading lr_scheduler,dataloader,optimizer",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--training.steps 20",
-                ],
-                # load at [tp:4].
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode jit",
-                    "--checkpoint.enable",
-                    "--checkpoint.exclude_from_loading lr_scheduler,dataloader,optimizer",
-                    "--parallelism.tensor_parallel_degree 4",
-                    "--training.steps 30",
-                ],
-            ],
-            "JIT Optional checkpoint",
-            "jit_optional_checkpoint",
-            ngpu=4,
-            disabled=_JIT_DISABLED,
-        ),
-        # === aot_fx_trace mode tests ===
-        # Note: aot_fx_trace applies cudagraph by default, so skip_rocm_test=True.
+        # === GraphRuntime tests ===
+        # Note: aot_fx_trace applies CUDA graph by default, so skip_rocm_test=True.
         #
-        # Uses the SDPA backend: the default FlexAttention + CP +
-        # regional_inductor combination is not yet supported — the CP load
-        # balancer injects an index-rearrange constant (torch
-        # _context_parallel/_attention.py qkv_rearrange_indices) that
-        # regional_inductor's make_fx re-trace cannot lift ("Attempting to use
-        # FunctionalTensor on its own"). SDPA has native CP support and no such
-        # constant, so it exercises the CP graph path. cudagraph is disabled
-        # here: CUDA-graph replay of the coalesced FSDP collectives fails under
-        # CP with "CUDA error: invalid argument".
-        # TODO: re-test on FlexAttention once flex + CP + regional_inductor is
-        # supported upstream.
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel_sdpa",
-                    "--compile.mode aot_fx_trace",
-                    "--compile.disable_passes cudagraph_pass",
-                    "--parallelism.data_parallel_shard_degree 2",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.context_parallel_degree 2",
-                ],
-            ],
-            "aot_fx_trace llama3 FSDP+TP+CP",
-            "aot_fx_trace_llama3_fsdp_tp_cp",
+        # Disable cuda_graph: replaying coalesced FSDP collectives with CP fails
+        # with "CUDA error: invalid argument".
+        IntegrationTestDefinition(
+            configs=[llama3_fsdp_tp_cp],
+            test_descr="aot_fx_trace llama3 FSDP+TP+CP",
+            test_name="aot_fx_trace_llama3_fsdp_tp_cp",
             ngpu=8,
             skip_rocm_test=True,
+            disabled=_FLEX_CP_INDUCTOR_DISABLED,
         ),
         # async_tp test lives in graph_trainer_h100 suite (needs NVLink).
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode aot_fx_trace",
-                    "--parallelism.data_parallel_shard_degree 4",
-                    "--parallelism.tensor_parallel_degree 2",
-                ],
-            ],
-            "aot_fx_trace llama3 FSDP+TP",
-            "aot_fx_trace_llama3_fsdp_tp",
+        IntegrationTestDefinition(
+            configs=[llama3_fsdp_tp],
+            test_descr="aot_fx_trace llama3 FSDP+TP",
+            test_name="aot_fx_trace_llama3_fsdp_tp",
             ngpu=8,
         ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode aot_fx_trace",
-                    "--compile.memory_policy sac_and_offload",
-                    "--parallelism.data_parallel_shard_degree 4",
-                    "--parallelism.tensor_parallel_degree 2",
-                ],
-            ],
-            "aot_fx_trace llama3 FSDP+TP+sac_and_offload",
-            "aot_fx_trace_llama3_fsdp_tp_sac_and_offload",
-            ngpu=8,
+        IntegrationTestDefinition(
+            configs=[llama3_spmd_gradient_accumulation],
+            test_descr="aot_fx_trace llama3 SPMD gradient accumulation",
+            test_name="aot_fx_trace_llama3_spmd_gradient_accumulation",
+            ngpu=1,
             skip_rocm_test=True,
         ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel",
-                    "--compile.mode aot_fx_trace",
-                    "--compile.inductor_compilation full",
-                    "--parallelism.data_parallel_shard_degree 4",
-                    "--parallelism.tensor_parallel_degree 2",
-                ],
-            ],
-            "aot_fx_trace llama3 FSDP+TP+full_inductor",
-            "aot_fx_trace_llama3_fsdp_tp_full_inductor",
+        IntegrationTestDefinition(
+            configs=[llama3_ga_per_microbatch_fsdp_collectives],
+            test_descr="aot_fx_trace llama3 GA with per-microbatch FSDP collectives",
+            test_name="aot_fx_trace_llama3_ga_per_microbatch_fsdp_collectives",
+            ngpu=4,
+            skip_rocm_test=True,
+        ),
+        IntegrationTestDefinition(
+            configs=[llama3_ga_first_unshard_last_reduce_fsdp_collectives],
+            test_descr=(
+                "aot_fx_trace llama3 GA with first-microbatch FSDP unshard and "
+                "last-microbatch grad reduction"
+            ),
+            test_name="aot_fx_trace_llama3_ga_first_unshard_last_reduce_fsdp",
+            ngpu=4,
+            skip_rocm_test=True,
+        ),
+        IntegrationTestDefinition(
+            configs=[llama3_fsdp_tp_sac_and_offload],
+            test_descr="aot_fx_trace llama3 FSDP+TP+sac_and_offload",
+            test_name="aot_fx_trace_llama3_fsdp_tp_sac_and_offload",
+            ngpu=8,
+            skip_rocm_test=True,
+            # GraphRuntime must preserve offload/reload pairs when it
+            # extracts scheduled graph callables.
+            disabled=True,
+        ),
+        IntegrationTestDefinition(
+            configs=[llama3_fsdp_tp_regional_inductor],
+            test_descr="aot_fx_trace llama3 FSDP+TP+regional_inductor",
+            test_name="aot_fx_trace_llama3_fsdp_tp_regional_inductor",
             ngpu=8,
         ),
     ]
 
 
-def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
+def _build_deepseek_v3_tests() -> list[IntegrationTestDefinition]:
     """DeepSeek-v3-based integration tests (require H100 machines)."""
+    ep_overlap_flex_tests = [
+        # TODO(#4342): Remove transformer-level chunking. After the model batch
+        # dimension was folded into the token dimension, splitting `layers.*`
+        # in half cuts the packed token stream mid-document, so neither chunk
+        # has full attention context. This variant aborts at step 1 with a
+        # non-finite loss.
+        (
+            deepseek_v3_regional_ep_overlap_transformer_batch,
+            "regional",
+            "transformer_batch",
+            True,
+        ),
+        (
+            deepseek_v3_regional_ep_overlap_moe_batch,
+            "regional",
+            "moe_batch",
+            True,
+        ),
+        (
+            deepseek_v3_regional_ep_overlap_moe_seq,
+            "regional",
+            "moe_seq",
+            True,
+        ),
+        # TODO(#4342): Remove transformer-level chunking, as above. Under full
+        # Inductor the mid-document split surfaces earlier than the non-finite
+        # loss: this variant aborts before step 1 on a Triton index-out-of-
+        # bounds assertion.
+        (
+            deepseek_v3_full_ep_overlap_transformer_batch,
+            "full",
+            "transformer_batch",
+            True,
+        ),
+        (
+            deepseek_v3_full_ep_overlap_moe_batch,
+            "full",
+            "moe_batch",
+            True,
+        ),
+        (
+            deepseek_v3_full_ep_overlap_moe_seq,
+            "full",
+            "moe_seq",
+            True,
+        ),
+    ]
+
     return [
-        # === JIT mode tests ===
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.deepseek_v3",
-                    "--config graph_trainer_deepseek_v3_debugmodel",
-                    "--compile.mode jit",
-                    "--parallelism.data_parallel_shard_degree 8",
-                    "--parallelism.expert_parallel_degree 2",
-                ],
-            ],
-            "JIT FSDP+EP",
-            "jit_fsdp+ep",
-            ngpu=8,
-            disabled=_JIT_DISABLED,
-        ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.deepseek_v3",
-                    "--config graph_trainer_deepseek_v3_debugmodel",
-                    "--compile.mode jit",
-                    "--parallelism.data_parallel_shard_degree 4",
-                    "--parallelism.context_parallel_degree 2",
-                ],
-            ],
-            "JIT FSDP+CP",
-            "jit_fsdp+cp",
-            ngpu=8,
-            disabled=_JIT_DISABLED,
-        ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.deepseek_v3",
-                    "--config graph_trainer_deepseek_v3_debugmodel",
-                    "--compile.mode jit",
-                    "--compile.backend inductor",
-                    "--parallelism.tensor_parallel_degree 1",
-                    "--parallelism.expert_parallel_degree 8",
-                    "--compile.passes=auto_bucketing",
-                ]
-            ],
-            "jit_deepseekv3_auto_bucketing",
+        # === GraphRuntime tests ===
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_hsdp_edp_shard_ep],
+            test_descr="aot_fx_trace deepseek_v3 HSDP+edp_shard+EP",
+            test_name="aot_fx_trace_deepseek_v3_hsdp_edp_shard_ep",
             ngpu=8,
         ),
-        # === aot_fx_trace mode tests ===
-        # Note: cudagraph is auto-skipped for DSv3 because MoE load-balancing
-        # introduces CUDA→CPU transfers incompatible with CUDA graph capture.
+        # Note: standard DSv3 MoE load-balancing introduces CUDA-to-CPU
+        # transfers incompatible with CUDA graph capture, so this fused test
+        # explicitly disables CUDA graphs in both the trainer and graph passes.
         #
-        # TODO: FSDP+TP+CP+EP is disabled: tracing fails with "aten.add.Tensor
-        # got mixed torch.Tensor and DTensor" — a separate CP+EP issue,
-        # unrelated to the empty_strided shadow-node fix. Re-enable once fixed.
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.deepseek_v3",
-                    "--config graph_trainer_deepseek_v3_debugmodel",
-                    "--compile.mode aot_fx_trace",
-                    "--parallelism.data_parallel_shard_degree 2",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.context_parallel_degree 2",
-                    "--parallelism.expert_parallel_degree 4",
-                ],
-            ],
-            "aot_fx_trace deepseek_v3 FSDP+TP+CP+EP",
-            "aot_fx_trace_deepseek_v3_fsdp_tp_cp_ep",
+        # TODO: Re-enable FSDP bucketing when its stable topological sort
+        # supports the fused MLA Q kernel's mutating custom-op boundary.
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_fused_mla_swiglu_fsdp_tp_ep],
+            test_descr="aot_fx_trace deepseek_v3 fused MLA+SwiGLU FSDP+TP+EP",
+            test_name="aot_fx_trace_deepseek_v3_fused_mla_swiglu_fsdp_tp_ep",
+            ngpu=4,
+        ),
+        # TODO: Re-enable after fixing the separate CP+EP mixed Tensor/DTensor
+        # failure, in addition to the graph_trainer CP backend issue.
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_fsdp_tp_cp_ep],
+            test_descr="aot_fx_trace deepseek_v3 FSDP+TP+CP+EP",
+            test_name="aot_fx_trace_deepseek_v3_fsdp_tp_cp_ep",
             ngpu=8,
             disabled=True,
         ),
@@ -335,157 +471,150 @@ def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
         # instability (intermittent; also seen as a "Split sizes" crash, and the
         # full_inductor EP variant below has passed in the same run). Re-enable
         # once the EP all-to-all instability is resolved upstream.
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.deepseek_v3",
-                    "--config graph_trainer_deepseek_v3_debugmodel",
-                    "--compile.mode aot_fx_trace",
-                    "--parallelism.data_parallel_shard_degree 4",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.expert_parallel_degree 4",
-                ],
-            ],
-            "aot_fx_trace deepseek_v3 FSDP+TP+EP",
-            "aot_fx_trace_deepseek_v3_fsdp_tp_ep",
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_fsdp_tp_ep],
+            test_descr="aot_fx_trace deepseek_v3 FSDP+TP+EP",
+            test_name="aot_fx_trace_deepseek_v3_fsdp_tp_ep",
             ngpu=8,
             disabled=True,
         ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.deepseek_v3",
-                    "--config graph_trainer_deepseek_v3_debugmodel",
-                    "--compile.mode aot_fx_trace",
-                    "--compile.inductor_compilation full",
-                    "--parallelism.data_parallel_shard_degree 4",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.expert_parallel_degree 4",
-                ],
-            ],
-            "aot_fx_trace deepseek_v3 FSDP+TP+EP+full_inductor",
-            "aot_fx_trace_deepseek_v3_fsdp_tp_ep_full_inductor",
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_fsdp_tp_ep_regional_inductor],
+            test_descr="aot_fx_trace deepseek_v3 FSDP+TP+EP+regional_inductor",
+            test_name="aot_fx_trace_deepseek_v3_fsdp_tp_ep_regional_inductor",
+            ngpu=8,
+            # TODO(#4047): Re-enable once FSDP bucketing no longer creates a
+            # cyclic region for this DeepSeekV3 FSDP+TP+EP configuration.
+            disabled=True,
+        ),
+        *[
+            IntegrationTestDefinition(
+                configs=[config_fn],
+                test_descr=(
+                    "aot_fx_trace deepseek_v3 FlexAttn "
+                    f"{inductor_compilation}_inductor ep_overlap {variant}"
+                ),
+                test_name=(
+                    "aot_fx_trace_deepseek_v3_flexattn_"
+                    f"{inductor_compilation}_inductor_ep_overlap_{variant}"
+                ),
+                ngpu=8,
+                # TODO(#4052): These were disabled under graph chunking with
+                # dense-region FSDP overlap; re-validate the MoE variants with
+                # eager chunking before re-enabling.
+                disabled=disabled,
+            )
+            for (
+                config_fn,
+                inductor_compilation,
+                variant,
+                disabled,
+            ) in ep_overlap_flex_tests
+        ],
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_graph_pp_interleaved_1f1b],
+            test_descr=(
+                "aot_fx_trace deepseek_v3 GraphPP Interleaved1F1B full_inductor"
+            ),
+            test_name=(
+                "aot_fx_trace_deepseek_v3_graph_pp_interleaved_1f1b_full_inductor"
+            ),
             ngpu=8,
         ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.deepseek_v3",
-                    "--config graph_trainer_deepseek_v3_debugmodel_hybridep",
-                    "--compile.mode aot_fx_trace",
-                    "--parallelism.data_parallel_shard_degree 2",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.expert_parallel_degree 2",
-                ],
-            ],
-            "aot_fx_trace deepseek_v3 FSDP+TP+HybridEP",
-            "aot_fx_trace_deepseek_v3_hybridep",
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_graph_pp_zbv_zero_bubble],
+            test_descr="aot_fx_trace deepseek_v3 GraphPP ZBVZeroBubble full_inductor",
+            test_name="aot_fx_trace_deepseek_v3_graph_pp_zbv_zero_bubble_full_inductor",
+            ngpu=8,
+        ),
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_graph_pp_dual_pipe_v],
+            test_descr="aot_fx_trace deepseek_v3 GraphPP DualPipeV full_inductor",
+            test_name="aot_fx_trace_deepseek_v3_graph_pp_dual_pipe_v_full_inductor",
+            ngpu=8,
+        ),
+        # Paged stashing under GraphTrainer's CUDA graph pass and under GraphPP.
+        # Round-robin routing keeps the stash footprint steady across steps: the
+        # buffers are sized from the first step, and a step that outgrows them is
+        # fatal under the default overflow check.
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_hybrid_ep_paged_stash],
+            test_descr="aot_fx_trace deepseek_v3 FSDP+TP+HybridEP+paged_stash",
+            test_name="aot_fx_trace_deepseek_v3_hybridep_paged_stash",
             ngpu=4,
-            disabled=True,
         ),
-        # MinimalAsyncEP avoids the standard all-to-all load-balancing path and
-        # is expected to remain CUDA-graphable under its constrained topology.
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.deepseek_v3",
-                    "--config graph_trainer_deepseek_v3_debugmodel_minimal_async_ep",
-                    "--compile.mode aot_fx_trace",
-                    "--compile.memory_policy full",
-                    "--parallelism.data_parallel_shard_degree 4",
-                    "--parallelism.expert_parallel_degree 4",
-                ],
-            ],
-            "aot_fx_trace deepseek_v3 MinimalAsyncEP",
-            "aot_fx_trace_deepseek_v3_minimal_async_ep",
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_graph_pp_hybrid_ep_paged_stash],
+            test_descr="aot_fx_trace deepseek_v3 GraphPP+HybridEP+paged_stash",
+            test_name="aot_fx_trace_deepseek_v3_graph_pp_hybridep_paged_stash",
             ngpu=4,
         ),
     ]
 
 
-def _build_qwen3_tests() -> list[OverrideDefinitions]:
+def _build_qwen3_tests() -> list[IntegrationTestDefinition]:
     """Qwen3-based integration tests (dense + MoE)."""
     return [
-        # TODO: Disabled — this uses the default FlexAttention backend, and
-        # FlexAttention + CP + regional_inductor is unsupported: the CP load
-        # balancer injects an index-rearrange constant (torch
-        # _context_parallel/_attention.py qkv_idx_restore) that
-        # regional_inductor's make_fx re-trace cannot lift ("Attempting to use
-        # FunctionalTensor on its own"). This is the same upstream issue noted
-        # for the llama3 CP test above, which works around it with an SDPA
-        # config. To re-enable, add a qwen3 SDPA debug config and switch to it
-        # (mirroring aot_fx_trace_llama3_fsdp_tp_cp), or wait for flex + CP +
-        # regional_inductor support upstream.
-        #
-        # cudagraph is also disabled here (kept for when this is re-enabled):
-        # CUDA-graph replay of the coalesced FSDP collectives fails under
-        # context parallelism with "CUDA error: invalid argument".
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.qwen3",
-                    "--config graph_trainer_qwen3_debugmodel",
-                    "--compile.mode aot_fx_trace",
-                    "--compile.disable_passes cudagraph_pass",
-                    "--parallelism.data_parallel_shard_degree 2",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.context_parallel_degree 2",
-                ],
-            ],
-            "aot_fx_trace qwen3 FSDP+TP+CP",
-            "aot_fx_trace_qwen3_fsdp_tp_cp",
+        # Disable cuda_graph: replaying coalesced FSDP collectives with CP fails
+        # with "CUDA error: invalid argument".
+        IntegrationTestDefinition(
+            configs=[qwen3_fsdp_tp_cp],
+            test_descr="aot_fx_trace qwen3 FSDP+TP+CP",
+            test_name="aot_fx_trace_qwen3_fsdp_tp_cp",
             ngpu=8,
-            disabled=True,
+            disabled=_FLEX_CP_INDUCTOR_DISABLED,
         ),
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.qwen3",
-                    "--config graph_trainer_qwen3_debugmodel_moe",
-                    "--compile.mode aot_fx_trace",
-                    "--parallelism.data_parallel_shard_degree 4",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--parallelism.expert_parallel_degree 4",
-                ],
-            ],
-            "aot_fx_trace qwen3 MoE FSDP+TP+EP",
-            "aot_fx_trace_qwen3_moe_fsdp_tp_ep",
+        IntegrationTestDefinition(
+            configs=[qwen3_moe_fsdp_tp_ep],
+            test_descr="aot_fx_trace qwen3 MoE FSDP+TP+EP",
+            test_name="aot_fx_trace_qwen3_moe_fsdp_tp_ep",
             ngpu=8,
         ),
     ]
 
 
-def build_graph_trainer_test_list() -> list[OverrideDefinitions]:
-    """All graph_trainer integration tests (Llama3 + DeepSeek-v3 + Qwen3)."""
-    return _build_llama3_tests() + _build_deepseek_v3_tests() + _build_qwen3_tests()
+def _build_muse_glimmer_tests() -> list[IntegrationTestDefinition]:
+    """MuseGlimmer integration tests."""
+    return [
+        IntegrationTestDefinition(
+            configs=[muse_glimmer_fsdp],
+            test_descr="aot_fx_trace muse_glimmer FSDP",
+            test_name="aot_fx_trace_muse_glimmer_fsdp",
+            ngpu=8,
+        ),
+        IntegrationTestDefinition(
+            configs=[muse_glimmer_fsdp_tp],
+            test_descr="aot_fx_trace muse_glimmer FSDP+TP",
+            test_name="aot_fx_trace_muse_glimmer_fsdp_tp",
+            ngpu=8,
+        ),
+    ]
 
 
-def build_graph_trainer_default_test_list() -> list[OverrideDefinitions]:
-    """Llama3 tests only (for default A10 machines)."""
-    return _build_llama3_tests()
+def build_graph_trainer_test_list() -> list[IntegrationTestDefinition]:
+    """All graph_trainer integration tests."""
+    return (
+        _build_llama3_tests()
+        + _build_deepseek_v3_tests()
+        + _build_qwen3_tests()
+        + _build_muse_glimmer_tests()
+    )
 
 
-def _build_async_tp_tests() -> list[OverrideDefinitions]:
+def build_graph_trainer_default_test_list() -> list[IntegrationTestDefinition]:
+    """Dense-model tests for default A10 machines."""
+    return _build_llama3_tests() + _build_muse_glimmer_tests()
+
+
+def _build_async_tp_tests() -> list[IntegrationTestDefinition]:
     """Async TP tests (require NVLink for symmetric memory)."""
     return [
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_8b",
-                    "--compile.mode aot_fx_trace",
-                    "--parallelism.enable_async_tensor_parallel",
-                    "--training.local_batch_size 2",
-                    "--training.seq_len 512",
-                    "--parallelism.data_parallel_shard_degree 4",
-                    "--parallelism.tensor_parallel_degree 2",
-                    "--hf_assets_path ./tests/assets/tokenizer",
-                ],
-            ],
+        IntegrationTestDefinition(
+            configs=[llama3_fsdp_tp_async_tp],
             # async_tp (micro_pipeline_tp) requires shard_dim >= 1024.
             # 8B (dim=4096) with TP=2 gives shard=2048, above threshold.
-            "aot_fx_trace llama3 FSDP+TP+async_tp",
-            "aot_fx_trace_llama3_fsdp_tp_asynctp",
+            test_descr="aot_fx_trace llama3 FSDP+TP+async_tp",
+            test_name="aot_fx_trace_llama3_fsdp_tp_asynctp",
             ngpu=8,
             skip_rocm_test=True,
             # TODO: Disabled — async_tp (micro_pipeline_tp) fails with an
@@ -499,72 +628,80 @@ def _build_async_tp_tests() -> list[OverrideDefinitions]:
     ]
 
 
-def _build_autoparallel_tests() -> list[OverrideDefinitions]:
+def _build_autoparallel_tests() -> list[IntegrationTestDefinition]:
     """AutoParallel integration tests for default runners."""
     return [
-        # Uses the SDPA backend: AutoParallel's dynamo export
-        # (_dynamo_graph_capture_for_export) pytree-flattens the default
-        # FlexAttention BlockMask to plain (Fake)Tensors, so flex_attention then
-        # fails with "'FakeTensor' object has no attribute 'BLOCK_SIZE'". SDPA is
-        # maskless (is_causal) and carries no BlockMask, and its input_fn
-        # (tokens, positions) binds correctly now that Decoder.forward lists
-        # positions before attention_masks.
-        # TODO: re-test on FlexAttention once BlockMask survives AutoParallel
-        # graph capture.
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.llama3",
-                    "--config graph_trainer_llama3_debugmodel_sdpa_cross_entropy_loss",
-                    "--compile.mode aot_fx_trace",
-                    "--compile.enable_autoparallel",
-                    "--parallelism.data_parallel_shard_degree 2",
-                    "--parallelism.tensor_parallel_degree 2",
-                ],
-            ],
-            "autoparallel llama3 FSDP+TP",
-            "autoparallel_llama3_fsdp_tp",
-            ngpu=4,
-        ),
-    ]
-
-
-def _build_autoparallel_h100_tests() -> list[OverrideDefinitions]:
-    """AutoParallel integration tests that require H100 runners."""
-    return [
-        # TODO: Disabled due to upstream AutoParallel regression in PyTorch
-        # nightly dev20260508. AutoParallel rejects FakeTensor device
-        # mismatch (traced on meta vs actual cuda). Re-enable once fixed.
-        OverrideDefinitions(
-            [
-                [
-                    "--module graph_trainer.deepseek_v3",
-                    "--config graph_trainer_deepseek_v3_debugmodel",
-                    "--compile.mode aot_fx_trace",
-                    "--compile.enable_autoparallel",
-                    "--parallelism.data_parallel_shard_degree 4",
-                    "--parallelism.expert_parallel_degree 2",
-                ],
-            ],
-            "autoparallel deepseek_v3 EFSDP+EP",
-            "autoparallel_deepseek_v3_efsdp_ep",
+        # TODO: Before re-enabling, wire Varlen metadata through AutoParallel
+        # input_fn and its input sharding constraints.
+        # TODO: Disabled due to upstream AutoParallel/PyTorch API skew. PyTorch
+        # #186754 (2026-06-24) removed propagate_single_input_strategy in favor
+        # of propagate_single_input_single_dim_strategy, but AutoParallel's
+        # convert_element_type_rule still imports the old name, so the sharding
+        # optimizer fails with ImportError. Re-enable once AutoParallel migrates.
+        # https://github.com/pytorch/torchtitan/issues/3699
+        IntegrationTestDefinition(
+            configs=[llama3_autoparallel_fsdp_tp],
+            test_descr="autoparallel llama3 FSDP+TP",
+            test_name="autoparallel_llama3_fsdp_tp",
             ngpu=4,
             disabled=True,
         ),
     ]
 
 
-def build_graph_trainer_h100_test_list() -> list[OverrideDefinitions]:
+def _build_autoparallel_h100_tests() -> list[IntegrationTestDefinition]:
+    """AutoParallel integration tests that require H100 runners."""
+    return [
+        # TODO: Disabled due to upstream AutoParallel regression in PyTorch
+        # nightly dev20260508. AutoParallel rejects FakeTensor device
+        # mismatch (traced on meta vs actual cuda). Re-enable once fixed.
+        IntegrationTestDefinition(
+            configs=[deepseek_v3_autoparallel_edp_shard_ep],
+            test_descr="autoparallel deepseek_v3 edp_shard+ep",
+            test_name="autoparallel_deepseek_v3_edp_shard_ep",
+            ngpu=4,
+            disabled=True,
+        ),
+    ]
+
+
+def build_graph_trainer_h100_test_list() -> list[IntegrationTestDefinition]:
     """DeepSeek-v3 + Qwen3 + async_tp tests (for H100 machines)."""
     return _build_deepseek_v3_tests() + _build_qwen3_tests() + _build_async_tp_tests()
 
 
-def build_graph_trainer_autoparallel_test_list() -> list[OverrideDefinitions]:
+def build_graph_trainer_b200_test_list() -> list[IntegrationTestDefinition]:
+    """Dist-MoE tests that require B200-class hardware."""
+    return [
+        IntegrationTestDefinition(
+            configs=[
+                b200_recipes.graph_trainer_deepseek_v3_debugmodel_dist_moe_bf16_fsdp2_ep2
+            ],
+            test_descr="GraphTrainer BF16 Dist-MoE with FSDP and EP",
+            test_name="graph_trainer_dist_moe_fsdp_ep",
+            ngpu=2,
+            use_real_pg=True,
+        ),
+        IntegrationTestDefinition(
+            configs=[
+                b200_recipes.graph_trainer_deepseek_v3_debugmodel_dist_moe_mxfp8_fsdp2_ep2_pp2
+            ],
+            test_descr="GraphPP MXFP8 Dist-MoE activation-slot reuse",
+            test_name="graph_trainer_dist_moe_mxfp8_fsdp_ep_pp",
+            ngpu=4,
+            use_real_pg=True,
+        ),
+    ]
+
+
+def build_graph_trainer_autoparallel_test_list() -> list[IntegrationTestDefinition]:
     """AutoParallel tests for default runners."""
     return _build_autoparallel_tests()
 
 
-def build_graph_trainer_autoparallel_h100_test_list() -> list[OverrideDefinitions]:
+def build_graph_trainer_autoparallel_h100_test_list() -> list[
+    IntegrationTestDefinition
+]:
     """AutoParallel tests that require H100 runners."""
     return _build_autoparallel_h100_tests()
 
@@ -573,6 +710,7 @@ _TEST_SUITES_FUNCTION = {
     "graph_trainer": build_graph_trainer_test_list,
     "graph_trainer_default": build_graph_trainer_default_test_list,
     "graph_trainer_h100": build_graph_trainer_h100_test_list,
+    "graph_trainer_b200": build_graph_trainer_b200_test_list,
     "graph_trainer_autoparallel": build_graph_trainer_autoparallel_test_list,
     "graph_trainer_autoparallel_h100": build_graph_trainer_autoparallel_h100_test_list,
 }

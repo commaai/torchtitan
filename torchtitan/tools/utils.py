@@ -5,18 +5,17 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
-import gc
+import logging
+import os
 import subprocess
-import time
 from collections.abc import Generator
-from dataclasses import dataclass
 from types import ModuleType
 
 import torch
 from torch._utils import _get_available_device_type, _get_device_module
 
-from torchtitan.observability import structured_logger as sl
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def round_up(value: int, multiple: int) -> int:
@@ -24,10 +23,33 @@ def round_up(value: int, multiple: int) -> int:
 
 
 def has_cuda_capability(major: int, minor: int) -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
-        major,
-        minor,
+    # torch.version.hip is None excludes ROCm (capability is a tuple on AMD too).
+    return (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability() >= (major, minor)
     )
+
+
+def get_cuda_flash_attention_impl() -> str | None:
+    """Return the FlashAttention implementation for the current CUDA architecture."""
+
+    # ROCm has neither FA3 nor FA4: torch's flash_attn_interface is CUDA-only.
+    # This has to be checked explicitly, because has_cuda_capability() below is
+    # just torch.cuda.get_device_capability() >= (major, minor) and AMD devices
+    # report a capability too -- gfx950 (MI350X) reports (9, 5), which satisfies
+    # the (9, 0) test and would select FA3 on hardware that cannot run it.
+    if torch.version.hip is not None:
+        return None
+
+    # FA4 advertises Hopper support, but as of writing it hangs under
+    # torch.compile there, so Hopper (sm90) stays on FA3.
+    # https://github.com/pytorch/torchtitan/pull/4413
+    if has_cuda_capability(10, 0):
+        return "FA4"
+    if has_cuda_capability(9, 0):
+        return "FA3"
+    return None
 
 
 def has_rocm_capability(major: int, minor: int) -> bool:
@@ -47,47 +69,45 @@ def get_device_info() -> tuple[str, ModuleType]:
 device_type, device_module = get_device_info()
 
 
-# used to avoid stragglers in garbage collection
-class GarbageCollection:
-    def __init__(self, gc_freq: int = 1000, debug: bool = False):
-        assert gc_freq > 0, "gc_freq must be a positive integer"
-        self.gc_freq = gc_freq
-        self.debug = debug
-        gc.disable()
-        self.collect("Initial GC collection")
-        if debug:
-            from torch.utils.viz._cycles import warn_tensor_cycles
+def get_local_device() -> torch.device:
+    """Return this process's device under LOCAL_RANK or visible-device launch.
 
-            if torch.distributed.get_rank() == 0:
-                warn_tensor_cycles()
+    Launchers normally expose multiple accelerators per process and set
+    LOCAL_RANK to identify which local device the process should use. Some
+    launchers instead mask each process down to a single accelerator with
+    CUDA_VISIBLE_DEVICES or another backend-specific visible-device mask. When
+    exactly one device is visible, target device index 0; otherwise preserve
+    the existing LOCAL_RANK mapping.
+    """
+    local_rank_str = os.environ.get("LOCAL_RANK")
+    if local_rank_str is None:
+        raise ValueError("LOCAL_RANK must be set before selecting a local device.")
+    try:
+        local_rank = int(local_rank_str)
+    except ValueError as e:
+        raise ValueError(
+            "LOCAL_RANK environment variable must be a valid integer, "
+            f"got: {local_rank_str}"
+        ) from e
+    if local_rank < 0:
+        raise ValueError(f"LOCAL_RANK must be non-negative, got: {local_rank}")
 
-    @sl.log_trace_span("gc_collect")
-    def run(self, step_count: int) -> bool:
-        """Run a GC cycle if this step should collect. Returns True when a
-        collection actually ran, False otherwise."""
-        if self.debug:
-            self.collect(
-                "Force GC to perform collection to obtain debug information",
-                generation=2,
-            )
-            gc.collect()
-            sl.add_step_tag("gc")
-            return True
-        if step_count > 1 and step_count % self.gc_freq == 0:
-            self.collect("Performing periodic GC collection")
-            sl.add_step_tag("gc")
-            return True
-        return False
-
-    @staticmethod
-    def collect(reason: str, generation: int = 1):
-        begin = time.monotonic()
-        gc.collect(generation)
-        logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
+    num_devices = None
+    if hasattr(device_module, "device_count"):
+        num_devices = device_module.device_count()
+    device_index = 0 if num_devices == 1 else local_rank
+    if num_devices is not None and num_devices > 1 and device_index >= num_devices:
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} is outside the visible {device_type} "
+            f"device count ({num_devices}). If each process is launched with a "
+            f"single visible {device_type} device, set the visible-device mask "
+            "per process so device_count() returns 1."
+        )
+    return torch.device(device_type, device_index)
 
 
 # hardcoded BF16 type peak flops for NVIDIA A100, H20, H100, H200, B200 GPU,
-# AMD MI250, MI300X, MI325X, MI355X, Intel PVC, and AWS Trainium/Inferentia
+# AMD MI250, MI300X, MI325X, MI350X, MI355X, Intel PVC, and AWS Trainium/Inferentia
 def get_peak_flops(device_name: str) -> float:
     try:
         # Run the lspci command and capture the output
@@ -138,9 +158,12 @@ def get_peak_flops(device_name: str) -> float:
         # GB300 data from https://www.nvidia.com/en-us/data-center/dgx-gb300
         return 2.5e15
     elif "B300" in device_name or "B200" in device_name:
-        # data from https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
+        # data from https://resources.nvidia.com/en-us-blackwell-architecture
         # Checked after GB300 to avoid false match on "GB300"
         return 2.25e15
+    elif "MI350X" in device_name:
+        # MI350X data from https://www.amd.com/en/products/accelerators/instinct/mi350/mi350x.html
+        return 2300e12
     elif "MI355X" in device_name:
         # MI355X data from https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html
         return 2500e12
@@ -161,7 +184,7 @@ def get_peak_flops(device_name: str) -> float:
         # Standard EU mode (i.e. 448 max compute units): 298.2 TFLOPS (BF16)
         max_comp_units = torch.xpu.get_device_properties("xpu").max_compute_units
         return 512 * max_comp_units * 1300 * 10**6
-    elif "l40s" in device_name:
+    elif "l40s" in device_name.casefold():
         # data from: "https://resources.nvidia.com/en-us-l40s/l40s-datasheet-28413"
         return 362e12
     elif "neuron" in device_name:
@@ -183,63 +206,38 @@ def get_peak_flops(device_name: str) -> float:
             )
             return 79e12 * 2
 
+    elif device_name.startswith("TPU"):
+        # Google Cloud TPU: dense BF16 matrix-engine (MXU) peak, per device.
+        # Source: https://cloud.google.com/tpu/docs/system-architecture-tpu-vm
+        if "v4" in device_name:
+            return 275e12
+        elif "v5e" in device_name:
+            return 197e12
+        elif "v5p" in device_name:
+            return 459e12
+        elif "v6e" in device_name:
+            return 918e12
+        elif "v7" in device_name:
+            # 2307 TFLOPS is the published per-chip figure; v7 exposes each of
+            # its two TensorCores as a separate device, so halve for per-device.
+            return 2307e12 / 2
+        else:
+            logger.warning(
+                f"Peak flops undefined for TPU: {device_name}, fallback to A100"
+            )
+            return 312e12
+
+    elif "5090" in device_name:
+        # FP16/FP16 data:
+        # https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf
+        return 419.0e12
+    elif "4090" in device_name:
+        return 330.3e12
+    elif "3090" in device_name:
+        return 142.4e12
     else:  # for other GPU types, assume A100
         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
         return 312e12
-
-
-@dataclass(frozen=True)
-class Color:
-    black = "\033[30m"
-    red = "\033[31m"
-    green = "\033[32m"
-    yellow = "\033[33m"
-    blue = "\033[34m"
-    magenta = "\033[35m"
-    cyan = "\033[36m"
-    white = "\033[37m"
-    reset = "\033[39m"
-    orange = "\033[38;2;180;60;0m"
-    turquoise = "\033[38;2;54;234;195m"
-
-
-@dataclass(frozen=True)
-class NoColor:
-    black = ""
-    red = ""
-    green = ""
-    yellow = ""
-    blue = ""
-    magenta = ""
-    cyan = ""
-    white = ""
-    reset = ""
-    orange = ""
-    turquoise = ""
-
-
-assert set(NoColor.__dataclass_fields__.keys()) == set(
-    Color.__dataclass_fields__.keys()
-), "NoColor must have the same fields as Color."
-
-
-def check_if_feature_in_pytorch(
-    feature_name: str,
-    pull_request: str,
-    min_nightly_version: str | None = None,
-) -> None:
-    if "git" in torch.__version__:  # pytorch is built from source
-        # notify users to check if the pull request is included in their pytorch
-        logger.warning(
-            "Detected that the pytorch is built from source. Please make sure the PR "
-            f"({pull_request}) is included in pytorch for correct {feature_name}."
-        )
-    elif min_nightly_version is not None and torch.__version__ < min_nightly_version:
-        logger.warning(
-            f"Detected that the pytorch version {torch.__version__} is older than "
-            f"{min_nightly_version}. Please upgrade a newer version to include the "
-            f"change in ({pull_request}) for correct {feature_name}."
-        )
 
 
 @contextlib.contextmanager

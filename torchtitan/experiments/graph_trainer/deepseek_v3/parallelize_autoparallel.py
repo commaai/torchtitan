@@ -10,7 +10,7 @@ AutoParallel-based parallelization for DeepSeek V3.
 Uses AutoParallelGraph to apply solver-based SPMD sharding on AutoParallel's
 local_map DSv3 model (whose ops the solver supports), then lets graph_trainer
 trace and compile the placed model through its normal `aot_fx_trace` train-step
-pipeline. Requires a 2D sparse mesh (EFSDP+EP).
+pipeline. Requires a 2D sparse mesh (``edp_shard`` + ``ep``).
 
 The torchtitan DSv3 model is replaced with AutoParallel's DeepSeekV3Model
 because the solver doesn't support torchtitan's token_dispatcher ops
@@ -18,23 +18,25 @@ because the solver doesn't support torchtitan's token_dispatcher ops
 layout via duck typing.
 """
 
+import logging
 import time
 
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor.placement_types import Shard
 
-from torchtitan.config import ParallelismConfig, TORCH_DTYPE_MAP, TrainingConfig
-from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed import ParallelismContext
+from torchtitan.distributed.activation_remat import ActivationRematConfig
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.experiments.graph_trainer.autoparallel_api import AutoParallelGraph
 from torchtitan.experiments.graph_trainer.compile import apply_compile
-from torchtitan.experiments.graph_trainer.configs import (
-    GraphTrainerCompileConfig,
-    validate_autoparallel_config,
-)
-from torchtitan.tools.logging import logger
+from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.tools.utils import device_type
+
+
+logger = logging.getLogger(__name__)
 
 
 def _load_autoparallel_dsv3_dependency():
@@ -85,50 +87,50 @@ def _preserve_moe_attributes(original_model, parallel_model):
             par_moe.moe_enabled = orig_moe.moe_enabled
         if hasattr(orig_moe, "load_balance_coeff"):
             par_moe.load_balance_coeff = orig_moe.load_balance_coeff
+        # The balancing hooks read this flag; AutoParallel's MoE has no frozen bias.
+        par_moe.freeze_expert_bias = False
 
 
 def parallelize_autoparallel_deepseekv3(
     model,
     *,
-    parallel_dims: ParallelDims,
+    parallelism_context: ParallelismContext,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: GraphTrainerCompileConfig,
-    ac_config: ActivationCheckpointingConfig,
+    activation_remat: ActivationRematConfig | None,
     dump_folder: str,
 ):
     """Apply AutoParallelGraph SPMD sharding to DeepSeek V3.
 
     Returns a sharded model carrying AutoParallel train-step metadata.
-    Requires a 2D sparse mesh (EFSDP+EP).
+    Requires a 2D sparse mesh (``edp_shard`` + ``ep``).
     """
-    validate_autoparallel_config(compile_config)
-
-    if parallel_dims.dp_replicate_enabled:
+    if parallelism_context.dp_replicate_enabled:
         raise ValueError("AutoParallel DeepSeek V3 does not support DDP yet")
-    if parallel_dims.cp_enabled:
+    if parallelism_context.cp_enabled:
         raise ValueError("AutoParallel DeepSeek V3 does not support CP yet")
-    if parallel_dims.pp_enabled:
+    if parallelism_context.pp_enabled:
         raise ValueError("AutoParallel DeepSeek V3 does not support PP yet")
-    if parallel_dims.tp_enabled:
+    if parallelism_context.tp_enabled:
         raise ValueError("AutoParallel DeepSeek V3 does not support TP yet")
 
-    required_sparse_axes = ("efsdp", "ep")
+    required_sparse_axes = ("edp_shard", "ep")
     missing_sparse_axes = [
         name
         for name in required_sparse_axes
-        if parallel_dims.get_optional_mesh(name) is None
+        if parallelism_context.get_optional_mesh(name) is None
     ]
     if missing_sparse_axes:
         raise ValueError(
-            "AutoParallel DeepSeek V3 requires EFSDP and EP axes, but missing "
+            "AutoParallel DeepSeek V3 requires edp_shard and ep axes, but missing "
             f"{missing_sparse_axes}"
         )
 
-    sparse_mesh = parallel_dims.get_mesh(list(required_sparse_axes))
+    sparse_mesh = parallelism_context.get_mesh(list(required_sparse_axes))
     if sparse_mesh.ndim != 2 or sparse_mesh.mesh_dim_names != required_sparse_axes:
         raise ValueError(
-            "AutoParallel DeepSeek V3 requires a 2D sparse mesh with EFSDP and EP "
+            "AutoParallel DeepSeek V3 requires a 2D sparse mesh with edp_shard and ep "
             f"axes, but got mesh axes {sparse_mesh.mesh_dim_names}"
         )
 
@@ -141,7 +143,7 @@ def parallelize_autoparallel_deepseekv3(
     )
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         parallelism.fsdp_reshard_after_forward,
-        parallel_dims.pp_enabled,
+        parallelism_context.pp_enabled,
     )
     (
         APDeepSeekV3Model,
@@ -160,15 +162,17 @@ def parallelize_autoparallel_deepseekv3(
         )
 
     def input_fn():
-        global_batch_size = training.global_batch_size
-        if global_batch_size < 0:
-            dp_degree = parallel_dims.dp_replicate * parallel_dims.dp_shard
-            global_batch_size = training.local_batch_size * dp_degree
+        dp_degree = parallelism_context.dp_replicate * parallelism_context.dp_shard
+        num_tokens_per_train_step = training.num_tokens_per_train_step
+        if num_tokens_per_train_step < 0:
+            num_tokens_per_train_step = (
+                training.num_tokens_per_microbatch_per_dp_rank * dp_degree
+            )
         tokens = torch.randint(
             0,
             ap_model.model_args.vocab_size,
-            (global_batch_size, training.seq_len),
-            device=torch.device("cuda"),
+            (num_tokens_per_train_step,),
+            device=torch.device(device_type),
         )
         return tokens
 
@@ -195,7 +199,7 @@ def parallelize_autoparallel_deepseekv3(
         t1 = time.time()
         logger.info(f"AutoParallelGraph took {t1 - t0:.2f} seconds")
 
-        # The solved output is logically batch-sharded over EFSDP and EP
+        # The solved output is logically batch-sharded over edp_shard and ep.
         # (Shard(0), Shard(0)). Those axes are data-parallel factors for
         # loss computation, so graph_trainer can consume each rank's local
         # logits as a plain tensor and pair them with local labels. Only TP
@@ -211,8 +215,6 @@ def parallelize_autoparallel_deepseekv3(
     model = apply_compile(
         parallel_mod,
         compile_config=compile_config,
-        parallelism=parallelism,
-        parallel_dims=parallel_dims,
-        dump_folder=dump_folder,
+        parallelism_context=parallelism_context,
     )
     return model

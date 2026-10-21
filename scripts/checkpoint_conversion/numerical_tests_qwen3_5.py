@@ -22,6 +22,7 @@ Usage:
 import argparse
 import os
 import types
+from contextlib import nullcontext
 from typing import Any
 
 import einops as E
@@ -30,17 +31,19 @@ import torch._dynamo
 import torch.distributed.checkpoint as dcp
 import torch.nn.functional as F
 from PIL import Image
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 torch._dynamo.config.disable = True
 
-from torchtitan.components.checkpoint import ModelWrapper
-from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
-from torchtitan.hf_datasets.multimodal.utils.image import (
+from torchtitan.components.checkpointer import ModelWrapper
+from torchtitan.components.data.multimodal.mm_collator import MultiModalCollator
+from torchtitan.components.data.multimodal.utils.image import (
     process_image,
     vision_to_patches,
 )
-from torchtitan.models.common.attention import ScaledDotProductAttention
-from torchtitan.models.qwen3_5 import model_registry, QWEN3_5_SPECIAL_TOKENS
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.common.attention import InnerAttention
+from torchtitan.models.qwen3_5 import build_model_config, QWEN3_5_SPECIAL_TOKENS
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
@@ -91,9 +94,9 @@ def build_inputs(hf_model_path, model_flavor, num_samples, image_size=224):
     # trips the .apply_chat_template call on environments without transformers stubs.
     processor: Any = AutoProcessor.from_pretrained(hf_model_path)
 
-    model_config = model_registry(model_flavor).model
-    # pyrefly: ignore [missing-attribute]
+    model_config = build_model_config(model_flavor, parallelism=ParallelismConfig())
     encoder_config = model_config.vision_encoder
+    assert encoder_config is not None
     patch_size = encoder_config.patch_size
     temporal_patch_size = encoder_config.temporal_patch_size
     merge_size = encoder_config.spatial_merge_size
@@ -270,7 +273,7 @@ def run_tt(model_flavor, checkpoint_path, tt_inputs, special_tokens, device):
     """Run TT model, return last-token logits per sample."""
     print(f"Loading TorchTitan model on {device} ...")
 
-    model_config = model_registry(model_flavor).model
+    model_config = build_model_config(model_flavor, parallelism=ParallelismConfig())
     with torch.device("meta"):
         model = model_config.build()
     model.to_empty(device="cpu")
@@ -282,23 +285,49 @@ def run_tt(model_flavor, checkpoint_path, tt_inputs, special_tokens, device):
     dcp.load(state_dict, checkpoint_id=checkpoint_path)
     model.to(device)
 
-    # Replace FlexAttention with SDPA for single-process inference
-    # (unfused FlexAttention without torch.compile has poor fp16 numerics).
+    class _SDPA(InnerAttention):
+        """SDPA for a single text document or an unpadded image."""
+
+        def __init__(self, *, is_causal):
+            super().__init__()
+            self.is_causal = is_causal
+
+        def forward(self, q_BLHK, k_BLHK, v_BLHV, **kwargs):
+            if self.is_causal and kwargs.get("attention_metadata") is not None:
+                raise ValueError(
+                    "The checkpoint SDPA reference requires a single document."
+                )
+            backend_context = (
+                sdpa_kernel(
+                    [
+                        SDPBackend.CUDNN_ATTENTION,
+                        SDPBackend.FLASH_ATTENTION,
+                        SDPBackend.MATH,
+                    ],
+                    set_priority=True,
+                )
+                if self.is_causal
+                else nullcontext()
+            )
+            with backend_context:
+                out_BHLV = F.scaled_dot_product_attention(
+                    q_BLHK.transpose(1, 2),
+                    k_BLHK.transpose(1, 2),
+                    v_BLHV.transpose(1, 2),
+                    is_causal=self.is_causal,
+                    scale=kwargs.get("scale"),
+                    enable_gqa=kwargs.get("enable_gqa", False),
+                )
+            return out_BHLV.transpose(1, 2)
+
+    # Replace FlexInnerAttention with SDPA for single-process inference
+    # (unfused FlexInnerAttention without torch.compile has poor fp16 numerics).
     for layer in model.layers.values():
         if layer.full_attn:
-            layer.attn.inner_attention = ScaledDotProductAttention.Config().build()
-
-    class _BidirectionalSDPA(torch.nn.Module):
-        def forward(self, q, k, v, **kwargs):
-            # q/k/v: (bs, seq, heads, dim) -> transpose to (bs, heads, seq, dim)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-            return out.transpose(1, 2)
+            layer.attn.inner_attention = _SDPA(is_causal=True)
 
     for blk in model.vision_encoder.layers.values():
-        blk.attn.flex_attention = _BidirectionalSDPA()
+        blk.attn.flex_attention = _SDPA(is_causal=False)
 
     model.eval()
 
@@ -308,7 +337,7 @@ def run_tt(model_flavor, checkpoint_path, tt_inputs, special_tokens, device):
             tokens.to(device),
             pixel_values=pixel_values.half().to(device),
             grid_thw=grid_thw.to(device),
-            mrope_positions=mrope_positions.to(device),
+            positions=mrope_positions.to(device),
             special_tokens=special_tokens,
         )
         outputs.append(logits[:, -1:, :].cpu())

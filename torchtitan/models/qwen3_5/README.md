@@ -24,10 +24,15 @@ Note: the diagram shows each patch mapping to one vision token. In practice, the
 Install the additional dependencies:
 
 ```bash
-pip install av torchvision flash-linear-attention
+pip install -r .ci/docker/requirements-vlm.txt
 ```
 
 ## Model Variants
+
+Training recipes are intentionally not shipped for the released flavors below
+until they have been validated end to end. User-owned recipes can use the
+corresponding `assets/hf/Qwen3.5-<variant>` directory; for example, flavor
+`35B-A3B` conventionally uses `assets/hf/Qwen3.5-35B-A3B`.
 
 ### Dense
 
@@ -64,7 +69,8 @@ pip install av torchvision flash-linear-attention
 | Tensor Parallelism (TP) | With Sequence Parallel; head-sharded TP on GatedDeltaNet projections |
 | Expert Parallelism (EP) | For MoE variants |
 | Pipeline Parallel (PP) | Vision encoder assigned to first stage; 1F1B and Interleaved1F1B schedules |
-| Sample Packing | Configurable via `packing_buffer_size` in dataloader config |
+| Context Parallelism (CP) | Attention Gym native CP for GatedDeltaNet; full attention supports K/V all-gather with contiguous, head-tail, or PTRR partitions and Ulysses with contiguous partitions. |
+| Sample Packing | Opt-in via `MMSamplePackingConfig` |
 
 ## Numerical Parity
 
@@ -79,4 +85,3 @@ Test scripts:
 ## TODO
 
 - Add video dataset training configs
-- Add Context Parallel (CP) support

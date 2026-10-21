@@ -1,0 +1,16 @@
+# Test recipes
+
+These recipes exist to exercise TorchTitan in CI. They are not recommendations
+for production training.
+
+- `models/` contains reusable debug configurations for individual models.
+- `graph_trainer/` and `torchft/` contain subsystem-specific test recipes.
+- `rl/` contains debug-model and CI recipes for RL examples, one module per
+  example (verified recipes live in `torchtitan_recipes/rl/`).
+- `transformers_modeling_backend.py` contains the test recipes for that
+  standalone test surface.
+
+Keep a configuration with its model when it only changes model-local test
+setup. A configuration that represents one entry of a cross-model or hardware
+test matrix lives next to its test definition in `tests/integration_tests/`,
+so adding an integration test edits one file.

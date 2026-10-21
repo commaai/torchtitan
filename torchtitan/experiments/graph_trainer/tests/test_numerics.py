@@ -7,21 +7,36 @@
 import copy
 import importlib.util
 import math
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
+from unittest.mock import patch
 
+import spmd_types as spmd
 import torch
+import torch.distributed as dist
+import torch.nn as nn
 from torch.distributed._composable.fsdp import fully_shard
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing._internal.common_fsdp import FSDPTest
+from torchtitan_recipes.tests.graph_trainer import numerics as graph_trainer_numerics
 
 from torchtitan.components.loss import cross_entropy_loss
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed import ParallelismContext
+from torchtitan.distributed.spmd_types import set_current_spmd_mesh
+from torchtitan.experiments.graph_trainer import simple_fsdp
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
+from torchtitan.models.common.linear import GroupedLinear, Linear
 
 
 STEPS = 20
+NUMERICS_CONFIG_MODULE = graph_trainer_numerics.__name__
 
 
 def run_loss_compare(
@@ -29,10 +44,10 @@ def run_loss_compare(
     baseline_config: str,
     test_module: str,
     test_config: str,
-    baseline_options: str = "",
-    test_options: str = "",
     baseline_ngpus: int = 8,
     test_ngpus: int = 8,
+    metrics: tuple[str, ...] = ("loss",),
+    steps: int = STEPS,
 ) -> bool:
     """Run loss_compare.py comparing a baseline module against a graph_trainer module.
 
@@ -41,10 +56,10 @@ def run_loss_compare(
         baseline_config: Config name for baseline (e.g., "llama3_debugmodel").
         test_module: Module name for test (e.g., "graph_trainer.llama3").
         test_config: Config name for test (e.g., "graph_trainer_llama3_debugmodel").
-        baseline_options: Additional CLI options for the baseline run.
-        test_options: Additional CLI options for the test run.
         baseline_ngpus: Number of GPUs for the baseline run.
         test_ngpus: Number of GPUs for the test run.
+        metrics: Full-precision TensorBoard metrics that must match exactly.
+        steps: Number of optimizer steps in both runs.
 
     Returns:
         True if the assertion passed, False otherwise.
@@ -62,16 +77,12 @@ def run_loss_compare(
             f"--test-module={test_module}",
             f"--test-config={test_config}",
             "--assert-equal",
-            f"--steps={STEPS}",
+            f"--steps={steps}",
             f"--baseline-ngpus={baseline_ngpus}",
             f"--test-ngpus={test_ngpus}",
+            f"--metrics={','.join(metrics)}",
             f"--job-dump-folder={job_dump_folder}",
         ]
-        if baseline_options:
-            cmd.append(f"--baseline-options={baseline_options}")
-        if test_options:
-            cmd.append(f"--test-options={test_options}")
-
         print(f"Running: {' '.join(cmd)}")
         result = subprocess.run(cmd, text=True)
         if result.returncode != 0:
@@ -84,19 +95,19 @@ def run_loss_compare_close(
     baseline_config: str,
     test_module: str,
     test_config: str,
-    baseline_options: str = "",
-    test_options: str = "",
     baseline_ngpus: int = 8,
     test_ngpus: int = 8,
+    metrics: tuple[str, ...] = ("loss",),
+    steps: int = STEPS,
     rtol: float = 1e-4,
     atol: float = 1e-5,
 ) -> bool:
-    """Run loss_compare.py and assert losses are numerically close.
+    """Run loss_compare.py and assert selected metrics are numerically close.
 
-    AutoParallel can choose a different SPMD graph and collective ordering than
-    eager, so this checks tight numerical agreement rather than bitwise identity.
+    Backends may intentionally change graph, collective, or gradient-accumulation
+    rounding, so this checks tight numerical agreement rather than bitwise identity.
     """
-    from scripts.loss_compare import extract_losses_from_tensorboard
+    from scripts.loss_compare import extract_metrics_from_tensorboard
 
     with tempfile.TemporaryDirectory() as job_dump_folder:
         cmd = [
@@ -108,184 +119,285 @@ def run_loss_compare_close(
             f"--baseline-config={baseline_config}",
             f"--test-module={test_module}",
             f"--test-config={test_config}",
-            f"--steps={STEPS}",
+            f"--steps={steps}",
             f"--baseline-ngpus={baseline_ngpus}",
             f"--test-ngpus={test_ngpus}",
+            f"--metrics={','.join(metrics)}",
             f"--job-dump-folder={job_dump_folder}",
         ]
-        if baseline_options:
-            cmd.append(f"--baseline-options={baseline_options}")
-        if test_options:
-            cmd.append(f"--test-options={test_options}")
-
         print(f"Running: {' '.join(cmd)}")
         result = subprocess.run(cmd, text=True)
         if result.returncode != 0:
             print("loss_compare.py failed")
             return False
 
-        baseline_losses = extract_losses_from_tensorboard(
-            job_dump_folder, "tb_baseline"
+        baseline_metrics = extract_metrics_from_tensorboard(
+            job_dump_folder,
+            "tb_baseline",
+            metrics,
         )
-        test_losses = extract_losses_from_tensorboard(job_dump_folder, "tb_test")
-        if baseline_losses.keys() != test_losses.keys():
-            return False
-        max_step = max(
-            baseline_losses,
-            key=lambda step: abs(baseline_losses[step] - test_losses[step]),
+        test_metrics = extract_metrics_from_tensorboard(
+            job_dump_folder,
+            "tb_test",
+            metrics,
         )
-        max_diff = abs(baseline_losses[max_step] - test_losses[max_step])
-        print(
-            "Max loss difference: "
-            f"step={max_step} baseline={baseline_losses[max_step]!r} "
-            f"test={test_losses[max_step]!r} diff={max_diff!r}"
-        )
-        return all(
-            math.isclose(
-                baseline_losses[step],
-                test_losses[step],
-                rel_tol=rtol,
-                abs_tol=atol,
+        for metric in metrics:
+            baseline_values = baseline_metrics[metric]
+            test_values = test_metrics[metric]
+            if baseline_values.keys() != test_values.keys():
+                return False
+            max_step = max(
+                baseline_values,
+                key=lambda step: abs(baseline_values[step] - test_values[step]),
             )
-            for step in baseline_losses
+            max_diff = abs(baseline_values[max_step] - test_values[max_step])
+            print(
+                f"Max {metric} difference: "
+                f"step={max_step} baseline={baseline_values[max_step]!r} "
+                f"test={test_values[max_step]!r} diff={max_diff!r}"
+            )
+            if not all(
+                math.isclose(
+                    baseline_values[step],
+                    test_values[step],
+                    rel_tol=rtol,
+                    abs_tol=atol,
+                )
+                for step in baseline_values
+            ):
+                return False
+        return True
+
+
+@contextmanager
+def _log_rank(log_rank: int) -> Iterator[None]:
+    previous_log_rank = os.environ.get("LOG_RANK")
+    os.environ["LOG_RANK"] = str(log_rank)
+    try:
+        yield
+    finally:
+        if previous_log_rank is None:
+            os.environ.pop("LOG_RANK", None)
+        else:
+            os.environ["LOG_RANK"] = previous_log_rank
+
+
+def _losses_are_equal(
+    baseline_losses: dict[int, float],
+    test_losses: dict[int, float],
+) -> bool:
+    if baseline_losses.keys() != test_losses.keys():
+        print(
+            "Step mismatch: "
+            f"baseline={sorted(baseline_losses)} test={sorted(test_losses)}"
+        )
+        return False
+
+    for step in sorted(baseline_losses):
+        if baseline_losses[step] != test_losses[step]:
+            print(
+                "Loss mismatch at "
+                f"step={step}: baseline={baseline_losses[step]!r} "
+                f"test={test_losses[step]!r}"
+            )
+            return False
+    return True
+
+
+def _extract_losses_from_rank_tensorboard(
+    job_dump_folder: str,
+    tb_folder: str,
+    rank: int,
+) -> dict[int, float]:
+    from scripts.loss_compare import TB_LOSS_TAG
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    base_path = os.path.join(job_dump_folder, tb_folder)
+    timestamp_dirs = [
+        path
+        for path in os.listdir(base_path)
+        if os.path.isdir(os.path.join(base_path, path))
+    ]
+    rank_event_dirs = [
+        os.path.join(base_path, timestamp_dir, f"rank_{rank}")
+        for timestamp_dir in timestamp_dirs
+        if os.path.isdir(os.path.join(base_path, timestamp_dir, f"rank_{rank}"))
+    ]
+    if len(rank_event_dirs) != 1:
+        raise RuntimeError(
+            f"Expected one TensorBoard rank_{rank} directory under {base_path}, "
+            f"found {rank_event_dirs}."
+        )
+
+    event_accumulator = EventAccumulator(rank_event_dirs[0])
+    event_accumulator.Reload()
+    losses = {
+        scalar.step: scalar.value for scalar in event_accumulator.Scalars(TB_LOSS_TAG)
+    }
+    print(f"Extracted {len(losses)} losses from {rank_event_dirs[0]}")
+    return losses
+
+
+def _run_llama3_loss_compare() -> bool:
+    """Run loss_compare for llama3 vs graph_trainer.llama3 with FSDP+TP."""
+    return run_loss_compare(
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="llama3_eager_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="llama3_graph_numerics",
+    )
+
+
+def _run_hsdp_llama3_gradient_accumulation_loss_compare() -> bool:
+    """Compare eager and GraphTrainer HSDP with gradient accumulation."""
+    return run_loss_compare_close(
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="llama3_eager_hsdp_gradient_accumulation_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="llama3_graph_hsdp_gradient_accumulation_numerics",
+        baseline_ngpus=4,
+        test_ngpus=4,
+        metrics=("loss", "grad_norm"),
+    )
+
+
+def _run_hsdp_llama3_pp_loss_compare() -> bool:
+    """Compare eager PP and GraphPP with HSDP."""
+    with _log_rank(4):
+        return run_loss_compare_close(
+            baseline_module=NUMERICS_CONFIG_MODULE,
+            baseline_config="llama3_eager_hsdp_pp_numerics",
+            test_module=NUMERICS_CONFIG_MODULE,
+            test_config="llama3_graph_hsdp_pp_numerics",
+            baseline_ngpus=8,
+            test_ngpus=8,
+            metrics=("loss", "grad_norm"),
         )
 
 
-LLAMA3_PARALLELISM = (
-    "--parallelism.tensor_parallel_degree=2"
-    " --parallelism.data_parallel_shard_degree=4"
-)
-
-
-def _run_llama3_loss_compare(test_options_extra: str = "") -> bool:
-    """Run loss_compare for llama3 vs graph_trainer.llama3 with FSDP+TP."""
-    test_options = LLAMA3_PARALLELISM
-    if test_options_extra:
-        test_options += f" {test_options_extra}"
-    return run_loss_compare(
-        baseline_module="llama3",
-        baseline_config="llama3_debugmodel",
-        test_module="graph_trainer.llama3",
-        test_config="graph_trainer_llama3_debugmodel",
-        baseline_options=LLAMA3_PARALLELISM,
-        test_options=test_options,
-    )
-
-
-DSV3_PARALLELISM = (
-    "--parallelism.data_parallel_shard_degree=4"
-    " --parallelism.tensor_parallel_degree=2"
-    " --parallelism.expert_parallel_degree=2"
-)
-
-
-def _run_deepseek_v3_loss_compare(test_options_extra: str = "") -> bool:
+def _run_deepseek_v3_loss_compare(
+    *,
+    baseline_config: str = "deepseek_v3_eager_numerics",
+    test_config: str = "deepseek_v3_graph_numerics",
+) -> bool:
     """Run loss_compare for deepseek_v3 vs graph_trainer.deepseek_v3."""
-    test_options = DSV3_PARALLELISM
-    if test_options_extra:
-        test_options += f" {test_options_extra}"
     return run_loss_compare(
-        baseline_module="deepseek_v3",
-        baseline_config="deepseek_v3_debugmodel",
-        test_module="graph_trainer.deepseek_v3",
-        test_config="graph_trainer_deepseek_v3_debugmodel",
-        baseline_options=DSV3_PARALLELISM,
-        test_options=test_options,
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config=baseline_config,
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config=test_config,
     )
 
 
-QWEN3_PARALLELISM = (
-    "--parallelism.tensor_parallel_degree=2"
-    " --parallelism.data_parallel_shard_degree=4"
-)
+def _run_graph_pp_deepseek_v3_loss_compare(schedule: str) -> bool:
+    """Run exact loss_compare for eager Interleaved1F1B PP vs GraphPP."""
+    from scripts.loss_compare import create_seed_checkpoint, run_training
+
+    test_configs = {
+        "Interleaved1F1B": "deepseek_v3_graph_pp_interleaved_numerics",
+        "ZBVZeroBubble": "deepseek_v3_graph_pp_zbv_numerics",
+        "DualPipeV": "deepseek_v3_graph_pp_dual_pipe_v_numerics",
+    }
+    baseline_module = NUMERICS_CONFIG_MODULE
+    baseline_config = "deepseek_v3_eager_pp_numerics"
+    test_module = NUMERICS_CONFIG_MODULE
+    test_config = test_configs[schedule]
+    baseline_tb_folder = "tb_baseline"
+    test_tb_folder = "tb_test"
+    baseline_loss_rank = 4
+    test_loss_rank = 0 if schedule in {"ZBVZeroBubble", "DualPipeV"} else 4
+
+    # loss_compare.py and core metrics choose one logging rank per run. The
+    # eager Interleaved1F1B baseline owns loss on the first rank of the last PP
+    # stage, while V-style GraphPP schedules own loss on rank 0. Save TB for
+    # all ranks in this experiment-local test, then compare the full-precision
+    # scalars from the ranks that actually own loss.
+    with tempfile.TemporaryDirectory() as job_dump_folder:
+        create_seed_checkpoint(
+            True,
+            baseline_module,
+            baseline_config,
+            None,
+            job_dump_folder,
+        )
+        with _log_rank(baseline_loss_rank):
+            run_training(
+                "baseline",
+                baseline_module,
+                baseline_config,
+                STEPS,
+                True,
+                None,
+                job_dump_folder,
+                8,
+                tb_folder=baseline_tb_folder,
+            )
+        baseline_losses = _extract_losses_from_rank_tensorboard(
+            job_dump_folder,
+            baseline_tb_folder,
+            baseline_loss_rank,
+        )
+
+        with _log_rank(test_loss_rank):
+            run_training(
+                "test",
+                test_module,
+                test_config,
+                STEPS,
+                True,
+                None,
+                job_dump_folder,
+                8,
+                tb_folder=test_tb_folder,
+            )
+        test_losses = _extract_losses_from_rank_tensorboard(
+            job_dump_folder,
+            test_tb_folder,
+            test_loss_rank,
+        )
+
+    return _losses_are_equal(baseline_losses, test_losses)
 
 
-def _run_qwen3_loss_compare(test_options_extra: str = "") -> bool:
+def _run_qwen3_loss_compare() -> bool:
     """Run loss_compare for qwen3 vs graph_trainer.qwen3 with FSDP+TP."""
-    test_options = QWEN3_PARALLELISM
-    if test_options_extra:
-        test_options += f" {test_options_extra}"
     return run_loss_compare(
-        baseline_module="qwen3",
-        baseline_config="qwen3_debugmodel",
-        test_module="graph_trainer.qwen3",
-        test_config="graph_trainer_qwen3_debugmodel",
-        baseline_options=QWEN3_PARALLELISM,
-        test_options=test_options,
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="qwen3_eager_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="qwen3_graph_numerics",
     )
 
 
-QWEN3_MOE_PARALLELISM = (
-    "--parallelism.data_parallel_shard_degree=4"
-    " --parallelism.tensor_parallel_degree=2"
-    " --parallelism.expert_parallel_degree=2"
-)
-
-
-def _run_qwen3_moe_loss_compare(test_options_extra: str = "") -> bool:
+def _run_qwen3_moe_loss_compare() -> bool:
     """Run loss_compare for qwen3 MoE vs graph_trainer.qwen3 MoE."""
-    test_options = QWEN3_MOE_PARALLELISM
-    if test_options_extra:
-        test_options += f" {test_options_extra}"
     return run_loss_compare(
-        baseline_module="qwen3",
-        baseline_config="qwen3_moe_debug",
-        test_module="graph_trainer.qwen3",
-        test_config="graph_trainer_qwen3_debugmodel_moe",
-        baseline_options=QWEN3_MOE_PARALLELISM,
-        test_options=test_options,
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="qwen3_moe_eager_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="qwen3_moe_graph_numerics",
     )
-
-
-AUTOPARALLEL_LLAMA3_PARALLELISM = (
-    "--parallelism.data_parallel_shard_degree=2"
-    " --parallelism.tensor_parallel_degree=2"
-)
 
 
 def _run_autoparallel_llama3_loss_compare() -> bool:
-    """Run loss_compare for eager SDPA llama3 vs graph_trainer AutoParallel.
-
-    AutoParallel is unsupported on the default FlexAttention backend (dynamo
-    export flattens the BlockMask), so both sides use the test-only SDPA backend.
-    The eager baseline runs the same SDPA model through GraphTrainer with
-    ``mode=None`` (delegates to the core eager path).
-    """
+    """Compare manual and AutoParallel Llama3 using Varlen attention."""
     return run_loss_compare_close(
-        baseline_module="graph_trainer.llama3",
-        baseline_config="graph_trainer_llama3_debugmodel_sdpa_eager",
-        test_module="graph_trainer.llama3",
-        test_config="graph_trainer_llama3_debugmodel_sdpa_cross_entropy_loss",
-        baseline_options=AUTOPARALLEL_LLAMA3_PARALLELISM,
-        test_options=(
-            f"{AUTOPARALLEL_LLAMA3_PARALLELISM}"
-            " --compile.mode aot_fx_trace"
-            " --compile.enable_autoparallel"
-        ),
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="llama3_varlen_manual_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="llama3_varlen_autoparallel_numerics",
         baseline_ngpus=4,
         test_ngpus=4,
     )
 
 
-AUTOPARALLEL_DSV3_PARALLELISM = (
-    "--parallelism.data_parallel_shard_degree=4"
-    " --parallelism.expert_parallel_degree=2"
-)
-
-
 def _run_autoparallel_deepseek_v3_loss_compare() -> bool:
     """Run loss_compare for eager DeepSeek V3 vs graph_trainer AutoParallel."""
     return run_loss_compare_close(
-        baseline_module="deepseek_v3",
-        baseline_config="deepseek_v3_debugmodel",
-        test_module="graph_trainer.deepseek_v3",
-        test_config="graph_trainer_deepseek_v3_debugmodel",
-        baseline_options=AUTOPARALLEL_DSV3_PARALLELISM,
-        test_options=(
-            f"{AUTOPARALLEL_DSV3_PARALLELISM}"
-            " --compile.mode aot_fx_trace"
-            " --compile.enable_autoparallel"
-        ),
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="deepseek_v3_manual_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="deepseek_v3_autoparallel_numerics",
         baseline_ngpus=4,
         test_ngpus=4,
         rtol=5e-4,
@@ -296,46 +408,13 @@ class TestGraphTrainerNumerics(unittest.TestCase):
     """Test numerics equivalence between graph_trainer and FSDP2 eager."""
 
     def test_dense_llama3_aot_fx_trace_vs_eager(self):
-        self.assertTrue(
-            _run_llama3_loss_compare(test_options_extra="--compile.mode aot_fx_trace"),
-        )
+        self.assertTrue(_run_llama3_loss_compare())
 
-    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
-    def test_dense_llama3_jit_vs_eager(self):
-        self.assertTrue(
-            _run_llama3_loss_compare(test_options_extra="--compile.mode jit"),
-        )
+    def test_dense_llama3_hsdp_gradient_accumulation_aot_fx_trace_vs_eager(self):
+        self.assertTrue(_run_hsdp_llama3_gradient_accumulation_loss_compare())
 
-    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
-    def test_dense_llama3_auto_bucketing_jit_vs_eager(self):
-        self.assertTrue(
-            _run_llama3_loss_compare(
-                test_options_extra="--compile.mode jit --compile.passes auto_bucketing"
-            ),
-        )
-
-    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
-    def test_dense_llama3_manual_bucketing_jit_vs_eager(self):
-        self.assertTrue(
-            _run_llama3_loss_compare(
-                test_options_extra="--compile.mode jit --compile.passes transformer_block_bucketing"
-            ),
-        )
-
-    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
-    def test_moe_dsv3_jit_vs_eager(self):
-        """Test graph_trainer.deepseek_v3 matches deepseek_v3 (JIT)."""
-        self.assertTrue(
-            _run_deepseek_v3_loss_compare(test_options_extra="--compile.mode jit"),
-        )
-
-    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
-    def test_moe_dsv3_manual_bucketing_jit_vs_eager(self):
-        self.assertTrue(
-            _run_deepseek_v3_loss_compare(
-                test_options_extra="--compile.mode jit --compile.passes transformer_block_bucketing"
-            ),
-        )
+    def test_dense_llama3_hsdp_graph_pp_vs_eager(self):
+        self.assertTrue(_run_hsdp_llama3_pp_loss_compare())
 
     @unittest.skip(
         "Disabled: flaky single-rank crash in DSv3 MoE EP all-to-all. Losses "
@@ -345,22 +424,82 @@ class TestGraphTrainerNumerics(unittest.TestCase):
         "diagnosed and fixed."
     )
     def test_moe_dsv3_aot_fx_trace_vs_eager(self):
-        self.assertTrue(
-            _run_deepseek_v3_loss_compare(
-                test_options_extra="--compile.mode aot_fx_trace"
-            ),
-        )
+        self.assertTrue(_run_deepseek_v3_loss_compare())
+
+    @unittest.skip(
+        # Flaky on H100 CI: the DSv3 MoE EP all-to-all is not bitwise
+        # deterministic with debug.deterministic (ALLTOALL_BASE reduction
+        # order varies across NCCL/driver), so the aot_fx_trace vs eager loss
+        # compare diverges by ~2e-5. Passes bitwise locally. See #3874.
+        "flaky: DSv3 MoE EP all-to-all nondeterminism with debug.deterministic (#3874)"
+    )
+    def test_graph_pp_moe_dsv3_aot_fx_trace_vs_eager(self):
+        for schedule in ("Interleaved1F1B", "ZBVZeroBubble", "DualPipeV"):
+            with self.subTest(schedule=schedule):
+                self.assertTrue(_run_graph_pp_deepseek_v3_loss_compare(schedule))
 
     def test_dense_qwen3_aot_fx_trace_vs_eager(self):
-        self.assertTrue(
-            _run_qwen3_loss_compare(test_options_extra="--compile.mode aot_fx_trace"),
-        )
+        self.assertTrue(_run_qwen3_loss_compare())
 
     def test_moe_qwen3_aot_fx_trace_vs_eager(self):
+        self.assertTrue(_run_qwen3_moe_loss_compare())
+
+
+def _run_dist_moe_pp_loss_compare(
+    baseline_config: str,
+    test_config: str,
+) -> bool:
+    """Compare exact Dist-MoE PP loss and gradient norm on four GPUs."""
+    with _log_rank(2):
+        return run_loss_compare(
+            NUMERICS_CONFIG_MODULE,
+            baseline_config,
+            NUMERICS_CONFIG_MODULE,
+            test_config,
+            baseline_ngpus=4,
+            test_ngpus=4,
+            metrics=("loss", "grad_norm"),
+            steps=4,
+        )
+
+
+def _run_dist_moe_graph_pp_loss_compare_close() -> bool:
+    """Compare GraphPP against eager across the known WGrad rounding boundary."""
+    with _log_rank(2):
+        return run_loss_compare_close(
+            NUMERICS_CONFIG_MODULE,
+            "deepseek_v3_dist_moe_eager_pp_stage_microbatch_numerics",
+            NUMERICS_CONFIG_MODULE,
+            "deepseek_v3_dist_moe_graph_pp_stage_microbatch_numerics",
+            baseline_ngpus=4,
+            test_ngpus=4,
+            metrics=("loss", "grad_norm"),
+            steps=4,
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+
+@unittest.skipUnless(
+    torch.cuda.device_count() >= 4 and importlib.util.find_spec("dist_moe") is not None,
+    "requires four CUDA devices and the optional dist-moe package",
+)
+class TestDistMoePipelineNumerics(unittest.TestCase):
+    """Verify Dist-MoE slot selection and cross-engine numerical agreement."""
+
+    def test_graph_pp_matches_eager(self) -> None:
+        """GraphPP and eager agree across their WGrad rounding boundary."""
+        # FIXME(https://github.com/pytorch/torchtitan/issues/5043): restore
+        # bitwise parity after GraphPP preserves singleton-FSDP reduce dtype.
+        self.assertTrue(_run_dist_moe_graph_pp_loss_compare_close())
+
+    def test_eager_slot_policies_match_bitwise(self) -> None:
+        """Changing only eager slot granularity must preserve exact numerics."""
         self.assertTrue(
-            _run_qwen3_moe_loss_compare(
-                test_options_extra="--compile.mode aot_fx_trace"
-            ),
+            _run_dist_moe_pp_loss_compare(
+                "deepseek_v3_dist_moe_eager_pp_microbatch_numerics",
+                "deepseek_v3_dist_moe_eager_pp_stage_microbatch_numerics",
+            )
         )
 
 
@@ -371,11 +510,17 @@ class TestGraphTrainerNumerics(unittest.TestCase):
 class TestGraphTrainerAutoParallelNumerics(unittest.TestCase):
     """Test graph_trainer AutoParallel numerics equivalence against eager."""
 
-    # AutoParallel runs on the test-only SDPA backend (Decoder.forward lists
-    # positions before attention_masks so input_fn's (tokens, positions) binds
-    # correctly). It is unsupported on the default FlexAttention backend (dynamo
-    # export flattens the BlockMask to (Fake)Tensors and flex_attention fails on
-    # missing BLOCK_SIZE), so both eager baseline and AutoParallel test use SDPA.
+    # TODO: Before re-enabling, wire Varlen metadata through AutoParallel
+    # input_fn and its input sharding constraints.
+    # TODO: Disabled due to upstream AutoParallel/PyTorch API skew. PyTorch
+    # #186754 (2026-06-24) removed propagate_single_input_strategy in favor of
+    # propagate_single_input_single_dim_strategy, but AutoParallel's
+    # convert_element_type_rule still imports the old name, so the sharding
+    # optimizer fails with ImportError. Re-enable once AutoParallel migrates.
+    # https://github.com/pytorch/torchtitan/issues/3699
+    @unittest.skip(
+        "upstream AutoParallel imports removed propagate_single_input_strategy"
+    )
     def test_llama3_aot_fx_trace_autoparallel_vs_eager(self):
         self.assertTrue(_run_autoparallel_llama3_loss_compare())
 
@@ -384,7 +529,466 @@ class TestGraphTrainerAutoParallelNumerics(unittest.TestCase):
         self.assertTrue(_run_autoparallel_deepseek_v3_loss_compare())
 
 
+# B: batch size, D: input features, O: output features.
+
+
+class _SharedProjection(nn.Module):
+    def __init__(self, num_outputs, *, num_inputs=8, bias, device):
+        super().__init__()
+        self.projection = nn.Linear(
+            num_inputs, num_outputs, bias=bias, device=device, dtype=torch.float64
+        )
+
+    def forward(self, inputs_BD):
+        return sum(self.projection(inputs_BD * scale) for scale in (1, 2, 3, 4))
+
+
+class _WeightedSum(nn.Module):
+    """``sum(inputs * weight)``, so the weight gradient is the summed input."""
+
+    def __init__(self, num_features, *, device, wide_grad=False):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_features, device=device))
+        self.wide_grad = wide_grad
+
+    def forward(self, inputs_BD):
+        weight = (
+            _AddFp32GradResidual.apply(self.weight) if self.wide_grad else self.weight
+        )
+        return (inputs_BD * weight).sum()
+
+
+class _AddFp32GradResidual(torch.autograd.Function):
+    """Identity whose backward returns an fp32 gradient with a sub-bf16 term.
+
+    Stands in for a module like HiMidLoLinear that computes a bf16 weight's
+    gradient in fp32.
+    """
+
+    @staticmethod
+    def forward(ctx, weight):
+        return weight.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad.float() + 2**-9
+
+
 class TestSimpleFSDP(FSDPTest):
+    @staticmethod
+    def _local_shard(tensor, *, tp_rank, dp_rank, shard_dim, mode):
+        local = tensor.chunk(2, dim=0)[tp_rank]
+        if mode != "replicate":
+            chunks = local.chunk(2, dim=shard_dim)
+            local = (
+                chunks[dp_rank]
+                if dp_rank < len(chunks)
+                else local.narrow(shard_dim, 0, 0)
+            )
+        return local.contiguous()
+
+    @staticmethod
+    def _check_layout(actual, expected):
+        assert actual.shape == expected.shape
+        assert actual.stride() == expected.stride()
+        assert len(actual.placements) == len(expected.placements)
+        for placement, expected_placement in zip(
+            actual.placements, expected.placements, strict=True
+        ):
+            assert type(placement) is type(expected_placement)
+            assert placement == expected_placement
+            if isinstance(placement, _StridedShard):
+                assert placement.split_factor == expected_placement.split_factor
+
+    @patch.dict(os.environ, {"CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
+    def _test_sharding(
+        self,
+        mode="fully_shard",
+        *,
+        num_outputs=10,
+        num_inputs=8,
+        shard_dim=0,
+        meta_init=False,
+        compiled=False,
+        transposed=False,
+    ):
+        required_world_size = 8 if mode == "hybrid_shard" else 4
+        if self.world_size < required_world_size or self.world_size % 4:
+            self.skipTest(
+                f"Requires a multiple of four devices, at least {required_world_size}"
+            )
+        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
+        device = (
+            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
+        )
+        previous_deterministic = torch.are_deterministic_algorithms_enabled()
+        torch.manual_seed(42)
+        torch.use_deterministic_algorithms(True)
+        try:
+            mesh = init_device_mesh(
+                device_type,
+                (self.world_size // 4, 2, 2),
+                mesh_dim_names=("replica", "fsdp", "tp"),
+            )
+            dp_mesh = (
+                mesh["replica", "fsdp"] if mode == "hybrid_shard" else mesh["fsdp"]
+            )
+            tp_mesh = mesh["tp"]
+            tp_rank = tp_mesh.get_local_rank()
+            dp_rank = mesh["fsdp"].get_local_rank()
+            reference = _SharedProjection(
+                num_outputs, num_inputs=num_inputs, bias=shard_dim == 0, device=device
+            )
+            if transposed:
+                reference.projection.weight = nn.Parameter(
+                    reference.projection.weight.detach().t().contiguous().t()
+                )
+            model = (
+                _SharedProjection(
+                    num_outputs,
+                    num_inputs=num_inputs,
+                    bias=shard_dim == 0,
+                    device="meta",
+                )
+                if meta_init
+                else copy.deepcopy(reference)
+            )
+            for name, parameter in model.projection.named_parameters():
+                local_parameter = nn.Parameter(
+                    parameter.detach().chunk(2, dim=0)[tp_rank].clone(),
+                    requires_grad=parameter.requires_grad,
+                )
+                spmd.assert_type(local_parameter, {tp_mesh.get_group(): spmd.S(0)})
+                model.projection.register_parameter(name, local_parameter)
+
+            original_redistribute = simple_fsdp.redistribute_local_tensor
+
+            def check_outer_spec(local, *, current_spec, target_spec):
+                for spec in (current_spec, target_spec):
+                    assert spec.shape == local.shape
+                    assert spec.tensor_meta.stride == local.stride()
+                    assert spec.tensor_meta.dtype == local.dtype
+                return original_redistribute(
+                    local, current_spec=current_spec, target_spec=target_spec
+                )
+
+            with patch.object(
+                simple_fsdp, "redistribute_local_tensor", check_outer_spec
+            ):
+                simple_fsdp.data_parallel(
+                    model,
+                    dp_mesh,
+                    mode,
+                    shard_dim=shard_dim,
+                    non_dp_mesh=tp_mesh,
+                )
+
+            def expected_local(tensor):
+                return self._local_shard(
+                    tensor,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    shard_dim=shard_dim,
+                    mode=mode,
+                )
+
+            if meta_init:
+                model.to_empty(device=device)
+                assert all(not parameter.is_meta for parameter in model.parameters())
+                with torch.no_grad(), simple_fsdp.disable_active_parametrization():
+                    for parameter, original in zip(
+                        model.parameters(), reference.parameters(), strict=True
+                    ):
+                        parameter.to_local().copy_(expected_local(original))
+
+            compute_weight = model.projection.weight
+            self.assertNotIsInstance(compute_weight, DTensor)
+            self.assertEqual(compute_weight.shape, (num_outputs // 2, num_inputs))
+            for parameter, original in zip(
+                model.parameters(), reference.parameters(), strict=True
+            ):
+                self.assertIsInstance(parameter, DTensor)
+                self.assertEqual(parameter.shape, original.shape)
+                self.assertEqual(parameter.stride(), original.stride())
+            optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, foreach=False)
+            reference_optimizer = torch.optim.AdamW(
+                reference.parameters(), lr=0.01, foreach=False
+            )
+            run_model = (
+                torch.compile(model, backend="aot_eager", fullgraph=True)
+                if compiled
+                else model
+            )
+            for _ in range(2):
+                optimizer.zero_grad(set_to_none=True)
+                reference_optimizer.zero_grad(set_to_none=True)
+                for microbatch in range(2):
+                    # Sparse, exactly representable inputs keep the comparison bitwise
+                    # across different GEMM shapes while varying the data across DP ranks.
+                    batch_start = (self.rank // 2 + microbatch) % 4
+                    inputs_BD = torch.eye(
+                        num_inputs, dtype=torch.float64, device=device
+                    )[batch_start : batch_start + 2]
+                    output_BO = run_model(inputs_BD)
+                    expected_BO = reference(inputs_BD)
+                    local_expected_BO = expected_BO.chunk(2, dim=1)[
+                        tp_rank
+                    ].contiguous()
+                    torch.testing.assert_close(
+                        output_BO, local_expected_BO, rtol=0, atol=0
+                    )
+                    loss = output_BO.sum()
+                    torch.testing.assert_close(
+                        loss, local_expected_BO.sum(), rtol=0, atol=0
+                    )
+                    loss.backward()
+                    expected_BO.sum().backward()
+                for parameter, original in zip(
+                    model.parameters(), reference.parameters(), strict=True
+                ):
+                    # NCCL requires contiguous buffers even for transposed parameters.
+                    reference_grad = original.grad.contiguous()
+                    # SimpleFSDP sums gradients across every data-parallel axis.
+                    for axis_name in dp_mesh.mesh_dim_names:
+                        dist.all_reduce(
+                            reference_grad, group=dp_mesh.get_group(axis_name)
+                        )
+                    original.grad.copy_(reference_grad)
+                    self._check_layout(parameter.grad, parameter)
+                    torch.testing.assert_close(
+                        parameter.grad.to_local(),
+                        expected_local(original.grad),
+                        rtol=0,
+                        atol=0,
+                    )
+                optimizer.step()
+                reference_optimizer.step()
+                for parameter, original in zip(
+                    model.parameters(), reference.parameters(), strict=True
+                ):
+                    torch.testing.assert_close(
+                        parameter.to_local(), expected_local(original), rtol=0, atol=0
+                    )
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        state = optimizer.state[parameter][key]
+                        self._check_layout(state, parameter)
+                        torch.testing.assert_close(
+                            state.to_local(),
+                            expected_local(reference_optimizer.state[original][key]),
+                            rtol=0,
+                            atol=0,
+                        )
+        finally:
+            torch.use_deterministic_algorithms(previous_deterministic)
+
+    def test_uneven_fsdp_with_tp(self):
+        self._test_sharding()
+
+    def test_uneven_fsdp_with_ep_tp(self):
+        if self.world_size < 8 or self.world_size % 4:
+            self.skipTest("Requires a multiple of four devices, at least eight")
+        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
+        device = (
+            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
+        )
+        mesh = init_device_mesh(
+            device_type,
+            (self.world_size // 4, 2, 2),
+            mesh_dim_names=("fsdp", "ep", "tp"),
+        )
+        # EP and TP split evenly: 20 -> 10 -> 5. Only the DP split is uneven.
+        weight = torch.arange(160, dtype=torch.float32, device=device).reshape(20, 8)
+        expected_local = (
+            weight.chunk(2, dim=0)[mesh["ep"].get_local_rank()]
+            .chunk(2, dim=0)[mesh["tp"].get_local_rank()]
+            .clone()
+        )
+        model = nn.Linear(8, 20, bias=False, device=device)
+        model.weight = nn.Parameter(expected_local.clone())
+        ep_axis = spmd.MeshAxis.of(mesh["ep"].get_group())
+        tp_axis = spmd.MeshAxis.of(mesh["tp"].get_group())
+        spmd.assert_type(
+            model.weight,
+            {ep_axis: spmd.V, tp_axis: spmd.V},
+            spmd.PartitionSpec((ep_axis, tp_axis), None),
+        )
+        data_parallel(model, mesh["fsdp"], "fully_shard", non_dp_mesh=mesh["ep", "tp"])
+        output = model.weight
+        self.assertNotIsInstance(output, DTensor)
+        torch.testing.assert_close(output, expected_local, rtol=0, atol=0)
+        output.sum().backward()
+        parameter = model._parameters["weight"]
+        self.assertEqual(parameter.shape, weight.shape)
+        self._check_layout(parameter.grad, parameter)
+        torch.testing.assert_close(
+            parameter.grad.to_local(),
+            torch.full_like(parameter.to_local(), mesh["fsdp"].size()),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_uneven_hsdp_with_tp(self):
+        self._test_sharding("hybrid_shard")
+
+    def test_uneven_fsdp_shard_dim_one_with_tp(self):
+        self._test_sharding(num_inputs=7, shard_dim=1)
+
+    def test_replicate_with_tp(self):
+        self._test_sharding("replicate")
+
+    def test_uneven_sharding_transposed_parameter(self):
+        self._test_sharding(transposed=True)
+
+    def test_uneven_sharding_transposed_parameter_compiled(self):
+        self._test_sharding(transposed=True, compiled=True)
+
+    def test_replicate_transposed_parameter(self):
+        self._test_sharding("replicate", transposed=True)
+
+    def test_uneven_sharding_meta_init(self):
+        self._test_sharding(meta_init=True)
+
+    def test_uneven_sharding_compiled(self):
+        self._test_sharding(compiled=True)
+
+    def test_even_fsdp_with_tp(self):
+        self._test_sharding(num_outputs=12)
+
+    def test_empty_fsdp_shard_with_tp(self):
+        self._test_sharding(num_outputs=2)
+
+    def test_stacked_linear_shards_matrix_rows(self):
+        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
+        device = (
+            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
+        )
+        mesh = init_device_mesh(
+            device_type, (self.world_size,), mesh_dim_names=("fsdp",)
+        )
+        model = Linear.Config(
+            in_features=8,
+            out_features=8,
+            num_linears=2,
+            bias=True,
+        ).build()
+        model.to(device)
+
+        data_parallel(model, mesh, "fully_shard")
+
+        weight = model._parameters["weight"]
+        bias = model._parameters["bias"]
+        self.assertIsInstance(weight, DTensor)
+        self.assertIsInstance(bias, DTensor)
+        self.assertEqual(weight.placements, (Shard(1),))
+        self.assertEqual(bias.placements, (Shard(1),))
+
+    def test_stacked_grouped_linear_shards_matrix_rows(self):
+        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
+        device = (
+            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
+        )
+        mesh = init_device_mesh(
+            device_type, (self.world_size,), mesh_dim_names=("fsdp",)
+        )
+        model = GroupedLinear.Config(
+            group_size=4,
+            in_features=8,
+            out_features=8,
+            num_linears=2,
+        ).build()
+        model.to(device)
+
+        data_parallel(model, mesh, "fully_shard")
+
+        weight = model._parameters["weight"]
+        self.assertIsInstance(weight, DTensor)
+        self.assertEqual(weight.placements, (Shard(2),))
+
+    def test_frozen_parameter_remains_frozen(self):
+        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
+        device = (
+            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
+        )
+        mesh = init_device_mesh(
+            device_type, (self.world_size,), mesh_dim_names=("fsdp",)
+        )
+        model = nn.Linear(8, 8, device=device)
+        model.weight.requires_grad_(False)
+        data_parallel(model, mesh, "fully_shard")
+        weight = model._parameters["weight"]
+        bias = model._parameters["bias"]
+        self.assertFalse(weight.requires_grad)
+        self.assertTrue(bias.requires_grad)
+        original_weight = weight.to_local().detach().clone()
+        original_bias = bias.to_local().detach().clone()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+        model(torch.ones(2, 8, device=device)).sum().backward()
+        self.assertIsNone(weight.grad)
+        self.assertIsNotNone(bias.grad)
+        optimizer.step()
+        self.assertTrue(torch.equal(weight.to_local(), original_weight))
+        self.assertFalse(torch.equal(bias.to_local(), original_bias))
+
+    def test_tp_reduced_grad_stays_in_reduce_dtype(self):
+        """The TP all-reduce of an R parameter's grad feeds the reduce-scatter
+        in reduce_dtype, as in FSDP2, without rounding to param_dtype."""
+        if self.world_size < 4 or self.world_size % 2:
+            self.skipTest("Requires an even number of devices, at least four")
+        device = torch.device("cuda", self.rank)
+        mesh = init_device_mesh(
+            "cuda", (self.world_size // 2, 2), mesh_dim_names=("fsdp", "tp")
+        )
+        dp_size, dp_rank = mesh["fsdp"].size(), mesh["fsdp"].get_local_rank()
+        tp_mesh = mesh["tp"]
+        model = _WeightedSum(dp_size, device=device)
+        # R on TP, like a sequence-parallel norm weight: each TP rank's grad is
+        # partial.
+        spmd.assert_type(model.weight, {tp_mesh.get_group(): spmd.R})
+        data_parallel(
+            model,
+            mesh["fsdp"],
+            "fully_shard",
+            mp_policy=simple_fsdp.MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+            ),
+            non_dp_mesh=tp_mesh,
+        )
+        # Per-TP-rank grads 1 and 2**-9 are exact in bf16, but their sum is not.
+        value = 1.0 if tp_mesh.get_local_rank() == 0 else 2**-9
+        inputs_BD = torch.full((1, dp_size), value, dtype=torch.bfloat16, device=device)
+        # Match the trainer: it disables autograd multithreading and sets the
+        # ambient mesh, so backward can resolve the TP axis.
+        with (
+            torch.autograd.set_multithreading_enabled(False),
+            set_current_spmd_mesh(mesh),
+        ):
+            model(inputs_BD).backward()
+        # Summed over TP in fp32 (1 + 2**-9), then over FSDP.
+        expected = torch.full((1,), dp_size * (1 + 2**-9), device=device)
+        grad = model._parameters["weight"].grad.to_local()
+        torch.testing.assert_close(grad, expected, rtol=0, atol=0)
+
+    def test_wide_grad_reaches_reduce_scatter(self):
+        """A gradient computed in fp32 for a bf16 weight keeps its fp32 value,
+        as with FSDP2's unsharded grad_dtype = reduce_dtype."""
+        device = torch.device("cuda", self.rank)
+        mesh = init_device_mesh("cuda", (self.world_size,), mesh_dim_names=("fsdp",))
+        model = _WeightedSum(self.world_size, device=device, wide_grad=True)
+        data_parallel(
+            model,
+            mesh,
+            "fully_shard",
+            mp_policy=simple_fsdp.MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+            ),
+        )
+        inputs_BD = torch.ones(1, self.world_size, dtype=torch.bfloat16, device=device)
+        model(inputs_BD).backward()
+        # Each rank contributes 1 + 2**-9, which bf16 would round to 1.
+        expected = torch.full((1,), self.world_size * (1 + 2**-9), device=device)
+        grad = model._parameters["weight"].grad.to_local()
+        torch.testing.assert_close(grad, expected, rtol=0, atol=0)
+
     def init_test(self):
         self.optimizer = torch.optim.Adam
         self.loss_fn = cross_entropy_loss
@@ -393,15 +997,15 @@ class TestSimpleFSDP(FSDPTest):
             self.dp_mesh_dim_names = ["dp_replicate"]
             data_parallel_replicate_degree = self.world_size
         elif self.mode == "fully_shard":
-            self.dp_mesh_dim_names = ["fsdp"]
+            self.dp_mesh_dim_names = ["dp_shard"]
             data_parallel_replicate_degree = 1
         elif self.mode == "hybrid_shard":
-            self.dp_mesh_dim_names = ["dp_replicate", "fsdp"]
+            self.dp_mesh_dim_names = ["dp_replicate", "dp_shard"]
             data_parallel_replicate_degree = self.world_size // 2
         else:
             raise ValueError(f"Unsupported mode {self.mode}")
 
-        self.parallel_dims = ParallelDims(
+        self.parallelism_context = ParallelismContext(
             dp_shard=data_parallel_shard_degree,
             dp_replicate=data_parallel_replicate_degree,
             cp=1,
@@ -409,6 +1013,7 @@ class TestSimpleFSDP(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            enable_sequence_parallel=False,
         )
 
     def get_input(self):
@@ -418,7 +1023,9 @@ class TestSimpleFSDP(FSDPTest):
         return model, inputs, labels
 
     def run_fsdp2(self, model, inputs, labels, epoch=20):
-        fully_shard(model, mesh=self.parallel_dims.get_mesh(self.dp_mesh_dim_names))
+        fully_shard(
+            model, mesh=self.parallelism_context.get_mesh(self.dp_mesh_dim_names)
+        )
         optim = self.optimizer(model.parameters(), lr=1e-4)
         losses = []
         for _ in range(epoch):
@@ -433,7 +1040,7 @@ class TestSimpleFSDP(FSDPTest):
     def run_simple_fsdp(self, model, inputs, labels, epoch=20):
         model = data_parallel(
             model,
-            device_mesh=self.parallel_dims.get_mesh(self.dp_mesh_dim_names),
+            device_mesh=self.parallelism_context.get_mesh(self.dp_mesh_dim_names),
             mode=self.mode,
         )
         optim = self.optimizer(model.parameters(), lr=1e-4)
@@ -450,7 +1057,7 @@ class TestSimpleFSDP(FSDPTest):
     def run_simple_fsdp_compiled_aot_eager(self, model, inputs, labels, epoch=20):
         model = data_parallel(
             model,
-            device_mesh=self.parallel_dims.get_mesh(self.dp_mesh_dim_names),
+            device_mesh=self.parallelism_context.get_mesh(self.dp_mesh_dim_names),
             mode=self.mode,
         )
         # TODO: Add "inductor" backend when it's numerical issues are fixed

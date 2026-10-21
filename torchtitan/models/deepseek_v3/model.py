@@ -5,21 +5,32 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+import spmd_types as spmd
 import torch
+import torch_remat as remat
 from torch import nn
 
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import (
-    AttentionMasksType,
     BaseAttention,
-    FlexAttention,
+    FlexAttentionMetadata,
+    VarlenAttentionMetadata,
+    VarlenInnerAttention,
 )
-from torchtitan.models.common.decoder import Decoder, TransformerBlock
-from torchtitan.models.common.nn_modules import Linear, RMSNorm
+from torchtitan.models.common.decoder import TransformerBlock
+from torchtitan.models.common.flops import (
+    get_nparams_and_active_nparams,
+    quadratic_attention_flops_per_token,
+)
+from torchtitan.models.common.linear import Linear, maybe_gather_tp_input
+from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
-from torchtitan.models.utils import get_moe_model_nparams_and_flops
-from torchtitan.protocols.module import Module
+from torchtitan.models.deepseek_v3.mtp import MTPDecoder
+
+from .state_dict_adapter import DeepSeekV3StateDictAdapter
 
 
 class Attention(BaseAttention):
@@ -47,7 +58,9 @@ class Attention(BaseAttention):
         qk_rope_head_dim: int = 64
         v_head_dim: int = 128
         rope: RoPE.Config
-        inner_attention: Module.Config = field(default_factory=FlexAttention.Config)
+        inner_attention: Module.Config = field(
+            default_factory=VarlenInnerAttention.Config
+        )
         mscale: float = 1.0
 
     def __init__(self, config: Config):
@@ -80,7 +93,7 @@ class Attention(BaseAttention):
         self.wo = config.wo.build()
         self.softmax_scale = self.qk_head_dim**-0.5
 
-        if config.rope.max_seq_len > config.rope.original_seq_len:
+        if config.rope.scaling == "yarn" and config.rope.rope_factor > 1.0:
             mscale = 0.1 * config.mscale * math.log(config.rope.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
@@ -90,18 +103,33 @@ class Attention(BaseAttention):
     def forward(
         self,
         x: torch.Tensor,
-        attention_masks: AttentionMasksType,
+        attention_metadata: FlexAttentionMetadata | VarlenAttentionMetadata,
         positions: torch.Tensor | None = None,
     ):
-        bsz, seqlen, _ = x.size()
+        # The MLA projection branches all consume x. Gather once here.
+        x = maybe_gather_tp_input(self, x)
+
+        num_tokens = x.shape[0]
 
         # Query projection
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
             q = self.wq_a(x)
+            # q_norm reads the wq_a projection output with bare ops.
+            remat.recompute_needs_tensor(q)
             q = self.wq_b(self.q_norm(q))
-        q = q.view(bsz, seqlen, -1, self.qk_head_dim)
+
+        # TODO(pianpwk): same QKV:S(1) unflatten case handled by even sharding
+        with spmd.local():
+            q = q.view(num_tokens, -1, self.qk_head_dim)
+            if spmd.is_type_checking():
+                spmd.assert_type(
+                    q,
+                    spmd.V,
+                    spmd.PartitionSpec(("dp", "cp"), "tp", None),
+                )
+
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
@@ -110,18 +138,40 @@ class Attention(BaseAttention):
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
-        q_pe, k_pe = self.rope(q_pe, k_pe.unsqueeze(2), positions)
+        # rope, the query concat, and kv_norm read the query and wkv_a projection
+        # outputs with bare ops.
+        remat.recompute_needs_tensor(q_nope, q_pe, kv, k_pe)
+        q_pe, k_pe = self.rope(q_pe, k_pe.unsqueeze(1), positions)
         q = torch.cat([q_nope, q_pe], dim=-1)
 
         kv = self.wkv_b(self.kv_norm(kv))
-        kv = kv.view(bsz, seqlen, -1, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1)
 
-        output = self.inner_attention(
-            q, k, v, attention_masks=attention_masks, scale=self.softmax_scale
-        ).contiguous()
-        output = output.view(bsz, seqlen, -1)
+        with (
+            spmd.local()
+        ):  # QKV even shard unflatten, but the expand is truly local SPMD
+            kv = kv.view(num_tokens, -1, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = torch.split(
+                kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            )
+            # The key concat reads the wkv_b projection output with bare ops.
+            remat.recompute_needs_tensor(k_nope)
+            k = torch.cat([k_nope, k_pe.expand(-1, k_nope.size(1), -1)], dim=-1)
+            if spmd.is_type_checking() and not torch.compiler.is_compiling():
+                for t in [k, v]:
+                    spmd.assert_type(
+                        t,
+                        spmd.V,
+                        spmd.PartitionSpec(("dp", "cp"), "tp", None),
+                    )
+
+        output = remat.region(
+            self.inner_attention,
+            self.remat_region_name("inner_attention"),
+            recompute=self.remat_should_recompute("inner_attention"),
+        )(q, k, v, attention_metadata=attention_metadata, scale=self.softmax_scale)
+        # The copy below reads the inner_attention output with bare ops.
+        remat.recompute_needs_tensor(output)
+        output = output.contiguous().view(num_tokens, -1)
         return self.wo(output)
 
 
@@ -151,57 +201,100 @@ class DeepSeekV3TransformerBlock(TransformerBlock):
     def forward(
         self,
         x: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+        attention_metadata: FlexAttentionMetadata | VarlenAttentionMetadata | None,
         positions: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
     ):
-        x = x + self.attention(self.attention_norm(x), attention_masks, positions)
+        attn_out = self.attention(self.attention_norm(x), attention_metadata, positions)
+        # The residual add reads the attention output with bare ops.
+        remat.recompute_needs_tensor(attn_out)
+        x = x + attn_out
         if self.moe_enabled:
-            x = x + self.moe(self.ffn_norm(x))
+            ffn_out = self.moe(
+                self.ffn_norm(x),
+                padding_mask_T=padding_mask,
+                aux_loss_denominator=aux_loss_denominator,
+            )
         else:
-            x = x + self.feed_forward(self.ffn_norm(x))
-        return x
+            ffn_out = self.feed_forward(self.ffn_norm(x))
+        # Trailing add, always saved: it saves nothing for backward, so replay skips
+        # it and its inputs need no persisting, matching checkpoint early stop.
+        return remat.region(
+            torch.add, self.remat_region_name("ffn_residual"), recompute=False
+        )(x, ffn_out)
 
 
-class DeepSeekV3Model(Decoder):
+def get_deepseek_v3_nparams_and_flops(
+    model_config: MTPDecoder.Config,
+    model: nn.Module,
+    seq_len: int,
+    *,
+    modules_excluded_from_active_params: Iterable[nn.Module | None] = (),
+) -> tuple[int, int]:
+    """Estimate DeepSeek-style decoder FLOPs from the final model config."""
+    nparams, active_nparams = get_nparams_and_active_nparams(
+        model,
+        modules_excluded_from_active_params=modules_excluded_from_active_params,
+    )
+
+    attention_op_flops = 0
+    for layers in (model_config.layers, model_config.mtp_layers):
+        for layer in layers:
+            attention = layer.attention
+            attention_op_flops += quadratic_attention_flops_per_token(
+                num_heads=attention.n_heads,
+                qk_head_dim=(attention.qk_nope_head_dim + attention.qk_rope_head_dim),
+                v_head_dim=attention.v_head_dim,
+                seq_len=seq_len,
+            )
+
+    # The base parameter term counts one lm_head use. MTP applies that same
+    # output projection once more for every prediction depth.
+    lm_head = getattr(model, "lm_head", None)
+    if isinstance(lm_head, nn.Module):
+        active_nparams += len(model_config.mtp_layers) * sum(
+            param.numel() for param in lm_head.parameters()
+        )
+
+    return nparams, 6 * active_nparams + attention_op_flops
+
+
+class DeepSeekV3Model(MTPDecoder):
+    state_dict_adapter_cls = DeepSeekV3StateDictAdapter
+
     """
     DeepSeek-V3 Transformer model with attention and feed-forward layers.
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Decoder.Config):
+    class Config(MTPDecoder.Config):
         dim: int = 2048
         vocab_size: int = 102400
-
-        def update_from_config(
-            self,
-            *,
-            config,
-            **kwargs,
-        ) -> None:
-            Decoder.Config.update_from_config(self, config=config, **kwargs)
-            parallelism = config.parallelism
-
-            from torchtitan.models.deepseek_v3.sharding import (
-                set_deepseek_v3_sharding_config,
-            )
-
-            set_deepseek_v3_sharding_config(
-                self,
-                enable_sp=parallelism.enable_sequence_parallel,
-                enable_ep=parallelism.expert_parallel_degree > 1,
-            )
+        local_compile_regions: list[str] = field(
+            default_factory=lambda: [
+                "loss",
+                "fused_binary_activation",
+                "fp32_to_bf16_split",
+                "moe_aux_loss",
+            ]
+        )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
+            return get_deepseek_v3_nparams_and_flops(self, model, seq_len)
 
-            assert isinstance(self.layers[0].attention, Attention.Config)
-            return get_moe_model_nparams_and_flops(
-                self,
-                model,
-                self.layers[0].attention.n_heads,
-                self.layers[0].attention.qk_nope_head_dim
-                + self.layers[0].attention.qk_rope_head_dim
-                + self.layers[0].attention.v_head_dim,
-                seq_len,
-            )
+    def __init__(self, config: Config):
+        super().__init__(config)
+
+    @classmethod
+    def _register_optimizer_hooks(
+        cls, optimizers, model_parts, parallelism_context
+    ) -> None:
+        from torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
+        from torchtitan.models.common.moe import register_moe_load_balancing_hook
+
+        register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
+        register_aux_loss_zero_hook(optimizers, model_parts, parallelism_context)
