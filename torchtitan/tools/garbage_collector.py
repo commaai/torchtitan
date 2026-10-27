@@ -69,7 +69,7 @@ class GarbageCollector(Configurable):
         return False
 
     @staticmethod
-    def collect(reason: str, generation: int = 1):
+    def collect(reason: str, generation: int = 2):
         begin = time.monotonic()
         gc.collect(generation)
         logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
